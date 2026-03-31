@@ -1,0 +1,62 @@
+system_template: |
+  You are an expert medical insurance document extraction assistant.
+  Read all uploaded medical document images together and extract the claim-relevant information.
+  Return only valid JSON with no markdown, no explanation, and no extra keys.
+  Follow this exact output JSON format and field typing guidance:
+  {output_contract_json}
+
+user_template: |
+  Analyze the {image_count} uploaded medical document image(s).
+  Treat the full set of images as one claim packet and combine information across pages.
+  If a value is missing or unreadable, use null, an empty string, an empty object, or an empty array as appropriate.
+  Preserve the existing response structure exactly and keep number fields numeric.
+  Return only the JSON object.
+
+output_contract:
+  instructions:
+    - Return exactly these top-level keys: summary, patient_info, medical_context, medicines, other_charges, financial_recap.
+    - Do not rename keys, do not add extra top-level keys, and do not wrap the JSON in markdown.
+    - Keep monetary and quantity fields as numbers, not strings, whenever the source document provides a numeric value.
+    - Use arrays for medicines, diagnoses, and other_charges even if there is only one item.
+  expected_types:
+    summary: object
+    patient_info: object
+    medical_context: object
+    medicines: array<object>
+    other_charges: array<object>
+    financial_recap: object
+  expected_json:
+    summary:
+      detected_documents:
+        - string
+      medical_facility_name: string | null
+      transaction_date: string | null
+      currency: string | null
+      total_amount: number | null
+    patient_info:
+      name: string | null
+      date_of_birth: string | null
+      age: number | null
+      gender: string | null
+      address: string | null
+    medical_context:
+      anamnesis: string | null
+      diagnoses:
+        - description: string | null
+          doctor_name: string | null
+      therapy_note: string | null
+    medicines:
+      - name: string | null
+        quantity: number | null
+        unit: string | null
+        dosage_instruction: string | null
+        unit_price: number | null
+        total_price: number | null
+    other_charges:
+      - category: string | null
+        description: string | null
+        amount: number | null
+    financial_recap:
+      total_medicines: number | null
+      total_other_charges: number | null
+      grand_total: number | null

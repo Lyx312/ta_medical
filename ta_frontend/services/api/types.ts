@@ -5,6 +5,12 @@ export type AuthUser = {
   role: 'user' | 'admin';
 };
 
+export type FamilyMember = {
+  id: number;
+  name: string;
+  relation: string;
+};
+
 export type LoginResponse = {
   message: string;
   access_token: string;
@@ -84,6 +90,7 @@ export type ClaimResponse = {
   id: number;
   user_id: number;
   user_email: string;
+  nama_pasien: string;
   tanggal_pelayanan: string;
   fasilitas_kesehatan: string;
   jenis_manfaat: string;
@@ -108,6 +115,7 @@ export type RegisterPayload = {
 };
 
 export type CreateClaimPayload = {
+  nama_pasien: string;
   tanggal_pelayanan: string;
   fasilitas_kesehatan: string;
   jenis_manfaat: string;
@@ -117,3 +125,12 @@ export type CreateClaimPayload = {
   fileUris: string[];
 };
 
+export type CreateFamilyMemberPayload = {
+  name: string;
+  relation: string;
+};
+
+export type UpdateFamilyMemberPayload = {
+  name: string;
+  relation: string;
+};

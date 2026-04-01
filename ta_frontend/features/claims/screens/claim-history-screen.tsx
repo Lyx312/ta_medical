@@ -18,6 +18,13 @@ function formatCurrency(amount: number) {
 }
 
 function formatDate(dateString: string) {
+  const dmyMatch = dateString.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (dmyMatch) {
+    const [, day, month, year] = dmyMatch;
+    const date = new Date(Number(year), Number(month) - 1, Number(day));
+    return Number.isNaN(date.getTime()) ? dateString : date.toLocaleDateString('id-ID');
+  }
+
   const date = new Date(dateString);
   return Number.isNaN(date.getTime()) ? dateString : date.toLocaleDateString('id-ID');
 }
@@ -80,6 +87,7 @@ export function ClaimHistoryScreen() {
         <ThemedText style={styles.amount}>{formatCurrency(item.nominal_klaim)}</ThemedText>
         <ThemedText style={[styles.status, { color: getStatusColor(item.status, colors) }]}>{item.status}</ThemedText>
       </View>
+      <ThemedText style={styles.patientName}>{item.nama_pasien}</ThemedText>
       <ThemedText style={styles.description}>{item.keterangan_penyakit}</ThemedText>
       <ThemedText style={styles.date}>{formatDate(item.tanggal_pelayanan)}</ThemedText>
     </View>
@@ -170,6 +178,11 @@ const styles = StyleSheet.create({
     gap: 12,
     marginTop: 20,
     paddingBottom: 12,
+  },
+  patientName: {
+    fontSize: 15,
+    fontWeight: '600',
+    marginTop: 8,
   },
   retryButton: {
     borderRadius: 12,

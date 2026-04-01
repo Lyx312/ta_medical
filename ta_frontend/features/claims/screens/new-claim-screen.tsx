@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   Image,
+  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -16,13 +17,16 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
+import { useFocusEffect } from '@react-navigation/native';
 
 import { ThemedText } from '@/components/themed-text';
 import { Colors } from '@/constants/theme';
+import { useAuth } from '@/contexts/auth-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { scanDocuments } from '@/services/api/ai';
 import { createClaim } from '@/services/api/claims';
-import type { AIMedicalScanResult, ApiError } from '@/services/api/types';
+import { getFamilyMembers } from '@/services/api/family-members';
+import type { AIMedicalScanResult, ApiError, FamilyMember } from '@/services/api/types';
 
 const BENEFIT_TYPES = [
   { value: 'rawat_jalan', label: 'Rawat Jalan' },
@@ -31,10 +35,38 @@ const BENEFIT_TYPES = [
   { value: 'maternity', label: 'Maternity' },
 ];
 
+type PatientOption = {
+  key: string;
+  name: string;
+  relation: string;
+};
+
+function normalizePatientName(name: string) {
+  return name.trim().toLocaleLowerCase();
+}
+
+function sanitizeClaimAmountInput(value: string) {
+  return value.replace(/\D/g, '');
+}
+
+function formatClaimAmountForDisplay(value: string) {
+  if (!value) {
+    return '';
+  }
+
+  return new Intl.NumberFormat('id-ID').format(Number(value));
+}
+
 export function NewClaimScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
+  const { user } = useAuth();
   const [imageUris, setImageUris] = useState<string[]>([]);
+  const [familyMembers, setFamilyMembers] = useState<FamilyMember[]>([]);
+  const [isLoadingFamilyMembers, setIsLoadingFamilyMembers] = useState(false);
+  const [familyMemberError, setFamilyMemberError] = useState('');
+  const [selectedPatientKey, setSelectedPatientKey] = useState('');
+  const [showPatientPicker, setShowPatientPicker] = useState(false);
   const [serviceDate, setServiceDate] = useState(new Date());
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [healthFacility, setHealthFacility] = useState('');
@@ -46,6 +78,53 @@ export function NewClaimScreen() {
   const [isScanning, setIsScanning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const patientOptions: PatientOption[] = [];
+  if (user?.full_name) {
+    patientOptions.push({
+      key: `self:${user.id}`,
+      name: user.full_name,
+      relation: 'Saya',
+    });
+  }
+  for (const familyMember of familyMembers) {
+    patientOptions.push({
+      key: `family:${familyMember.id}`,
+      name: familyMember.name,
+      relation: familyMember.relation,
+    });
+  }
+
+  const getSelectedPatientOption = () => patientOptions.find((option) => option.key === selectedPatientKey);
+
+  const findMatchingPatientOption = (name: string) => {
+    const normalizedName = normalizePatientName(name);
+    if (!normalizedName) {
+      return undefined;
+    }
+
+    return patientOptions.find((option) => normalizePatientName(option.name) === normalizedName);
+  };
+
+  const loadFamilyMembers = useCallback(async () => {
+    setIsLoadingFamilyMembers(true);
+    setFamilyMemberError('');
+
+    try {
+      setFamilyMembers(await getFamilyMembers());
+    } catch (err) {
+      const apiError = err as ApiError;
+      setFamilyMemberError(apiError.message ?? 'Unable to load family members.');
+    } finally {
+      setIsLoadingFamilyMembers(false);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadFamilyMembers();
+    }, [loadFamilyMembers]),
+  );
 
   const pickImages = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -93,9 +172,31 @@ export function NewClaimScreen() {
     }
   };
 
-  const formatDate = (date: Date) => date.toISOString().split('T')[0];
+  const formatDateForDisplay = (date: Date) =>
+    new Intl.DateTimeFormat('en-GB', {
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    }).format(date);
+
+  const formatDateForSubmission = (date: Date) => {
+    const day = `${date.getDate()}`.padStart(2, '0');
+    const month = `${date.getMonth() + 1}`.padStart(2, '0');
+    const year = date.getFullYear();
+    return `${day}-${month}-${year}`;
+  };
+
+  const displayedClaimAmount = formatClaimAmountForDisplay(claimAmount);
 
   const applyAIScanData = (data: AIMedicalScanResult) => {
+    if (data.patient_info.name) {
+      const matchedPatientOption = findMatchingPatientOption(data.patient_info.name);
+      if (matchedPatientOption) {
+        setSelectedPatientKey(matchedPatientOption.key);
+        setErrors((prev) => ({ ...prev, nama_pasien: '' }));
+      }
+    }
+
     if (data.summary.medical_facility_name) {
       setHealthFacility(data.summary.medical_facility_name);
     }
@@ -108,11 +209,18 @@ export function NewClaimScreen() {
     }
 
     if (data.summary.total_amount) {
-      setClaimAmount(data.summary.total_amount.toString());
+      setClaimAmount(sanitizeClaimAmountInput(data.summary.total_amount.toString()));
+    }
+
+    const diagnosisDescriptions = data.medical_context.diagnoses
+      .map((diagnosis) => diagnosis.description?.trim())
+      .filter((description): description is string => Boolean(description));
+
+    if (diagnosisDescriptions.length > 0) {
+      setDiseaseDescription(diagnosisDescriptions.join(', '));
     }
 
     if (data.medical_context.anamnesis) {
-      setDiseaseDescription(data.medical_context.anamnesis);
       setChronology(data.medical_context.anamnesis);
     }
   };
@@ -140,9 +248,14 @@ export function NewClaimScreen() {
 
   const validate = () => {
     const nextErrors: Record<string, string> = {};
+    const selectedPatient = getSelectedPatientOption();
 
     if (imageUris.length === 0) {
       nextErrors.images = 'At least one document image is required.';
+    }
+
+    if (!selectedPatient) {
+      nextErrors.nama_pasien = 'Patient selection is required.';
     }
 
     if (!healthFacility.trim()) {
@@ -171,6 +284,7 @@ export function NewClaimScreen() {
 
   const resetForm = () => {
     setImageUris([]);
+    setSelectedPatientKey('');
     setServiceDate(new Date());
     setHealthFacility('');
     setBenefitType('');
@@ -181,7 +295,12 @@ export function NewClaimScreen() {
   };
 
   const handleSubmit = async () => {
+    const selectedPatient = getSelectedPatientOption();
     if (!validate()) {
+      return;
+    }
+
+    if (!selectedPatient) {
       return;
     }
 
@@ -190,7 +309,8 @@ export function NewClaimScreen() {
 
     try {
       await createClaim({
-        tanggal_pelayanan: formatDate(serviceDate),
+        nama_pasien: selectedPatient.name,
+        tanggal_pelayanan: formatDateForSubmission(serviceDate),
         fasilitas_kesehatan: healthFacility.trim(),
         jenis_manfaat: benefitType,
         nominal_klaim: parseFloat(claimAmount),
@@ -210,198 +330,232 @@ export function NewClaimScreen() {
 
   return (
     <SafeAreaView style={[viewStyles.container, { backgroundColor: colors.background }]}>
-      <ScrollView
-        contentContainerStyle={viewStyles.scrollContent}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}>
-        <View style={viewStyles.content}>
-          <ThemedText type="title">New Claim</ThemedText>
-          <ThemedText style={textStyles.subtitle}>Submit a new insurance claim</ThemedText>
+      <KeyboardAvoidingView
+        style={viewStyles.keyboardContainer}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <View style={viewStyles.screen}>
+          <ScrollView
+            contentContainerStyle={viewStyles.scrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}>
+            <View style={viewStyles.content}>
+              <ThemedText type="title">New Claim</ThemedText>
+              <ThemedText style={textStyles.subtitle}>Submit a new insurance claim</ThemedText>
 
-          <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
-            <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Document Upload</ThemedText>
-            <ThemedText style={textStyles.sectionDescription}>
-              Upload or take photos of your medical documents
-            </ThemedText>
-
-            <View style={viewStyles.imageActions}>
-              <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={pickImages}>
-                <Ionicons name="image-outline" size={20} color={colors.primary} />
-                <ThemedText style={textStyles.imageButtonText}>Gallery</ThemedText>
-              </Pressable>
-              <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={takePhoto}>
-                <Ionicons name="camera-outline" size={20} color={colors.primary} />
-                <ThemedText style={textStyles.imageButtonText}>Camera</ThemedText>
-              </Pressable>
-            </View>
-
-            {errors.images ? (
-              <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.images}</ThemedText>
-            ) : null}
-
-            {imageUris.length > 0 ? (
-              <View style={viewStyles.imageGrid}>
-                {imageUris.map((uri, index) => (
-                  <View key={`${uri}-${index}`} style={viewStyles.imageThumbContainer}>
-                    <Image source={{ uri }} style={imageStyles.imageThumb} />
-                    <Pressable style={viewStyles.removeImageButton} onPress={() => removeImage(index)}>
-                      <Ionicons name="close-circle" size={22} color={colors.error} />
-                    </Pressable>
-                  </View>
-                ))}
-              </View>
-            ) : null}
-
-            {imageUris.length > 0 ? (
-              <Pressable
-                style={[viewStyles.aiScanButton, { backgroundColor: colors.secondary }]}
-                onPress={handleAIScan}
-                disabled={isScanning}>
-                {isScanning ? (
-                  <ActivityIndicator color={colors.cardBackground} size="small" />
-                ) : (
-                  <>
-                    <Ionicons name="scan-outline" size={20} color={colors.cardBackground} />
-                    <ThemedText style={[textStyles.aiScanButtonText, { color: colors.cardBackground }]}>
-                      Scan with AI
-                    </ThemedText>
-                  </>
-                )}
-              </Pressable>
-            ) : null}
-          </View>
-
-          <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
-            <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Claim Details</ThemedText>
-
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Tanggal Pelayanan</ThemedText>
-              <Pressable style={[viewStyles.dateButton, { borderColor: colors.divider }]} onPress={() => setShowDatePicker(true)}>
-                <Ionicons name="calendar-outline" size={20} color={colors.icon} />
-                <ThemedText style={[textStyles.dateText, { color: colors.text }]}>{formatDate(serviceDate)}</ThemedText>
-              </Pressable>
-              {showDatePicker ? (
-                Platform.OS === 'ios' ? (
-                  <Modal transparent animationType="slide" visible={showDatePicker}>
-                    <View style={viewStyles.modalOverlay}>
-                      <View style={[viewStyles.modalContent, { backgroundColor: colors.cardBackground }]}>
-                        <View style={viewStyles.modalHeader}>
-                          <Pressable onPress={() => setShowDatePicker(false)}>
-                            <ThemedText style={{ color: colors.secondary }}>Done</ThemedText>
-                          </Pressable>
-                        </View>
-                        <DateTimePicker value={serviceDate} mode="date" display="spinner" onChange={handleDateChange} />
-                      </View>
-                    </View>
-                  </Modal>
-                ) : (
-                  <DateTimePicker value={serviceDate} mode="date" display="default" onChange={handleDateChange} />
-                )
-              ) : null}
-              {errors.tanggal_pelayanan ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.tanggal_pelayanan}</ThemedText>
-              ) : null}
-            </View>
-
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Fasilitas Kesehatan</ThemedText>
-              <TextInput
-                value={healthFacility}
-                onChangeText={(text) => {
-                  setHealthFacility(text);
-                  setErrors((prev) => ({ ...prev, fasilitas_kesehatan: '' }));
-                }}
-                placeholder="e.g., RS IA KEBON JERUK"
-                placeholderTextColor={colors.icon}
-                style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
-              />
-              {errors.fasilitas_kesehatan ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.fasilitas_kesehatan}</ThemedText>
-              ) : null}
-            </View>
-
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Jenis Manfaat</ThemedText>
-              <Pressable style={[viewStyles.pickerButton, { borderColor: colors.divider }]} onPress={() => setShowBenefitPicker(true)}>
-                <ThemedText style={[textStyles.pickerButtonText, { color: benefitType ? colors.text : colors.icon }]}>
-                  {benefitType ? BENEFIT_TYPES.find((benefit) => benefit.value === benefitType)?.label : 'Select benefit type'}
+              <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+                <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Document Upload</ThemedText>
+                <ThemedText style={textStyles.sectionDescription}>
+                  Upload or take photos of your medical documents
                 </ThemedText>
-                <Ionicons name="chevron-down" size={20} color={colors.icon} />
-              </Pressable>
-              {errors.jenis_manfaat ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.jenis_manfaat}</ThemedText>
-              ) : null}
-            </View>
 
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Nominal Klaim (IDR)</ThemedText>
-              <TextInput
-                value={claimAmount}
-                onChangeText={(text) => {
-                  setClaimAmount(text);
-                  setErrors((prev) => ({ ...prev, nominal_klaim: '' }));
-                }}
-                placeholder="0"
-                placeholderTextColor={colors.icon}
-                keyboardType="numeric"
-                style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
-              />
-              {errors.nominal_klaim ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.nominal_klaim}</ThemedText>
-              ) : null}
-            </View>
+                <View style={viewStyles.imageActions}>
+                  <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={pickImages}>
+                    <Ionicons name="image-outline" size={20} color={colors.primary} />
+                    <ThemedText style={textStyles.imageButtonText}>Gallery</ThemedText>
+                  </Pressable>
+                  <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={takePhoto}>
+                    <Ionicons name="camera-outline" size={20} color={colors.primary} />
+                    <ThemedText style={textStyles.imageButtonText}>Camera</ThemedText>
+                  </Pressable>
+                </View>
 
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Keterangan Penyakit</ThemedText>
-              <TextInput
-                value={diseaseDescription}
-                onChangeText={(text) => {
-                  setDiseaseDescription(text);
-                  setErrors((prev) => ({ ...prev, keterangan_penyakit: '' }));
-                }}
-                placeholder="Describe the illness or condition"
-                placeholderTextColor={colors.icon}
-                multiline
-                numberOfLines={2}
-                style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
-              />
-              {errors.keterangan_penyakit ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.keterangan_penyakit}</ThemedText>
-              ) : null}
-            </View>
+                {errors.images ? (
+                  <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.images}</ThemedText>
+                ) : null}
 
-            <View style={viewStyles.fieldGroup}>
-              <ThemedText style={textStyles.fieldLabel}>Kronologi</ThemedText>
-              <TextInput
-                value={chronology}
-                onChangeText={(text) => {
-                  setChronology(text);
-                  setErrors((prev) => ({ ...prev, kronologi: '' }));
-                }}
-                placeholder="Describe the sequence of events"
-                placeholderTextColor={colors.icon}
-                multiline
-                numberOfLines={3}
-                style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
-              />
-              {errors.kronologi ? (
-                <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.kronologi}</ThemedText>
-              ) : null}
-            </View>
+                {imageUris.length > 0 ? (
+                  <View style={viewStyles.imageGrid}>
+                    {imageUris.map((uri, index) => (
+                      <View key={`${uri}-${index}`} style={viewStyles.imageThumbContainer}>
+                        <Image source={{ uri }} style={imageStyles.imageThumb} />
+                        <Pressable style={viewStyles.removeImageButton} onPress={() => removeImage(index)}>
+                          <Ionicons name="close-circle" size={22} color={colors.error} />
+                        </Pressable>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
 
-            <Pressable
-              style={[viewStyles.submitButton, { backgroundColor: colors.cta, opacity: isSubmitting ? 0.7 : 1 }]}
-              onPress={handleSubmit}
-              disabled={isSubmitting}>
-              {isSubmitting ? (
-                <ActivityIndicator color={colors.cardBackground} />
-              ) : (
-                <ThemedText style={[textStyles.submitButtonText, { color: colors.cardBackground }]}>Submit Claim</ThemedText>
-              )}
-            </Pressable>
-          </View>
+                {imageUris.length > 0 ? (
+                  <Pressable
+                    style={[viewStyles.aiScanButton, { backgroundColor: colors.secondary }]}
+                    onPress={handleAIScan}
+                    disabled={isScanning}>
+                    {isScanning ? (
+                      <ActivityIndicator color={colors.cardBackground} size="small" />
+                    ) : (
+                      <>
+                        <Ionicons name="scan-outline" size={20} color={colors.cardBackground} />
+                        <ThemedText style={[textStyles.aiScanButtonText, { color: colors.cardBackground }]}>
+                          Scan with AI
+                        </ThemedText>
+                      </>
+                    )}
+                  </Pressable>
+                ) : null}
+              </View>
+
+              <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+                <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Claim Details</ThemedText>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Nama Pasien</ThemedText>
+                  <Pressable
+                    style={[viewStyles.pickerButton, { borderColor: colors.divider }]}
+                    onPress={() => setShowPatientPicker(true)}>
+                    <View style={viewStyles.patientPickerTextContainer}>
+                      <ThemedText
+                        style={[textStyles.pickerButtonText, { color: getSelectedPatientOption() ? colors.text : colors.icon }]}>
+                        {getSelectedPatientOption()
+                          ? `${getSelectedPatientOption()?.name} (${getSelectedPatientOption()?.relation})`
+                          : 'Pilih pasien'}
+                      </ThemedText>
+                      {isLoadingFamilyMembers ? (
+                        <ThemedText style={textStyles.pickerHelperText}>Memuat anggota keluarga...</ThemedText>
+                      ) : null}
+                    </View>
+                    <Ionicons name="chevron-down" size={20} color={colors.icon} />
+                  </Pressable>
+                  {familyMemberError ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{familyMemberError}</ThemedText>
+                  ) : null}
+                  {errors.nama_pasien ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.nama_pasien}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Tanggal Pelayanan</ThemedText>
+                  <Pressable style={[viewStyles.dateButton, { borderColor: colors.divider }]} onPress={() => setShowDatePicker(true)}>
+                    <Ionicons name="calendar-outline" size={20} color={colors.icon} />
+                    <ThemedText style={[textStyles.dateText, { color: colors.text }]}>
+                      {formatDateForDisplay(serviceDate)}
+                    </ThemedText>
+                  </Pressable>
+                  {showDatePicker ? (
+                    Platform.OS === 'ios' ? (
+                      <Modal transparent animationType="slide" visible={showDatePicker}>
+                        <View style={viewStyles.modalOverlay}>
+                          <View style={[viewStyles.modalContent, { backgroundColor: colors.cardBackground }]}>
+                            <View style={viewStyles.modalHeader}>
+                              <Pressable onPress={() => setShowDatePicker(false)}>
+                                <ThemedText style={{ color: colors.secondary }}>Done</ThemedText>
+                              </Pressable>
+                            </View>
+                            <DateTimePicker value={serviceDate} mode="date" display="spinner" onChange={handleDateChange} />
+                          </View>
+                        </View>
+                      </Modal>
+                    ) : (
+                      <DateTimePicker value={serviceDate} mode="date" display="default" onChange={handleDateChange} />
+                    )
+                  ) : null}
+                  {errors.tanggal_pelayanan ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.tanggal_pelayanan}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Fasilitas Kesehatan</ThemedText>
+                  <TextInput
+                    value={healthFacility}
+                    onChangeText={(text) => {
+                      setHealthFacility(text);
+                      setErrors((prev) => ({ ...prev, fasilitas_kesehatan: '' }));
+                    }}
+                    placeholder="e.g., RS IA KEBON JERUK"
+                    placeholderTextColor={colors.icon}
+                    style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
+                  />
+                  {errors.fasilitas_kesehatan ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.fasilitas_kesehatan}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Jenis Manfaat</ThemedText>
+                  <Pressable style={[viewStyles.pickerButton, { borderColor: colors.divider }]} onPress={() => setShowBenefitPicker(true)}>
+                    <ThemedText style={[textStyles.pickerButtonText, { color: benefitType ? colors.text : colors.icon }]}>
+                      {benefitType ? BENEFIT_TYPES.find((benefit) => benefit.value === benefitType)?.label : 'Select benefit type'}
+                    </ThemedText>
+                    <Ionicons name="chevron-down" size={20} color={colors.icon} />
+                  </Pressable>
+                  {errors.jenis_manfaat ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.jenis_manfaat}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Nominal Klaim (IDR)</ThemedText>
+                  <TextInput
+                    value={displayedClaimAmount}
+                    onChangeText={(text) => {
+                      setClaimAmount(sanitizeClaimAmountInput(text));
+                      setErrors((prev) => ({ ...prev, nominal_klaim: '' }));
+                    }}
+                    placeholder="0"
+                    placeholderTextColor={colors.icon}
+                    keyboardType="numeric"
+                    style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
+                  />
+                  {errors.nominal_klaim ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.nominal_klaim}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Keterangan Penyakit (Diagnosis)</ThemedText>
+                  <TextInput
+                    value={diseaseDescription}
+                    onChangeText={(text) => {
+                      setDiseaseDescription(text);
+                      setErrors((prev) => ({ ...prev, keterangan_penyakit: '' }));
+                    }}
+                    placeholder="Describe the illness or condition"
+                    placeholderTextColor={colors.icon}
+                    multiline
+                    numberOfLines={2}
+                    style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
+                  />
+                  {errors.keterangan_penyakit ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.keterangan_penyakit}</ThemedText>
+                  ) : null}
+                </View>
+
+                <View style={viewStyles.fieldGroup}>
+                  <ThemedText style={textStyles.fieldLabel}>Kronologi (Anamnesis)</ThemedText>
+                  <TextInput
+                    value={chronology}
+                    onChangeText={(text) => {
+                      setChronology(text);
+                      setErrors((prev) => ({ ...prev, kronologi: '' }));
+                    }}
+                    placeholder="Describe the sequence of events"
+                    placeholderTextColor={colors.icon}
+                    multiline
+                    numberOfLines={3}
+                    style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
+                  />
+                  {errors.kronologi ? (
+                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.kronologi}</ThemedText>
+                  ) : null}
+                </View>
+
+                <Pressable
+                  style={[viewStyles.submitButton, { backgroundColor: colors.cta, opacity: isSubmitting ? 0.7 : 1 }]}
+                  onPress={handleSubmit}
+                  disabled={isSubmitting}>
+                  {isSubmitting ? (
+                    <ActivityIndicator color={colors.cardBackground} />
+                  ) : (
+                    <ThemedText style={[textStyles.submitButtonText, { color: colors.cardBackground }]}>Submit Claim</ThemedText>
+                  )}
+                </Pressable>
+              </View>
+            </View>
+          </ScrollView>
         </View>
-      </ScrollView>
+      </KeyboardAvoidingView>
 
       <Modal transparent animationType="slide" visible={showBenefitPicker}>
         <View style={viewStyles.modalOverlay}>
@@ -441,6 +595,48 @@ export function NewClaimScreen() {
           </View>
         </View>
       </Modal>
+
+      <Modal transparent animationType="slide" visible={showPatientPicker}>
+        <View style={viewStyles.modalOverlay}>
+          <View style={[viewStyles.modalContent, { backgroundColor: colors.cardBackground }]}>
+            <View style={viewStyles.modalHeader}>
+              <ThemedText style={textStyles.modalTitle}>Pilih Pasien</ThemedText>
+              <Pressable onPress={() => setShowPatientPicker(false)}>
+                <ThemedText style={{ color: colors.secondary }}>Cancel</ThemedText>
+              </Pressable>
+            </View>
+            <FlatList
+              data={patientOptions}
+              keyExtractor={(item) => item.key}
+              renderItem={({ item }) => (
+                <Pressable
+                  style={[
+                    viewStyles.benefitOption,
+                    { borderBottomColor: colors.divider },
+                    selectedPatientKey === item.key && { backgroundColor: `${colors.secondary}20` },
+                  ]}
+                  onPress={() => {
+                    setSelectedPatientKey(item.key);
+                    setErrors((prev) => ({ ...prev, nama_pasien: '' }));
+                    setShowPatientPicker(false);
+                  }}>
+                  <View style={viewStyles.patientOptionTextContainer}>
+                    <ThemedText
+                      style={[
+                        textStyles.benefitOptionText,
+                        { color: selectedPatientKey === item.key ? colors.secondary : colors.text },
+                      ]}>
+                      {item.name}
+                    </ThemedText>
+                    <ThemedText style={textStyles.patientOptionMeta}>{item.relation}</ThemedText>
+                  </View>
+                  {selectedPatientKey === item.key ? <Ionicons name="checkmark" size={22} color={colors.secondary} /> : null}
+                </Pressable>
+              )}
+            />
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -473,9 +669,10 @@ const viewStyles = StyleSheet.create({
     flex: 1,
   },
   content: {
-    flex: 1,
+    flexGrow: 1,
     gap: 16,
     padding: 20,
+    paddingBottom: 120,
   },
   dateButton: {
     alignItems: 'center',
@@ -524,10 +721,21 @@ const viewStyles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 16,
   },
+  keyboardContainer: {
+    flex: 1,
+  },
   modalOverlay: {
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     flex: 1,
     justifyContent: 'flex-end',
+  },
+  patientOptionTextContainer: {
+    flex: 1,
+    gap: 2,
+  },
+  patientPickerTextContainer: {
+    flex: 1,
+    gap: 2,
   },
   pickerButton: {
     alignItems: 'center',
@@ -545,6 +753,9 @@ const viewStyles = StyleSheet.create({
   },
   scrollContent: {
     flexGrow: 1,
+  },
+  screen: {
+    flex: 1,
   },
   submitButton: {
     alignItems: 'center',
@@ -587,8 +798,16 @@ const textStyles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '600',
   },
+  patientOptionMeta: {
+    fontSize: 13,
+    opacity: 0.7,
+  },
   pickerButtonText: {
     fontSize: 16,
+  },
+  pickerHelperText: {
+    fontSize: 12,
+    opacity: 0.7,
   },
   sectionDescription: {
     fontSize: 14,

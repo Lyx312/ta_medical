@@ -18,6 +18,7 @@ class Settings:
     google_api_key: str
     jwt_secret: str
     access_token_expire_minutes: int
+    database_url: str
 
 
 @lru_cache
@@ -29,4 +30,5 @@ def get_settings() -> Settings:
         google_api_key=os.getenv("GOOGLE_API_KEY", ""),
         jwt_secret=os.getenv("JWT_SECRET", "fallback_dev_secret_change_this"),
         access_token_expire_minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080")),
+        database_url=os.getenv("DATABASE_URL", "sqlite:///./app.db"),
     )

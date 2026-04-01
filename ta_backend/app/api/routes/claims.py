@@ -1,53 +1,21 @@
 import base64
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
-from jose import JWTError, jwt
-
-from app.core.config import get_settings
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from app.api.routes.auth import get_current_user_dependency
 from app.models.claim import Claim, ClaimRepository, _next_id
 from app.schemas.auth import TokenData
-from app.schemas.claim import ClaimResponse
+from app.schemas.claim import ClaimResponse, parse_claim_date
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 claim_repository = ClaimRepository()
-settings = get_settings()
-
-
-def get_current_user_dependency(authorization: str | None = Header(None)) -> TokenData:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = authorization[7:]
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
-        user_id = payload.get("sub")
-        email = payload.get("email")
-        role = payload.get("role")
-        if user_id is None or email is None or role is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials.",
-            )
-        return TokenData(user_id=int(user_id), email=str(email), role=str(role))
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials.",
-        )
-
-
-def require_auth(authorization: str = "") -> TokenData:
-    return get_current_user_dependency(authorization)
 
 
 @router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
 async def create_claim(
-    token_data: TokenData = Depends(require_auth),
-    tanggal_pelayanan: date = Form(...),
+    token_data: TokenData = Depends(get_current_user_dependency),
+    nama_pasien: str = Form(...),
+    tanggal_pelayanan: str = Form(...),
     fasilitas_kesehatan: str = Form(...),
     jenis_manfaat: str = Form(...),
     nominal_klaim: float = Form(...),
@@ -58,9 +26,17 @@ async def create_claim(
     valid_types = ["rawat_jalan", "rawat_inap", "emergency", "maternity"]
     if jenis_manfaat not in valid_types:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Invalid jenis_manfaat. Must be one of: {', '.join(valid_types)}",
         )
+
+    try:
+        parsed_tanggal_pelayanan = parse_claim_date(tanggal_pelayanan)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid tanggal_pelayanan. Expected format: dd-mm-yyyy",
+        ) from exc
 
     file_contents: list[str] = []
     for file in files:
@@ -71,7 +47,8 @@ async def create_claim(
         id=_next_id(),
         user_id=token_data.user_id,
         user_email=token_data.email,
-        tanggal_pelayanan=tanggal_pelayanan,
+        nama_pasien=nama_pasien.strip(),
+        tanggal_pelayanan=parsed_tanggal_pelayanan,
         fasilitas_kesehatan=fasilitas_kesehatan.strip(),
         jenis_manfaat=jenis_manfaat,  # type: ignore
         nominal_klaim=nominal_klaim,
@@ -86,6 +63,7 @@ async def create_claim(
         id=claim.id,
         user_id=claim.user_id,
         user_email=claim.user_email,
+        nama_pasien=claim.nama_pasien,
         tanggal_pelayanan=claim.tanggal_pelayanan,
         fasilitas_kesehatan=claim.fasilitas_kesehatan,
         jenis_manfaat=claim.jenis_manfaat,
@@ -100,7 +78,7 @@ async def create_claim(
 
 @router.get("", response_model=list[ClaimResponse])
 async def get_claims(
-    token_data: TokenData = Depends(require_auth),
+    token_data: TokenData = Depends(get_current_user_dependency),
 ) -> list[ClaimResponse]:
     claims = claim_repository.get_by_user_id(token_data.user_id)
     claims.sort(key=lambda c: c.created_at, reverse=True)
@@ -110,6 +88,7 @@ async def get_claims(
             id=c.id,
             user_id=c.user_id,
             user_email=c.user_email,
+            nama_pasien=c.nama_pasien,
             tanggal_pelayanan=c.tanggal_pelayanan,
             fasilitas_kesehatan=c.fasilitas_kesehatan,
             jenis_manfaat=c.jenis_manfaat,
@@ -127,7 +106,7 @@ async def get_claims(
 @router.get("/{claim_id}", response_model=ClaimResponse)
 async def get_claim(
     claim_id: int,
-    token_data: TokenData = Depends(require_auth),
+    token_data: TokenData = Depends(get_current_user_dependency),
 ) -> ClaimResponse:
     claim = claim_repository.get_by_id(claim_id)
     if claim is None:
@@ -145,6 +124,7 @@ async def get_claim(
         id=claim.id,
         user_id=claim.user_id,
         user_email=claim.user_email,
+        nama_pasien=claim.nama_pasien,
         tanggal_pelayanan=claim.tanggal_pelayanan,
         fasilitas_kesehatan=claim.fasilitas_kesehatan,
         jenis_manfaat=claim.jenis_manfaat,

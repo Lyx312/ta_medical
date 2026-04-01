@@ -7,7 +7,7 @@ type JsonRequestBody = Record<string, unknown>;
 type RequestOptions = {
   body?: BodyInit | null;
   headers?: Record<string, string>;
-  method: 'GET' | 'POST';
+  method: 'DELETE' | 'GET' | 'POST' | 'PUT';
   requiresAuth?: boolean;
 };
 
@@ -76,6 +76,27 @@ export function postJson<T>(path: string, body: JsonRequestBody, requiresAuth: b
   });
 }
 
+export function putJson<T>(path: string, body: JsonRequestBody, requiresAuth: boolean = false) {
+  return request<T>(path, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    requiresAuth,
+  });
+}
+
+export function deleteJson<T>(path: string, requiresAuth: boolean = false) {
+  return request<T>(path, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    requiresAuth,
+  });
+}
+
 export function postFormData<T>(path: string, formData: FormData, requiresAuth: boolean = false) {
   return request<T>(path, {
     method: 'POST',
@@ -83,4 +104,3 @@ export function postFormData<T>(path: string, formData: FormData, requiresAuth: 
     requiresAuth,
   });
 }
-

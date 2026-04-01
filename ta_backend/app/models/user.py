@@ -1,64 +1,31 @@
-from dataclasses import dataclass
 import hashlib
 import hmac
 import os
+from datetime import datetime, timezone
 from typing import Literal
 
-_counter = 0
+from sqlalchemy import CheckConstraint, DateTime, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+UserRole = Literal["user", "admin"]
 
 
-def _next_id() -> int:
-    global _counter
-    _counter += 1
-    return _counter
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (CheckConstraint("role IN ('user', 'admin')", name="ck_users_role"),)
 
-
-@dataclass(frozen=True)
-class UserInDB:
-    id: int
-    full_name: str
-    email: str
-    password_hash: str
-    role: Literal["user", "admin"]
-
-
-class UserRepository:
-    def __init__(self) -> None:
-        self._users_by_email: dict[str, UserInDB] = {}
-        self._users_by_id: dict[int, UserInDB] = {}
-
-        admin = UserInDB(
-            id=_next_id(),
-            full_name="Admin User",
-            email="admin@mail.com",
-            password_hash=hash_password("admin123"),
-            role="admin",
-        )
-        self.add(admin)
-
-        user = UserInDB(
-            id=_next_id(),
-            full_name="John Doe",
-            email="john@mail.com",
-            password_hash=hash_password("pass123"),
-            role="user",
-        )
-        self.add(user)
-
-    def get_by_email(self, email: str) -> UserInDB | None:
-        return self._users_by_email.get(email.lower())
-
-    def get_by_id(self, user_id: int) -> UserInDB | None:
-        return self._users_by_id.get(user_id)
-
-    def add(self, user: UserInDB) -> UserInDB:
-        self._users_by_email[user.email.lower()] = user
-        self._users_by_id[user.id] = user
-        return user
-
-    def clear(self) -> None:
-        self._users_by_email.clear()
-        self._users_by_id.clear()
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    full_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(String(20), nullable=False, default="user")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 def hash_password(password: str) -> str:

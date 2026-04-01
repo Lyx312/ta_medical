@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Request
@@ -6,9 +7,11 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes.auth import router as auth_router
+from app.api.routes.family_members import router as family_members_router
 from app.api.routes.test import router as test_router
 from app.api.routes.ai import router as ai_router
 from app.api.routes.claims import router as claims_router
+from app.db.init import initialize_database
 
 
 def build_error_response(
@@ -95,12 +98,20 @@ async def starlette_http_exception_handler(
     )
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    del app
+    initialize_database()
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Python Backend", version="0.1.0")
+    app = FastAPI(title="Python Backend", version="0.1.0", lifespan=lifespan)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
     app.add_exception_handler(StarletteHTTPException, starlette_http_exception_handler)
     app.include_router(auth_router, prefix="/api")
+    app.include_router(family_members_router, prefix="/api")
     app.include_router(test_router, prefix="/api")
     app.include_router(ai_router, prefix="/api")
     app.include_router(claims_router, prefix="/api")

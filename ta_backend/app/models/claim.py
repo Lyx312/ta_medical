@@ -16,6 +16,7 @@ class Claim:
     id: int
     user_id: int
     user_email: str
+    nama_pasien: str
     tanggal_pelayanan: date
     fasilitas_kesehatan: str
     jenis_manfaat: Literal["rawat_jalan", "rawat_inap", "emergency", "maternity"]

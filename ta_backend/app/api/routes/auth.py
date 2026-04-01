@@ -2,24 +2,38 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from jose import JWTError, jwt
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.models.user import UserInDB, UserRepository, hash_password, verify_password
+from app.db.session import get_db_session
+from app.models.user import hash_password, verify_password
+from app.repositories.user_repository import UserRepository
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
     RegisterRequest,
     RegisterResponse,
     TokenData,
+    UserRole,
     UserPublic,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-user_repository = UserRepository()
-settings = get_settings()
+
+
+def parse_user_role(value: object) -> UserRole:
+    if value in ("user", "admin"):
+        return value
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    settings = get_settings()
     to_encode = data.copy()
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
@@ -33,6 +47,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
 
 
 def get_current_user(token: str) -> TokenData:
+    settings = get_settings()
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials.",
@@ -42,10 +57,10 @@ def get_current_user(token: str) -> TokenData:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
         user_id = payload.get("sub")
         email = payload.get("email")
-        role = payload.get("role")
+        role = parse_user_role(payload.get("role"))
         if user_id is None or email is None or role is None:
             raise credentials_exception
-        return TokenData(user_id=int(user_id), email=str(email), role=str(role))
+        return TokenData(user_id=int(user_id), email=str(email), role=role)
     except JWTError:
         raise credentials_exception
 
@@ -53,7 +68,9 @@ def get_current_user(token: str) -> TokenData:
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register_user(
     request: RegisterRequest,
+    db: Session = Depends(get_db_session),
 ) -> RegisterResponse:
+    user_repository = UserRepository(db)
     existing_user = user_repository.get_by_email(request.email)
     if existing_user is not None:
         raise HTTPException(
@@ -64,17 +81,22 @@ async def register_user(
             },
         )
 
-    new_user = user_repository.add(UserInDB(
-        id=user_repository._users_by_email.__len__() + 1,
-        full_name=request.full_name,
-        email=request.email,
-        password_hash=hash_password(request.password),
-        role="user",
-    ))
-
-    access_token = create_access_token(
-        data={"sub": new_user.id, "email": new_user.email, "role": new_user.role}
-    )
+    try:
+        new_user = user_repository.create_user(
+            full_name=request.full_name,
+            email=request.email,
+            password_hash=hash_password(request.password),
+            role="user",
+        )
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Input validation failed.",
+                "errors": [{"field": "email", "message": "Email is already registered."}],
+            },
+        )
 
     return RegisterResponse(
         message="Registration successful.",
@@ -90,7 +112,9 @@ async def register_user(
 @router.post("/login", response_model=LoginResponse)
 async def login_user(
     request: LoginRequest,
+    db: Session = Depends(get_db_session),
 ) -> LoginResponse:
+    user_repository = UserRepository(db)
     matched_user = user_repository.get_by_email(request.email)
     if matched_user is None or not verify_password(request.password, matched_user.password_hash):
         raise HTTPException(
@@ -102,7 +126,7 @@ async def login_user(
         )
 
     access_token = create_access_token(
-        data={"sub": matched_user.id, "email": matched_user.email, "role": matched_user.role}
+        data={"sub": str(matched_user.id), "email": matched_user.email, "role": matched_user.role}
     )
 
     return LoginResponse(
@@ -129,8 +153,11 @@ async def get_current_user_dependency(authorization: str | None = Header(None)) 
 
 
 @router.get("/me", response_model=UserPublic)
-async def get_me(token_data: TokenData = Depends(get_current_user_dependency)) -> UserPublic:
-    print(f"Token data: {token_data}")
+async def get_me(
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> UserPublic:
+    user_repository = UserRepository(db)
     user = user_repository.get_by_id(token_data.user_id)
     if user is None:
         raise HTTPException(

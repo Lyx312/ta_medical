@@ -53,7 +53,11 @@ class MedicalDocumentProcessor:
         self._settings = settings
         self._prompt_file_path = prompt_file_path or PROMPT_FILE_PATH
 
-    async def process(self, images: list[DocumentImageInput]) -> AIMedicalScanResponse:
+    async def process(
+        self,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+    ) -> AIMedicalScanResponse:
         if not images:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -69,6 +73,7 @@ class MedicalDocumentProcessor:
                 await self._run_model_inference(
                     model_spec=model_spec,
                     images=images,
+                    patient_name_candidates=patient_name_candidates or [],
                     prompt_bundle=prompt_bundle,
                 )
             )
@@ -131,11 +136,16 @@ class MedicalDocumentProcessor:
         self,
         model_spec: AIModelSpec,
         images: list[DocumentImageInput],
+        patient_name_candidates: list[str],
         prompt_bundle: PromptBundle,
     ) -> AIMedicalScanResponse:
         model = self._create_chat_model(model_spec)
         messages = self._normalize_message_content(
-            self._build_messages(images=images, prompt_bundle=prompt_bundle)
+            self._build_messages(
+                images=images,
+                patient_name_candidates=patient_name_candidates,
+                prompt_bundle=prompt_bundle,
+            )
         )
         response = await model.ainvoke(messages)
 
@@ -180,11 +190,13 @@ class MedicalDocumentProcessor:
     def _build_messages(
         self,
         images: list[DocumentImageInput],
+        patient_name_candidates: list[str],
         prompt_bundle: PromptBundle,
     ) -> list[Any]:
         template_input = {
             "image_count": len(images),
             "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+            "patient_name_candidates_json": json.dumps(patient_name_candidates, ensure_ascii=False),
         }
 
         system_prompt = PromptTemplate.from_template(

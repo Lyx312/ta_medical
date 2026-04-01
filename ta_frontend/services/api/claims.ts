@@ -4,6 +4,7 @@ import type { ClaimResponse, CreateClaimPayload } from './types';
 export async function createClaim(payload: CreateClaimPayload): Promise<ClaimResponse> {
   const formData = new FormData();
 
+  formData.append('nama_pasien', payload.nama_pasien);
   formData.append('tanggal_pelayanan', payload.tanggal_pelayanan);
   formData.append('fasilitas_kesehatan', payload.fasilitas_kesehatan);
   formData.append('jenis_manfaat', payload.jenis_manfaat);
@@ -32,4 +33,3 @@ export function getClaims(): Promise<ClaimResponse[]> {
 export function getClaim(claimId: number): Promise<ClaimResponse> {
   return getJson<ClaimResponse>(`/claims/${claimId}`, true);
 }
-

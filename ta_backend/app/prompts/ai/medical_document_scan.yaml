@@ -8,6 +8,9 @@ system_template: |
 user_template: |
   Analyze the {image_count} uploaded medical document image(s).
   Treat the full set of images as one claim packet and combine information across pages.
+  Known patient name candidates for this user: {patient_name_candidates_json}
+  Use the candidate names only as hints to disambiguate patient names found in the documents.
+  Do not invent or force a candidate name if the documents do not support it.
   If a value is missing or unreadable, use null, an empty string, an empty object, or an empty array as appropriate.
   Preserve the existing response structure exactly and keep number fields numeric.
   Return only the JSON object.

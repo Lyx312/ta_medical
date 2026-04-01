@@ -19,6 +19,9 @@ def _validate_email(value: str) -> str:
     return email
 
 
+UserRole = Literal["user", "admin"]
+
+
 class RegisterRequest(BaseModel):
     full_name: str = Field(min_length=1, max_length=150)
     email: str = Field(max_length=255)
@@ -59,7 +62,7 @@ class UserPublic(BaseModel):
     id: int
     full_name: str
     email: str
-    role: Literal["user", "admin"]
+    role: UserRole
 
 
 class RegisterResponse(BaseModel):
@@ -88,7 +91,7 @@ class LoginRequest(BaseModel):
 class TokenPayload(BaseModel):
     sub: int
     email: str
-    role: str
+    role: UserRole
     exp: datetime
 
 
@@ -102,4 +105,4 @@ class LoginResponse(BaseModel):
 class TokenData(BaseModel):
     user_id: int
     email: str
-    role: str
+    role: UserRole

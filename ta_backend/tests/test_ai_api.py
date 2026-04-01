@@ -1,5 +1,8 @@
 import asyncio
+import base64
 import json
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi import HTTPException
@@ -7,15 +10,22 @@ from fastapi.testclient import TestClient
 from langchain_core.language_models._utils import _normalize_messages
 from langchain_core.messages import AIMessage
 
+from app.api.routes import ai as ai_route
 from app.api.routes.ai import processor
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
+from app.db.session import clear_database_caches
 from app.main import create_app
 from app.schemas.ai import AIMedicalScanResponse
 from app.services import ai_service
 from app.services.ai_service import AIModelSpec, DocumentImageInput, MedicalDocumentProcessor
+from app.services.image_preprocessing import ProcessedDocumentImage
 
 
-app = create_app()
+def get_message_block(content: Any, index: int) -> dict[str, Any]:
+    assert isinstance(content, list)
+    block = content[index]
+    assert isinstance(block, dict)
+    return cast(dict[str, Any], block)
 
 SCAN_RESULT = {
     "summary": {
@@ -70,28 +80,104 @@ def build_settings(google_api_key: str = "test-google-key") -> Settings:
         google_api_key=google_api_key,
         jwt_secret="test-secret",
         access_token_expire_minutes=60,
+        database_url="sqlite:///:memory:",
     )
 
 
-def test_scan_documents_returns_validated_ai_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = TestClient(app)
+@pytest.fixture()
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    database_path = tmp_path / "ai-test.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
+    monkeypatch.setenv("APP_ENV", "test")
+    get_settings.cache_clear()
+    clear_database_caches()
 
-    async def fake_process(images: list[DocumentImageInput]) -> AIMedicalScanResponse:
+    app = create_app()
+    with TestClient(app) as test_client:
+        yield test_client
+
+    clear_database_caches()
+    get_settings.cache_clear()
+
+
+def register_and_login(client: TestClient, *, email: str, full_name: str = "AI User") -> str:
+    register = client.post(
+        "/api/auth/register",
+        json={
+            "full_name": full_name,
+            "email": email,
+            "password": "password123",
+            "confirm_password": "password123",
+        },
+    )
+    assert register.status_code == 201
+
+    login = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": "password123"},
+    )
+    assert login.status_code == 200
+    return login.json()["access_token"]
+
+
+def test_scan_documents_returns_validated_ai_payload(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, email="scan@example.com", full_name="Siti Aminah")
+    family_member_response = client.post(
+        "/api/family-members",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Budi Saputra", "relation": "Child"},
+    )
+    assert family_member_response.status_code == 201
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "scan.png"
+        assert content == b"abc"
+        return ProcessedDocumentImage(
+            filename="scan.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+    ) -> AIMedicalScanResponse:
         assert len(images) == 1
-        assert images[0].filename == "scan.png"
-        assert images[0].mime_type == "image/png"
-        assert images[0].base64_data == "YWJj"
+        assert images[0].filename == "scan.jpg"
+        assert images[0].mime_type == "image/jpeg"
+        assert images[0].base64_data == base64.b64encode(b"processed-image").decode("utf-8")
+        assert patient_name_candidates == ["Siti Aminah", "Budi Saputra"]
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
 
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
     monkeypatch.setattr(processor, "process", fake_process)
 
     response = client.post(
         "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
         files=[("files", ("scan.png", b"abc", "image/png"))],
     )
 
     assert response.status_code == 200
     assert response.json() == SCAN_RESULT
+
+
+def test_scan_documents_rejects_invalid_image_upload(client: TestClient) -> None:
+    token = register_and_login(client, email="invalid-image@example.com", full_name="Siti Aminah")
+
+    response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("broken.png", b"not-an-image", "image/png"))],
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["message"] == "Input validation failed."
+    assert payload["errors"] == [{"field": "non_field", "message": "Uploaded file is not a readable image."}]
 
 
 def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:
@@ -106,14 +192,20 @@ def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:
                 base64_data="YWJj",
             )
         ],
+        patient_name_candidates=["Siti Aminah", "Budi Saputra"],
         prompt_bundle=prompt_bundle,
     )
 
+    text_block = get_message_block(messages[1].content, 0)
+    image_block = get_message_block(messages[1].content, 1)
+    image_url = cast(dict[str, Any], image_block["image_url"])
+
     assert "Return only valid JSON" in str(messages[0].content)
-    assert "Analyze the 1 uploaded medical document image(s)." in messages[1].content[0]["text"]
-    assert messages[1].content[1]["type"] == "image_url"
-    assert messages[1].content[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert messages[1].content[1]["image_url"]["url"] == "data:image/png;base64,YWJj"
+    assert "Analyze the 1 uploaded medical document image(s)." in cast(str, text_block["text"])
+    assert '["Siti Aminah", "Budi Saputra"]' in cast(str, text_block["text"])
+    assert image_block["type"] == "image_url"
+    assert cast(str, image_url["url"]).startswith("data:image/png;base64,")
+    assert image_url["url"] == "data:image/png;base64,YWJj"
 
 
 def test_build_messages_remain_image_url_after_langchain_normalization() -> None:
@@ -127,13 +219,16 @@ def test_build_messages_remain_image_url_after_langchain_normalization() -> None
                 base64_data="YWJj",
             )
         ],
+        patient_name_candidates=["Siti Aminah"],
         prompt_bundle=prompt_bundle,
     )
 
     normalized_messages = _normalize_messages(messages)
+    image_block = get_message_block(normalized_messages[1].content, 1)
+    image_url = cast(dict[str, Any], image_block["image_url"])
 
-    assert normalized_messages[1].content[1]["type"] == "image_url"
-    assert normalized_messages[1].content[1]["image_url"]["url"] == "data:image/png;base64,YWJj"
+    assert image_block["type"] == "image_url"
+    assert image_url["url"] == "data:image/png;base64,YWJj"
 
 
 def test_langchain_normalization_does_not_rewrite_built_image_to_base64_block() -> None:
@@ -147,15 +242,17 @@ def test_langchain_normalization_does_not_rewrite_built_image_to_base64_block() 
                 base64_data="YWJj",
             )
         ],
+        patient_name_candidates=["Siti Aminah"],
         prompt_bundle=prompt_bundle,
     )
 
     normalized_messages = _normalize_messages(messages)
-    image_block = normalized_messages[1].content[1]
+    image_block = get_message_block(normalized_messages[1].content, 1)
+    image_url = cast(dict[str, Any], image_block["image_url"])
 
     assert image_block["type"] == "image_url"
     assert "base64" not in image_block
-    assert image_block["image_url"]["url"] == "data:image/png;base64,YWJj"
+    assert image_url["url"] == "data:image/png;base64,YWJj"
 
 
 def test_process_returns_validated_result_from_model_json(monkeypatch: pytest.MonkeyPatch) -> None:

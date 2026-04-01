@@ -3,12 +3,16 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from app.api.routes.auth import get_current_user_dependency
+from app.core.config import get_settings
 from app.models.claim import Claim, ClaimRepository, _next_id
 from app.schemas.auth import TokenData
 from app.schemas.claim import ClaimResponse, parse_claim_date
+from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
+from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 claim_repository = ClaimRepository()
+validation_processor = DocumentValidationProcessor(settings=get_settings())
 
 
 @router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
@@ -39,9 +43,23 @@ async def create_claim(
         ) from exc
 
     file_contents: list[str] = []
+    validation_images: list[DocumentImageInput] = []
     for file in files:
         content = await file.read()
         file_contents.append(base64.b64encode(content).decode("utf-8"))
+        processed_image = preprocess_document_image(
+            filename=file.filename or "uploaded_file",
+            content=content,
+        )
+        validation_images.append(
+            DocumentImageInput(
+                filename=processed_image.filename,
+                mime_type=processed_image.mime_type,
+                base64_data=base64.b64encode(processed_image.content).decode("utf-8"),
+            )
+        )
+
+    await validation_processor.process(validation_images)
 
     claim = claim_repository.add(Claim(
         id=_next_id(),

@@ -10,11 +10,17 @@ from app.repositories.family_member_repository import FamilyMemberRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import TokenData
 from app.schemas.ai import AIMedicalScanResponse
-from app.services.ai_service import DocumentImageInput, MedicalDocumentProcessor
+from app.services.ai_service import (
+    DocumentImageInput,
+    DocumentValidationProcessor,
+    MedicalDocumentProcessor,
+    matches_any_patient_name_candidate,
+)
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 processor = MedicalDocumentProcessor(settings=get_settings())
+validation_processor = DocumentValidationProcessor(settings=get_settings())
 
 
 def build_patient_name_candidates(user_full_name: str, family_member_names: list[str]) -> list[str]:
@@ -67,8 +73,30 @@ async def scan_documents(
             )
         )
 
+    await validation_processor.process(images)
+
     patient_name_candidates = build_patient_name_candidates(
         user_full_name=user.full_name,
         family_member_names=[family_member.name for family_member in family_members],
     )
-    return await processor.process(images, patient_name_candidates=patient_name_candidates)
+    extraction_result = await processor.process(images, patient_name_candidates=patient_name_candidates)
+
+    extracted_patient_name = extraction_result.patient_info.get("name")
+    if isinstance(extracted_patient_name, str) and not matches_any_patient_name_candidate(
+        extracted_patient_name,
+        patient_name_candidates,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "message": "Patient name verification failed.",
+                "errors": [
+                    {
+                        "field": "non_field",
+                        "message": "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document.",
+                    }
+                ],
+            },
+        )
+
+    return extraction_result

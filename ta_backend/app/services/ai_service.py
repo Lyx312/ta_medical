@@ -11,10 +11,17 @@ from langchain_core.prompts import PromptTemplate
 from pydantic import ValidationError
 
 from app.core.config import ROOT_DIR, Settings
-from app.schemas.ai import AIMedicalScanResponse
+from app.db.session import get_session_factory
+from app.repositories.ai_model_repository import AIModelRepository
+from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 
 
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
+VALIDATION_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_validation.yaml"
+STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"receipt", "medical_form", "doctor_note", "prescription"}
+STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"lab_result", "radiology_result"}
+SUPPORTED_MEDICAL_DOCUMENT_TYPES = STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
+MIN_FUZZY_NAME_LENGTH = 4
 
 
 @dataclass(frozen=True)
@@ -39,12 +46,65 @@ class PromptBundle:
     output_contract: dict[str, Any]
 
 
-ACTIVE_AI_MODELS = [
-    AIModelSpec(provider="google_genai", model="gemini-3.1-flash-lite-preview", enabled=True),
-]
+def normalize_patient_name(name: str) -> str:
+    return " ".join(name.strip().casefold().split())
 
 
-class MedicalDocumentProcessor:
+def is_single_typo_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+
+    if len(left) < MIN_FUZZY_NAME_LENGTH or len(right) < MIN_FUZZY_NAME_LENGTH:
+        return False
+
+    if abs(len(left) - len(right)) > 1:
+        return False
+
+    if len(left) == len(right):
+        mismatches = sum(1 for left_char, right_char in zip(left, right) if left_char != right_char)
+        return mismatches <= 1
+
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = 0
+    long_index = 0
+    mismatch_found = False
+
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+
+        if mismatch_found:
+            return False
+
+        mismatch_found = True
+        long_index += 1
+
+    return True
+
+
+def matches_any_patient_name_candidate(extracted_name: str | None, candidates: list[str]) -> bool:
+    if extracted_name is None or not extracted_name.strip():
+        return True
+
+    normalized_extracted_name = normalize_patient_name(extracted_name)
+    normalized_candidates = [
+        normalize_patient_name(candidate)
+        for candidate in candidates
+        if candidate.strip()
+    ]
+
+    if normalized_extracted_name in normalized_candidates:
+        return True
+
+    return any(
+        is_single_typo_match(normalized_extracted_name, normalized_candidate)
+        for normalized_candidate in normalized_candidates
+    )
+
+
+class BaseDocumentAIProcessor:
     def __init__(
         self,
         settings: Settings,
@@ -52,45 +112,6 @@ class MedicalDocumentProcessor:
     ) -> None:
         self._settings = settings
         self._prompt_file_path = prompt_file_path or PROMPT_FILE_PATH
-
-    async def process(
-        self,
-        images: list[DocumentImageInput],
-        patient_name_candidates: list[str] | None = None,
-    ) -> AIMedicalScanResponse:
-        if not images:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="At least one image file is required.",
-            )
-
-        prompt_bundle = self._load_prompt_bundle()
-        model_specs = self._get_enabled_model_specs()
-
-        inference_results: list[AIMedicalScanResponse] = []
-        for model_spec in model_specs[:1]:
-            inference_results.append(
-                await self._run_model_inference(
-                    model_spec=model_spec,
-                    images=images,
-                    patient_name_candidates=patient_name_candidates or [],
-                    prompt_bundle=prompt_bundle,
-                )
-            )
-
-        return self.combine_inference_results(inference_results)
-
-    def combine_inference_results(
-        self,
-        results: list[AIMedicalScanResponse],
-    ) -> AIMedicalScanResponse:
-        if not results:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="No AI inference result was produced.",
-            )
-        print("Inference results:", results)
-        return results[0]
 
     def _load_prompt_bundle(self) -> PromptBundle:
         try:
@@ -124,40 +145,21 @@ class MedicalDocumentProcessor:
         )
 
     def _get_enabled_model_specs(self) -> list[AIModelSpec]:
-        enabled_models = [model for model in ACTIVE_AI_MODELS if model.enabled]
+        session_factory = get_session_factory()
+        with session_factory() as db:
+            repository = AIModelRepository(db)
+            active_models = repository.list_active()
+
+        enabled_models = [
+            AIModelSpec(provider=model.provider, model=model.model_name, enabled=model.is_active)
+            for model in active_models
+        ]
         if not enabled_models:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="No enabled AI model is configured.",
+                detail="No active AI model is configured.",
             )
         return enabled_models
-
-    async def _run_model_inference(
-        self,
-        model_spec: AIModelSpec,
-        images: list[DocumentImageInput],
-        patient_name_candidates: list[str],
-        prompt_bundle: PromptBundle,
-    ) -> AIMedicalScanResponse:
-        model = self._create_chat_model(model_spec)
-        messages = self._normalize_message_content(
-            self._build_messages(
-                images=images,
-                patient_name_candidates=patient_name_candidates,
-                prompt_bundle=prompt_bundle,
-            )
-        )
-        response = await model.ainvoke(messages)
-
-        payload = self._parse_ai_response_to_json(response.content)
-
-        try:
-            return AIMedicalScanResponse.model_validate(payload)
-        except ValidationError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="AI model returned invalid response shape.",
-            ) from exc
 
     def _create_chat_model(self, model_spec: AIModelSpec) -> Any:
         if model_spec.provider != "google_genai":
@@ -186,46 +188,6 @@ class MedicalDocumentProcessor:
             google_api_key=self._settings.google_api_key,
             temperature=model_spec.temperature,
         )
-
-    def _build_messages(
-        self,
-        images: list[DocumentImageInput],
-        patient_name_candidates: list[str],
-        prompt_bundle: PromptBundle,
-    ) -> list[Any]:
-        template_input = {
-            "image_count": len(images),
-            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
-            "patient_name_candidates_json": json.dumps(patient_name_candidates, ensure_ascii=False),
-        }
-
-        system_prompt = PromptTemplate.from_template(
-            prompt_bundle.system_template,
-        ).format(**template_input)
-        user_prompt = PromptTemplate.from_template(
-            prompt_bundle.user_template,
-        ).format(**template_input)
-
-        human_content: list[dict[str, object]] = [
-            {
-                "type": "text",
-                "text": user_prompt,
-            }
-        ]
-        for image in images:
-            human_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
-                    },
-                }
-            )
-
-        return [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=cast(list[str | dict[object, object]], human_content)),
-        ]
 
     def _normalize_message_content(self, messages: list[Any]) -> list[Any]:
         return messages
@@ -293,3 +255,298 @@ class MedicalDocumentProcessor:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         return "\n".join(lines).strip()
+
+
+class MedicalDocumentProcessor(BaseDocumentAIProcessor):
+    async def process(
+        self,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+    ) -> AIMedicalScanResponse:
+        if not images:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="At least one image file is required.",
+            )
+
+        prompt_bundle = self._load_prompt_bundle()
+        model_specs = self._get_enabled_model_specs()
+
+        inference_results: list[AIMedicalScanResponse] = []
+        for model_spec in model_specs[:1]:
+            inference_results.append(
+                await self._run_model_inference(
+                    model_spec=model_spec,
+                    images=images,
+                    patient_name_candidates=patient_name_candidates or [],
+                    prompt_bundle=prompt_bundle,
+                )
+            )
+
+        return self.combine_inference_results(inference_results)
+
+    def combine_inference_results(
+        self,
+        results: list[AIMedicalScanResponse],
+    ) -> AIMedicalScanResponse:
+        if not results:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="No AI inference result was produced.",
+            )
+        return results[0]
+
+    async def _run_model_inference(
+        self,
+        model_spec: AIModelSpec,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str],
+        prompt_bundle: PromptBundle,
+    ) -> AIMedicalScanResponse:
+        model = self._create_chat_model(model_spec)
+        messages = self._normalize_message_content(
+            self._build_messages(
+                images=images,
+                patient_name_candidates=patient_name_candidates,
+                prompt_bundle=prompt_bundle,
+            )
+        )
+        response = await model.ainvoke(messages)
+
+        payload = self._parse_ai_response_to_json(response.content)
+
+        try:
+            return AIMedicalScanResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="AI model returned invalid response shape.",
+            ) from exc
+
+    def _build_messages(
+        self,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str],
+        prompt_bundle: PromptBundle,
+    ) -> list[Any]:
+        template_input = {
+            "image_count": len(images),
+            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+            "patient_name_candidates_json": json.dumps(patient_name_candidates, ensure_ascii=False),
+        }
+
+        system_prompt = PromptTemplate.from_template(
+            prompt_bundle.system_template,
+        ).format(**template_input)
+        user_prompt = PromptTemplate.from_template(
+            prompt_bundle.user_template,
+        ).format(**template_input)
+
+        human_content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": user_prompt,
+            }
+        ]
+        for image in images:
+            human_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
+                    },
+                }
+            )
+
+        return [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=cast(list[str | dict[object, object]], human_content)),
+        ]
+
+class DocumentValidationProcessor(BaseDocumentAIProcessor):
+    def __init__(
+        self,
+        settings: Settings,
+        prompt_file_path: Path | None = None,
+    ) -> None:
+        super().__init__(settings=settings, prompt_file_path=prompt_file_path or VALIDATION_PROMPT_FILE_PATH)
+
+    async def process(self, images: list[DocumentImageInput]) -> DocumentValidationResponse:
+        if not images:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="At least one image file is required.",
+            )
+
+        prompt_bundle = self._load_prompt_bundle()
+        model_specs = self._get_enabled_model_specs()
+
+        inference_results: list[DocumentValidationResponse] = []
+        for model_spec in model_specs[:1]:
+            inference_results.append(
+                await self._run_model_inference(
+                    model_spec=model_spec,
+                    images=images,
+                    prompt_bundle=prompt_bundle,
+                )
+            )
+
+        validation_result = self.combine_inference_results(inference_results)
+        self._enforce_validation_rules(validation_result)
+        return validation_result
+
+    def combine_inference_results(
+        self,
+        results: list[DocumentValidationResponse],
+    ) -> DocumentValidationResponse:
+        if not results:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="No AI validation result was produced.",
+            )
+        return results[0]
+
+    async def _run_model_inference(
+        self,
+        model_spec: AIModelSpec,
+        images: list[DocumentImageInput],
+        prompt_bundle: PromptBundle,
+    ) -> DocumentValidationResponse:
+        model = self._create_chat_model(model_spec)
+        messages = self._build_messages(images=images, prompt_bundle=prompt_bundle)
+        response = await model.ainvoke(messages)
+        payload = self._parse_ai_response_to_json(response.content)
+
+        try:
+            return DocumentValidationResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="AI model returned invalid validation response shape.",
+            ) from exc
+
+    def _build_messages(
+        self,
+        images: list[DocumentImageInput],
+        prompt_bundle: PromptBundle,
+    ) -> list[Any]:
+        template_input = {
+            "image_count": len(images),
+            "filenames_json": json.dumps([image.filename for image in images], ensure_ascii=False),
+            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+        }
+
+        system_prompt = PromptTemplate.from_template(
+            prompt_bundle.system_template,
+        ).format(**template_input)
+        user_prompt = PromptTemplate.from_template(
+            prompt_bundle.user_template,
+        ).format(**template_input)
+
+        human_content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": user_prompt,
+            }
+        ]
+        for image in images:
+            human_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
+                    },
+                }
+            )
+
+        return [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=cast(list[str | dict[object, object]], human_content)),
+        ]
+
+    def _enforce_validation_rules(self, result: DocumentValidationResponse) -> None:
+        failures: list[str] = []
+
+        if not result.images:
+            failures.append("No document images could be validated.")
+
+        for image_result in result.images:
+            image_label = f"Image {image_result.image_index + 1}"
+
+            if image_result.document_count_detected <= 0:
+                failures.append(f"{image_label}: no medical document could be detected.")
+
+            if image_result.document_count_detected != len(image_result.documents):
+                failures.append(
+                    f"{image_label}: multiple documents were present but could not be validated clearly."
+                )
+
+            if not image_result.documents:
+                failures.append(f"{image_label}: no documents could be validated.")
+                continue
+
+            for document in image_result.documents:
+                document_label = f"{image_label} document {document.document_index + 1}"
+
+                if document.decision != "valid":
+                    failures.append(
+                        self._build_document_failure(
+                            document_label=document_label,
+                            reasons=document.reasons,
+                            fallback_message="the document could not be validated confidently. Please retake or reupload a clearer image.",
+                        )
+                    )
+                    continue
+
+                if document.document_type not in SUPPORTED_MEDICAL_DOCUMENT_TYPES:
+                    failures.append(f"{document_label}: unsupported or non-medical document type.")
+                    continue
+
+                if not document.is_medical_document:
+                    failures.append(f"{document_label}: the uploaded document is not recognized as a medical claim document.")
+                    continue
+
+                if not document.readability_ok:
+                    failures.append(f"{document_label}: the document is unreadable, blurred, or cropped.")
+
+                if not document.facility_identity_visible:
+                    failures.append(f"{document_label}: the medical facility identity is not clearly visible.")
+
+                if (
+                    document.document_type in STAMP_OR_SIGNATURE_REQUIRED_TYPES
+                    and not (document.stamp_detected or document.signature_detected)
+                ):
+                    failures.append(f"{document_label}: a visible facility stamp or doctor signature is required.")
+
+        if failures:
+            deduped_failures = list(dict.fromkeys(failures))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "message": "Document validation failed.",
+                    "errors": [
+                        {
+                            "field": "non_field",
+                            "message": self._build_validation_failure_message(deduped_failures),
+                        }
+                    ],
+                },
+            )
+
+    def _build_document_failure(
+        self,
+        document_label: str,
+        reasons: list[str],
+        fallback_message: str,
+    ) -> str:
+        normalized_reasons = [reason.strip() for reason in reasons if reason.strip()]
+        if normalized_reasons:
+            return f"{document_label}: {normalized_reasons[0]}"
+
+        return f"{document_label}: {fallback_message}"
+
+    def _build_validation_failure_message(self, failures: list[str]) -> str:
+        if len(failures) <= 3:
+            return "; ".join(failures)
+
+        return "; ".join([*failures[:3], f"and {len(failures) - 3} more issue(s)."])

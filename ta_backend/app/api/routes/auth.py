@@ -152,6 +152,17 @@ async def get_current_user_dependency(authorization: str | None = Header(None)) 
     return get_current_user(token)
 
 
+async def get_current_admin_dependency(
+    token_data: TokenData = Depends(get_current_user_dependency),
+) -> TokenData:
+    if token_data.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to access this resource.",
+        )
+    return token_data
+
+
 @router.get("/me", response_model=UserPublic)
 async def get_me(
     token_data: TokenData = Depends(get_current_user_dependency),

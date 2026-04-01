@@ -11,6 +11,14 @@ export type FamilyMember = {
   relation: string;
 };
 
+export type AIModelConfiguration = {
+  id: number;
+  display_name: string;
+  model_name: string;
+  provider: string;
+  is_active: boolean;
+};
+
 export type LoginResponse = {
   message: string;
   access_token: string;
@@ -133,4 +141,8 @@ export type CreateFamilyMemberPayload = {
 export type UpdateFamilyMemberPayload = {
   name: string;
   relation: string;
+};
+
+export type UpdateAIModelPayload = {
+  is_active: boolean;
 };

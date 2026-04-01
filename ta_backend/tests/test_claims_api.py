@@ -3,12 +3,17 @@ from typing import Generator
 
 import pytest
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 import app.models.claim as claim_model
+from app.api.routes import claims as claims_route
 from app.api.routes.claims import claim_repository
 from app.core.config import get_settings
 from app.db.session import clear_database_caches
 from app.main import create_app
+from app.schemas.ai import DocumentValidationResponse
+from app.services.ai_service import DocumentImageInput
+from app.services.image_preprocessing import ProcessedDocumentImage
 
 
 @pytest.fixture()
@@ -50,8 +55,51 @@ def register_and_login(client: TestClient, email: str) -> str:
     return login.json()["access_token"]
 
 
-def test_create_and_list_claims_include_nama_pasien(client: TestClient) -> None:
+def test_create_and_list_claims_include_nama_pasien(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     token = register_and_login(client, "claims@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+        assert len(images) == 1
+        assert images[0].filename == "receipt.jpg"
+        return DocumentValidationResponse.model_validate(
+            {
+                "images": [
+                    {
+                        "image_index": 0,
+                        "filename": images[0].filename,
+                        "document_count_detected": 1,
+                        "documents": [
+                            {
+                                "document_index": 0,
+                                "document_type": "receipt",
+                                "is_medical_document": True,
+                                "readability_ok": True,
+                                "facility_identity_visible": True,
+                                "stamp_detected": True,
+                                "signature_detected": False,
+                                "decision": "valid",
+                                "reasons": ["Visible facility stamp detected."],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
 
     create_response = client.post(
         "/api/claims",
@@ -65,6 +113,7 @@ def test_create_and_list_claims_include_nama_pasien(client: TestClient) -> None:
             "keterangan_penyakit": "Demam",
             "kronologi": "Pemeriksaan rawat jalan",
         },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
     )
 
     assert create_response.status_code == 201
@@ -107,3 +156,60 @@ def test_create_claim_rejects_non_dmy_date_format(client: TestClient) -> None:
     assert payload["errors"] == [
         {"field": "non_field", "message": "Invalid tanggal_pelayanan. Expected format: dd-mm-yyyy"}
     ]
+
+
+def test_create_claim_rejects_document_validation_failure(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-invalid-doc@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+        assert len(images) == 1
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Document validation failed.",
+                "errors": [
+                    {
+                        "field": "non_field",
+                        "message": "Image 1 document 1: a visible facility stamp or doctor signature is required.",
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["message"] == "Document validation failed."
+    assert payload["errors"] == [
+        {"field": "non_field", "message": "Image 1 document 1: a visible facility stamp or doctor signature is required."}
+    ]
+    assert claim_repository.get_all() == []

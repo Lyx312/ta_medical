@@ -1,23 +1,109 @@
 import base64
-from datetime import date, datetime, timezone
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from sqlalchemy.orm import Session
+
 from app.api.routes.auth import get_current_user_dependency
 from app.core.config import get_settings
-from app.models.claim import Claim, ClaimRepository, _next_id
+from app.db.session import get_db_session
+from app.repositories.claim_repository import ClaimFileCreate, ClaimRepository
+from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.auth import TokenData
 from app.schemas.claim import ClaimResponse, parse_claim_date
 from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/claims", tags=["claims"])
-claim_repository = ClaimRepository()
 validation_processor = DocumentValidationProcessor(settings=get_settings())
+
+
+@dataclass(frozen=True)
+class BufferedUpload:
+    filename: str
+    mime_type: str
+    content: bytes
+    byte_size: int
+    sha256_hash: str
+
+
+def build_claim_response(claim: Any) -> ClaimResponse:
+    return ClaimResponse(
+        id=claim.id,
+        user_id=claim.user_id,
+        user_email=claim.user_email,
+        nama_pasien=claim.nama_pasien,
+        tanggal_pelayanan=claim.tanggal_pelayanan,
+        fasilitas_kesehatan=claim.fasilitas_kesehatan,
+        jenis_manfaat=claim.jenis_manfaat,
+        nominal_klaim=claim.nominal_klaim,
+        keterangan_penyakit=claim.keterangan_penyakit,
+        kronologi=claim.kronologi,
+        file_count=len(claim.files),
+        status=claim.status,
+        source_scan_log_id=claim.source_scan_log_id,
+        created_at=claim.created_at,
+    )
+
+
+def normalize_upload_filename(filename: str | None, index: int) -> str:
+    candidate = (filename or "").strip()
+    if candidate:
+        return candidate
+    return f"uploaded_file_{index + 1}"
+
+
+def build_sorted_hashes(items: list[str]) -> list[str]:
+    return sorted(items)
+
+
+def build_invalid_scan_log_link_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "message": "Input validation failed.",
+            "errors": [
+                {
+                    "field": "source_scan_log_id",
+                    "message": "The selected scan log cannot be linked to this claim.",
+                }
+            ],
+        },
+    )
+
+
+async def read_uploaded_files(files: list[UploadFile]) -> list[BufferedUpload]:
+    buffered_uploads: list[BufferedUpload] = []
+    for index, file in enumerate(files):
+        content = await file.read()
+        buffered_uploads.append(
+            BufferedUpload(
+                filename=normalize_upload_filename(file.filename, index),
+                mime_type=file.content_type or "application/octet-stream",
+                content=content,
+                byte_size=len(content),
+                sha256_hash=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    return buffered_uploads
+
+
+def scan_log_matches_uploaded_files(scan_log: Any, uploads: list[BufferedUpload]) -> bool:
+    if scan_log.status != "succeeded":
+        return False
+
+    return build_sorted_hashes([scan_file.original_sha256_hash for scan_file in scan_log.files]) == build_sorted_hashes(
+        [upload.sha256_hash for upload in uploads]
+    )
 
 
 @router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
 async def create_claim(
     token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
     nama_pasien: str = Form(...),
     tanggal_pelayanan: str = Form(...),
     fasilitas_kesehatan: str = Form(...),
@@ -25,6 +111,7 @@ async def create_claim(
     nominal_klaim: float = Form(...),
     keterangan_penyakit: str = Form(...),
     kronologi: str = Form(...),
+    source_scan_log_id: int | None = Form(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> ClaimResponse:
     valid_types = ["rawat_jalan", "rawat_inap", "emergency", "maternity"]
@@ -42,14 +129,12 @@ async def create_claim(
             detail="Invalid tanggal_pelayanan. Expected format: dd-mm-yyyy",
         ) from exc
 
-    file_contents: list[str] = []
+    buffered_uploads = await read_uploaded_files(files)
     validation_images: list[DocumentImageInput] = []
-    for file in files:
-        content = await file.read()
-        file_contents.append(base64.b64encode(content).decode("utf-8"))
+    for upload in buffered_uploads:
         processed_image = preprocess_document_image(
-            filename=file.filename or "uploaded_file",
-            content=content,
+            filename=upload.filename,
+            content=upload.content,
         )
         validation_images.append(
             DocumentImageInput(
@@ -61,71 +146,58 @@ async def create_claim(
 
     await validation_processor.process(validation_images)
 
-    claim = claim_repository.add(Claim(
-        id=_next_id(),
+    if source_scan_log_id is not None:
+        scan_log_repository = ScanLogRepository(db)
+        source_scan_log = scan_log_repository.get_by_id_and_user_id(source_scan_log_id, token_data.user_id)
+        if source_scan_log is None or not scan_log_matches_uploaded_files(source_scan_log, buffered_uploads):
+            raise build_invalid_scan_log_link_error()
+
+    claim_repository = ClaimRepository(db)
+    claim = claim_repository.create(
         user_id=token_data.user_id,
         user_email=token_data.email,
-        nama_pasien=nama_pasien.strip(),
+        nama_pasien=nama_pasien,
         tanggal_pelayanan=parsed_tanggal_pelayanan,
-        fasilitas_kesehatan=fasilitas_kesehatan.strip(),
-        jenis_manfaat=jenis_manfaat,  # type: ignore
+        fasilitas_kesehatan=fasilitas_kesehatan,
+        jenis_manfaat=jenis_manfaat,
         nominal_klaim=nominal_klaim,
-        keterangan_penyakit=keterangan_penyakit.strip(),
-        kronologi=kronologi.strip(),
-        files=file_contents,
+        keterangan_penyakit=keterangan_penyakit,
+        kronologi=kronologi,
         status="pending",
         created_at=datetime.now(timezone.utc),
-    ))
-
-    return ClaimResponse(
-        id=claim.id,
-        user_id=claim.user_id,
-        user_email=claim.user_email,
-        nama_pasien=claim.nama_pasien,
-        tanggal_pelayanan=claim.tanggal_pelayanan,
-        fasilitas_kesehatan=claim.fasilitas_kesehatan,
-        jenis_manfaat=claim.jenis_manfaat,
-        nominal_klaim=claim.nominal_klaim,
-        keterangan_penyakit=claim.keterangan_penyakit,
-        kronologi=claim.kronologi,
-        file_count=len(claim.files),
-        status=claim.status,
-        created_at=claim.created_at,
+        source_scan_log_id=source_scan_log_id,
+        files=[
+            ClaimFileCreate(
+                filename=upload.filename,
+                mime_type=upload.mime_type,
+                byte_size=upload.byte_size,
+                sha256_hash=upload.sha256_hash,
+                content=upload.content,
+            )
+            for upload in buffered_uploads
+        ],
     )
+
+    return build_claim_response(claim)
 
 
 @router.get("", response_model=list[ClaimResponse])
 async def get_claims(
     token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
 ) -> list[ClaimResponse]:
+    claim_repository = ClaimRepository(db)
     claims = claim_repository.get_by_user_id(token_data.user_id)
-    claims.sort(key=lambda c: c.created_at, reverse=True)
-
-    return [
-        ClaimResponse(
-            id=c.id,
-            user_id=c.user_id,
-            user_email=c.user_email,
-            nama_pasien=c.nama_pasien,
-            tanggal_pelayanan=c.tanggal_pelayanan,
-            fasilitas_kesehatan=c.fasilitas_kesehatan,
-            jenis_manfaat=c.jenis_manfaat,
-            nominal_klaim=c.nominal_klaim,
-            keterangan_penyakit=c.keterangan_penyakit,
-            kronologi=c.kronologi,
-            file_count=len(c.files),
-            status=c.status,
-            created_at=c.created_at,
-        )
-        for c in claims
-    ]
+    return [build_claim_response(claim) for claim in claims]
 
 
 @router.get("/{claim_id}", response_model=ClaimResponse)
 async def get_claim(
     claim_id: int,
     token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
 ) -> ClaimResponse:
+    claim_repository = ClaimRepository(db)
     claim = claim_repository.get_by_id(claim_id)
     if claim is None:
         raise HTTPException(
@@ -138,18 +210,4 @@ async def get_claim(
             detail="You do not have permission to view this claim.",
         )
 
-    return ClaimResponse(
-        id=claim.id,
-        user_id=claim.user_id,
-        user_email=claim.user_email,
-        nama_pasien=claim.nama_pasien,
-        tanggal_pelayanan=claim.tanggal_pelayanan,
-        fasilitas_kesehatan=claim.fasilitas_kesehatan,
-        jenis_manfaat=claim.jenis_manfaat,
-        nominal_klaim=claim.nominal_klaim,
-        keterangan_penyakit=claim.keterangan_penyakit,
-        kronologi=claim.kronologi,
-        file_count=len(claim.files),
-        status=claim.status,
-        created_at=claim.created_at,
-    )
+    return build_claim_response(claim)

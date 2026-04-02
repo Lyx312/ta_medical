@@ -61,11 +61,15 @@ def test_startup_seed_creates_ai_model_rows_once(client: TestClient) -> None:
         repository = AIModelRepository(db)
         first_rows = repository.list_all()
 
-    assert len(first_rows) == 1
+    assert len(first_rows) == 2
     assert first_rows[0].display_name == "Gemini 3.1 Flash Lite Preview"
     assert first_rows[0].model_name == "gemini-3.1-flash-lite-preview"
     assert first_rows[0].provider == "google_genai"
     assert first_rows[0].is_active is True
+    assert first_rows[1].display_name == "Gemini 3 Flash Preview"
+    assert first_rows[1].model_name == "gemini-3-flash-preview"
+    assert first_rows[1].provider == "google_genai"
+    assert first_rows[1].is_active is True
 
     app = create_app()
     with TestClient(app):
@@ -75,8 +79,9 @@ def test_startup_seed_creates_ai_model_rows_once(client: TestClient) -> None:
         repository = AIModelRepository(db)
         second_rows = repository.list_all()
 
-    assert len(second_rows) == 1
+    assert len(second_rows) == 2
     assert second_rows[0].id == first_rows[0].id
+    assert second_rows[1].id == first_rows[1].id
 
 
 def test_admin_can_list_and_update_ai_models(client: TestClient) -> None:
@@ -89,7 +94,7 @@ def test_admin_can_list_and_update_ai_models(client: TestClient) -> None:
 
     assert list_response.status_code == 200
     models = list_response.json()
-    assert len(models) == 1
+    assert len(models) == 2
     assert models[0]["display_name"] == "Gemini 3.1 Flash Lite Preview"
     assert models[0]["is_active"] is True
 

@@ -41,6 +41,7 @@ class ClaimResponse(BaseModel):
     kronologi: str
     file_count: int
     status: str
+    source_scan_log_id: int | None = None
     created_at: datetime
 
     @field_serializer("tanggal_pelayanan")

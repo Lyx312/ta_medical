@@ -75,6 +75,7 @@ export function NewClaimScreen() {
   const [claimAmount, setClaimAmount] = useState('');
   const [diseaseDescription, setDiseaseDescription] = useState('');
   const [chronology, setChronology] = useState('');
+  const [sourceScanLogId, setSourceScanLogId] = useState<number | undefined>(undefined);
   const [isScanning, setIsScanning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -136,6 +137,7 @@ export function NewClaimScreen() {
     if (!result.canceled) {
       const newUris = result.assets.map((asset) => asset.uri);
       setImageUris((prev) => [...prev, ...newUris]);
+      setSourceScanLogId(undefined);
       setErrors((prev) => ({ ...prev, images: '' }));
     }
   };
@@ -155,11 +157,13 @@ export function NewClaimScreen() {
     if (!result.canceled) {
       const newUris = result.assets.map((asset) => asset.uri);
       setImageUris((prev) => [...prev, ...newUris]);
+      setSourceScanLogId(undefined);
       setErrors((prev) => ({ ...prev, images: '' }));
     }
   };
 
   const removeImage = (index: number) => {
+    setSourceScanLogId(undefined);
     setImageUris((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
   };
 
@@ -232,11 +236,13 @@ export function NewClaimScreen() {
     }
 
     setIsScanning(true);
+    setSourceScanLogId(undefined);
     setErrors({});
 
     try {
       const result = await scanDocuments(imageUris);
       applyAIScanData(result);
+      setSourceScanLogId(result.scan_log_id);
       Alert.alert('Success', 'Documents scanned and fields auto-filled. Please review the data.');
     } catch (err) {
       const apiError = err as ApiError;
@@ -291,6 +297,7 @@ export function NewClaimScreen() {
     setClaimAmount('');
     setDiseaseDescription('');
     setChronology('');
+    setSourceScanLogId(undefined);
     setErrors({});
   };
 
@@ -317,6 +324,7 @@ export function NewClaimScreen() {
         keterangan_penyakit: diseaseDescription.trim(),
         kronologi: chronology.trim(),
         fileUris: imageUris,
+        source_scan_log_id: sourceScanLogId,
       });
 
       Alert.alert('Success', 'Claim submitted successfully.', [{ text: 'OK', onPress: resetForm }]);

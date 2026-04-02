@@ -11,6 +11,9 @@ export async function createClaim(payload: CreateClaimPayload): Promise<ClaimRes
   formData.append('nominal_klaim', payload.nominal_klaim.toString());
   formData.append('keterangan_penyakit', payload.keterangan_penyakit);
   formData.append('kronologi', payload.kronologi);
+  if (payload.source_scan_log_id !== undefined) {
+    formData.append('source_scan_log_id', payload.source_scan_log_id.toString());
+  }
 
   for (const uri of payload.fileUris) {
     const filename = uri.split('/').pop() ?? `file_${Date.now()}.jpg`;

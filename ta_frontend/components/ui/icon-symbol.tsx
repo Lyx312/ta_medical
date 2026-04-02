@@ -21,6 +21,7 @@ const MAPPING = {
   'person.fill': 'person',
   'gearshape.fill': 'settings',
   'clock.fill': 'access-time',
+  'doc.text.fill': 'description',
   'plus.circle.fill': 'add-circle',
   'person.badge.plus': 'person-add',
 } as IconMapping;

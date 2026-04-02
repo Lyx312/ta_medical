@@ -17,6 +17,20 @@ export default function AdminTabsLayout() {
         tabBarButton: HapticTab,
       }}>
       <Tabs.Screen
+        name="logs/index"
+        options={{
+          title: 'Logs',
+          tabBarIcon: ({ color }) => <IconSymbol size={28} name="clock.fill" color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="claims/index"
+        options={{
+          title: 'Claims',
+          tabBarIcon: ({ color }) => <IconSymbol size={28} name="doc.text.fill" color={color} />,
+        }}
+      />
+      <Tabs.Screen
         name="settings/index"
         options={{
           title: 'Settings',

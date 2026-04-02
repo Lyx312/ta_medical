@@ -14,6 +14,10 @@ class AIMedicalScanResponse(BaseModel):
     financial_recap: dict[str, Any]
 
 
+class AIScanDocumentsResponse(AIMedicalScanResponse):
+    scan_log_id: int
+
+
 ValidationDocumentType = Literal[
     "receipt",
     "medical_form",

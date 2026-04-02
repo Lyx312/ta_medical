@@ -10,6 +10,47 @@ const sysError = '#E53E3E';
 const sysWarning = '#DD6B20';
 const sysInfo = '#3182CE';
 
+// --- Status Colors ---
+const statusApproved = '#22c55e';
+const statusPending = '#eab308';
+const statusRejected = sysError;
+
+export function getStatusColor(status: string, textColor: string) {
+  const normalizedStatus = status.toLowerCase();
+
+  if (normalizedStatus.includes('approve')) {
+    return statusApproved;
+  }
+
+  if (normalizedStatus.includes('pending') || normalizedStatus.includes('review')) {
+    return statusPending;
+  }
+
+  if (normalizedStatus.includes('reject')) {
+    return statusRejected;
+  }
+
+  return textColor;
+}
+
+export function getStatusBadgeBg(status: string) {
+  const normalizedStatus = status.toLowerCase();
+
+  if (normalizedStatus.includes('approve')) {
+    return `${statusApproved}20`;
+  }
+
+  if (normalizedStatus.includes('pending') || normalizedStatus.includes('review')) {
+    return `${statusPending}20`;
+  }
+
+  if (normalizedStatus.includes('reject')) {
+    return `${statusRejected}20`;
+  }
+
+  return '#71809620';
+}
+
 export const Colors = {
   light: {
     // Standard Navigation & Layout

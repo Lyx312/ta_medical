@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -16,9 +17,10 @@ from app.api.routes import ai as ai_route
 from app.api.routes.ai import processor
 from app.core.config import Settings, get_settings
 from app.db.base import Base
-from app.db.session import clear_database_caches
+from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
 from app.models.ai_model import AIModel
+from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services.ai_service import (
     AIModelSpec,
@@ -171,6 +173,12 @@ def register_and_login(client: TestClient, *, email: str, full_name: str = "AI U
     return login.json()["access_token"]
 
 
+def get_scan_log_by_id(scan_log_id: int):
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        return ScanLogRepository(db).get_by_id(scan_log_id)
+
+
 def test_scan_documents_returns_validated_ai_payload(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -219,7 +227,22 @@ def test_scan_documents_returns_validated_ai_payload(
     )
 
     assert response.status_code == 200
-    assert response.json() == SCAN_RESULT
+    payload = response.json()
+    assert payload["scan_log_id"] > 0
+    assert {key: value for key, value in payload.items() if key != "scan_log_id"} == SCAN_RESULT
+
+    scan_log = get_scan_log_by_id(payload["scan_log_id"])
+    assert scan_log is not None
+    assert scan_log.status == "succeeded"
+    assert scan_log.validation_payload == VALIDATION_RESULT
+    assert scan_log.extraction_payload == SCAN_RESULT
+    assert scan_log.ai_model_provider == "google_genai"
+    assert scan_log.ai_model_name == "gemini-3.1-flash-lite-preview"
+    assert len(scan_log.files) == 1
+    assert scan_log.files[0].original_content == b"abc"
+    assert scan_log.files[0].processed_content == b"processed-image"
+    assert scan_log.files[0].original_sha256_hash == hashlib.sha256(b"abc").hexdigest()
+    assert scan_log.files[0].processed_sha256_hash == hashlib.sha256(b"processed-image").hexdigest()
 
 
 def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates(
@@ -281,6 +304,15 @@ def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates
         }
     ]
 
+    scan_log = get_scan_log_by_id(1)
+    assert scan_log is not None
+    assert scan_log.status == "patient_name_mismatch"
+    assert scan_log.validation_payload == VALIDATION_RESULT
+    assert scan_log.extraction_payload is not None
+    assert scan_log.extraction_payload["patient_info"]["name"] == "Andi Saputra"
+    assert scan_log.error_payload is not None
+    assert scan_log.error_payload["detail"]["message"] == "Patient name verification failed."
+
 
 def test_scan_documents_returns_validation_failure_before_extraction(
     client: TestClient,
@@ -334,6 +366,14 @@ def test_scan_documents_returns_validation_failure_before_extraction(
     assert payload["errors"] == [
         {"field": "non_field", "message": "Image 1 document 1: a visible facility stamp or doctor signature is required."}
     ]
+
+    scan_log = get_scan_log_by_id(1)
+    assert scan_log is not None
+    assert scan_log.status == "validation_failed"
+    assert scan_log.validation_payload is None
+    assert scan_log.extraction_payload is None
+    assert scan_log.error_payload is not None
+    assert scan_log.error_payload["detail"]["message"] == "Document validation failed."
 
 
 def test_scan_documents_accepts_multi_document_validation_result_for_single_image(
@@ -413,7 +453,14 @@ def test_scan_documents_accepts_multi_document_validation_result_for_single_imag
     )
 
     assert response.status_code == 200
-    assert response.json() == SCAN_RESULT
+    payload = response.json()
+    assert payload["scan_log_id"] > 0
+    assert {key: value for key, value in payload.items() if key != "scan_log_id"} == SCAN_RESULT
+
+    scan_log = get_scan_log_by_id(payload["scan_log_id"])
+    assert scan_log is not None
+    assert scan_log.status == "succeeded"
+    assert len(scan_log.files) == 1
 
 
 def test_scan_documents_rejects_invalid_image_upload(client: TestClient) -> None:
@@ -429,6 +476,13 @@ def test_scan_documents_rejects_invalid_image_upload(client: TestClient) -> None
     payload = response.json()
     assert payload["message"] == "Input validation failed."
     assert payload["errors"] == [{"field": "non_field", "message": "Uploaded file is not a readable image."}]
+
+    scan_log = get_scan_log_by_id(1)
+    assert scan_log is not None
+    assert scan_log.status == "preprocess_failed"
+    assert len(scan_log.files) == 1
+    assert scan_log.files[0].original_content == b"not-an-image"
+    assert scan_log.files[0].processed_content is None
 
 
 def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:

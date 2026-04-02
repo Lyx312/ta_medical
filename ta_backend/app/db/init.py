@@ -2,7 +2,9 @@ from sqlalchemy import select
 
 from app.db.base import Base
 from app.models.ai_model import AIModel
+from app.models.claim import Claim, ClaimFile
 from app.models.family_member import FamilyMember
+from app.models.scan_log import ScanLog, ScanLogFile
 from app.db.session import get_engine, get_session_factory
 from app.models.user import User, hash_password
 from app.repositories.ai_model_repository import AIModelRepository, SeedAIModelRecord

@@ -1,49 +1,60 @@
-from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Literal
+from __future__ import annotations
 
-_counter = 0
+from datetime import date, datetime, timezone
 
+from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-def _next_id() -> int:
-    global _counter
-    _counter += 1
-    return _counter
+from app.db.base import Base
+from app.models.scan_log import ScanLog
 
 
-@dataclass(frozen=True)
-class Claim:
-    id: int
-    user_id: int
-    user_email: str
-    nama_pasien: str
-    tanggal_pelayanan: date
-    fasilitas_kesehatan: str
-    jenis_manfaat: Literal["rawat_jalan", "rawat_inap", "emergency", "maternity"]
-    nominal_klaim: float
-    keterangan_penyakit: str
-    kronologi: str
-    files: list[str]
-    status: str
-    created_at: datetime
+class Claim(Base):
+    __tablename__ = "claims"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    nama_pasien: Mapped[str] = mapped_column(String(255), nullable=False)
+    tanggal_pelayanan: Mapped[date] = mapped_column(Date, nullable=False)
+    fasilitas_kesehatan: Mapped[str] = mapped_column(String(255), nullable=False)
+    jenis_manfaat: Mapped[str] = mapped_column(String(50), nullable=False)
+    nominal_klaim: Mapped[float] = mapped_column(Float, nullable=False)
+    keterangan_penyakit: Mapped[str] = mapped_column(String, nullable=False)
+    kronologi: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    source_scan_log_id: Mapped[int | None] = mapped_column(
+        ForeignKey("scan_logs.id"),
+        index=True,
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    files: Mapped[list["ClaimFile"]] = relationship(
+        back_populates="claim",
+        cascade="all, delete-orphan",
+        order_by="ClaimFile.id.asc()",
+    )
+    source_scan_log: Mapped["ScanLog | None"] = relationship(
+        "ScanLog",
+        back_populates="linked_claims",
+        foreign_keys=[source_scan_log_id],
+    )
 
 
-class ClaimRepository:
-    def __init__(self) -> None:
-        self._claims: dict[int, Claim] = {}
+class ClaimFile(Base):
+    __tablename__ = "claim_files"
 
-    def add(self, claim: Claim) -> Claim:
-        self._claims[claim.id] = claim
-        return claim
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claims.id"), index=True, nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
-    def get_by_id(self, claim_id: int) -> Claim | None:
-        return self._claims.get(claim_id)
-
-    def get_by_user_id(self, user_id: int) -> list[Claim]:
-        return [c for c in self._claims.values() if c.user_id == user_id]
-
-    def get_all(self) -> list[Claim]:
-        return list(self._claims.values())
-
-    def clear(self) -> None:
-        self._claims.clear()
+    claim: Mapped[Claim] = relationship(back_populates="files")

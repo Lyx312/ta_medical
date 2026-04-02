@@ -161,6 +161,9 @@ class BaseDocumentAIProcessor:
             )
         return enabled_models
 
+    def get_primary_enabled_model_spec(self) -> AIModelSpec:
+        return self._get_enabled_model_specs()[0]
+
     def _create_chat_model(self, model_spec: AIModelSpec) -> Any:
         if model_spec.provider != "google_genai":
             raise HTTPException(

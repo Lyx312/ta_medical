@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes.admin_ai_models import router as admin_ai_models_router
+from app.api.routes.admin_claims import router as admin_claims_router
+from app.api.routes.admin_scan_logs import router as admin_scan_logs_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.family_members import router as family_members_router
 from app.api.routes.test import router as test_router
@@ -113,6 +115,8 @@ def create_app() -> FastAPI:
     app.add_exception_handler(StarletteHTTPException, starlette_http_exception_handler)
     app.include_router(auth_router, prefix="/api")
     app.include_router(admin_ai_models_router, prefix="/api")
+    app.include_router(admin_claims_router, prefix="/api")
+    app.include_router(admin_scan_logs_router, prefix="/api")
     app.include_router(family_members_router, prefix="/api")
     app.include_router(test_router, prefix="/api")
     app.include_router(ai_router, prefix="/api")

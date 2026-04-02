@@ -66,6 +66,7 @@ export type AIOtherCharge = {
 };
 
 export type AIMedicalScanResult = {
+  scan_log_id: number;
   summary: {
     detected_documents: string[];
     medical_facility_name: string;
@@ -107,7 +108,22 @@ export type ClaimResponse = {
   kronologi: string;
   file_count: number;
   status: string;
+  source_scan_log_id: number | null;
   created_at: string;
+};
+
+export type AdminClaimFile = {
+  id: number;
+  filename: string;
+  mime_type: string;
+  byte_size: number;
+  sha256_hash: string;
+  file_data_url: string;
+};
+
+export type AdminClaimDetail = ClaimResponse & {
+  files: AdminClaimFile[];
+  metadata?: Record<string, unknown> | null;
 };
 
 export type LoginPayload = {
@@ -131,6 +147,7 @@ export type CreateClaimPayload = {
   keterangan_penyakit: string;
   kronologi: string;
   fileUris: string[];
+  source_scan_log_id?: number;
 };
 
 export type CreateFamilyMemberPayload = {
@@ -145,4 +162,39 @@ export type UpdateFamilyMemberPayload = {
 
 export type UpdateAIModelPayload = {
   is_active: boolean;
+};
+
+export type AdminScanLogSummary = {
+  id: number;
+  user_id: number;
+  user_full_name: string;
+  user_email: string;
+  status: string;
+  file_count: number;
+  linked_claim_ids: number[];
+  ai_model_provider: string | null;
+  ai_model_name: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AdminScanLogFile = {
+  id: number;
+  original_filename: string;
+  original_mime_type: string;
+  original_byte_size: number;
+  original_sha256_hash: string;
+  original_image_data_url: string;
+  processed_filename: string | null;
+  processed_mime_type: string | null;
+  processed_byte_size: number | null;
+  processed_sha256_hash: string | null;
+  processed_image_data_url: string | null;
+};
+
+export type AdminScanLogDetail = AdminScanLogSummary & {
+  validation_payload: Record<string, unknown> | null;
+  extraction_payload: Record<string, unknown> | null;
+  error_payload: Record<string, unknown> | null;
+  files: AdminScanLogFile[];
 };

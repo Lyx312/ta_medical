@@ -7,6 +7,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   TextInput,
   View,
 } from 'react-native';
@@ -16,6 +17,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { ThemedText } from '@/components/themed-text';
 import { Colors } from '@/constants/theme';
 import { useAuth } from '@/contexts/auth-context';
+import { useThemePreference } from '@/contexts/theme-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import {
   createFamilyMember,
@@ -33,6 +35,7 @@ export function ProfileScreen({ title }: ProfileScreenProps) {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const { user, signOut } = useAuth();
+  const { setPreference } = useThemePreference();
   const [familyMembers, setFamilyMembers] = useState<FamilyMember[]>([]);
   const [isLoadingMembers, setIsLoadingMembers] = useState(false);
   const [isSavingMember, setIsSavingMember] = useState(false);
@@ -187,6 +190,27 @@ export function ProfileScreen({ title }: ProfileScreenProps) {
                 <ThemedText style={styles.info}>Name: {user?.full_name ?? 'Unknown'}</ThemedText>
                 <ThemedText style={styles.info}>Email: {user?.email ?? 'Unknown'}</ThemedText>
                 <ThemedText style={styles.info}>Role: {user?.role ?? 'Unknown'}</ThemedText>
+              </View>
+
+              <View style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+                <ThemedText style={styles.cardTitle}>Appearance</ThemedText>
+                <View style={styles.preferenceRow}>
+                  <View style={styles.preferenceTextBlock}>
+                    <ThemedText style={styles.preferenceTitle}>Dark Mode</ThemedText>
+                    <ThemedText style={styles.preferenceDescription}>
+                      Switch between the light and dark app themes.
+                    </ThemedText>
+                  </View>
+                  <Switch
+                    value={colorScheme === 'dark'}
+                    onValueChange={(value) => {
+                      void setPreference(value ? 'dark' : 'light');
+                    }}
+                    trackColor={{ false: colors.divider, true: `${colors.primary}80` }}
+                    thumbColor={colorScheme === 'dark' ? colors.primary : colors.cardBackground}
+                    ios_backgroundColor={colors.divider}
+                  />
+                </View>
               </View>
 
               {isUserProfile ? (
@@ -388,6 +412,23 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     gap: 12,
     justifyContent: 'center',
+  },
+  preferenceDescription: {
+    opacity: 0.75,
+  },
+  preferenceRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 16,
+    justifyContent: 'space-between',
+  },
+  preferenceTextBlock: {
+    flex: 1,
+    gap: 4,
+  },
+  preferenceTitle: {
+    fontSize: 16,
+    fontWeight: '600',
   },
   primaryButton: {
     alignItems: 'center',

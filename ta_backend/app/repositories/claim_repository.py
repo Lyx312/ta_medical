@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.claim import Claim, ClaimFile
@@ -90,14 +90,81 @@ class ClaimRepository:
             ).scalars()
         )
 
-    def list_all(self) -> list[Claim]:
+    def _build_admin_list_statement(
+        self,
+        *,
+        q: str | None = None,
+        linked: bool | None = None,
+        sort: str = "newest",
+        limit: int | None = None,
+    ):
+        statement = select(Claim).options(
+            selectinload(Claim.files),
+            selectinload(Claim.source_scan_log),
+        )
+
+        normalized_query = (q or "").strip()
+        if normalized_query:
+            like_pattern = f"%{normalized_query}%"
+            statement = statement.where(
+                or_(
+                    cast(Claim.id, String).ilike(like_pattern),
+                    Claim.nama_pasien.ilike(like_pattern),
+                    Claim.user_email.ilike(like_pattern),
+                )
+            )
+
+        if linked is True:
+            statement = statement.where(Claim.source_scan_log_id.is_not(None))
+        elif linked is False:
+            statement = statement.where(Claim.source_scan_log_id.is_(None))
+
+        if sort == "oldest":
+            statement = statement.order_by(Claim.created_at.asc(), Claim.id.asc())
+        elif sort == "amount_desc":
+            statement = statement.order_by(Claim.nominal_klaim.desc(), Claim.created_at.desc(), Claim.id.desc())
+        elif sort == "amount_asc":
+            statement = statement.order_by(Claim.nominal_klaim.asc(), Claim.created_at.desc(), Claim.id.desc())
+        else:
+            statement = statement.order_by(Claim.created_at.desc(), Claim.id.desc())
+
+        if limit is not None:
+            statement = statement.limit(limit)
+
+        return statement
+
+    def list_for_admin(
+        self,
+        *,
+        q: str | None = None,
+        linked: bool | None = None,
+        sort: str = "newest",
+        limit: int | None = 100,
+    ) -> list[Claim]:
         return list(
             self._db.execute(
-                select(Claim)
-                .order_by(Claim.created_at.desc(), Claim.id.desc())
-                .options(
-                    selectinload(Claim.files),
-                    selectinload(Claim.source_scan_log),
+                self._build_admin_list_statement(
+                    q=q,
+                    linked=linked,
+                    sort=sort,
+                    limit=limit,
                 )
             ).scalars()
         )
+
+    def summarize_for_admin(
+        self,
+        *,
+        q: str | None = None,
+        linked: bool | None = None,
+    ) -> dict[str, float | int]:
+        claims = self.list_for_admin(q=q, linked=linked, limit=None)
+        return {
+            "total_claims": len(claims),
+            "total_claim_amount": float(sum(claim.nominal_klaim for claim in claims)),
+            "linked_scan_count": sum(1 for claim in claims if claim.source_scan_log_id is not None),
+            "manual_submission_count": sum(1 for claim in claims if claim.source_scan_log_id is None),
+        }
+
+    def list_all(self) -> list[Claim]:
+        return self.list_for_admin(limit=None)

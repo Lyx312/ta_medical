@@ -14,6 +14,10 @@ from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
+from app.services.ai_provider_catalog import (
+    get_ai_provider_catalog_entry,
+    is_provider_scan_compatible,
+)
 
 
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
@@ -22,6 +26,31 @@ STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"receipt", "medical_form", "doctor_note", "
 STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"lab_result", "radiology_result"}
 SUPPORTED_MEDICAL_DOCUMENT_TYPES = STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
 MIN_FUZZY_NAME_LENGTH = 4
+OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
+ORIENTATION_REASON_KEYWORDS = (
+    "upside down",
+    "sideways",
+    "rotated",
+    "rotation",
+    "clockwise",
+    "counterclockwise",
+    "orientation",
+)
+NON_ORIENTATION_READABILITY_KEYWORDS = (
+    "blur",
+    "blurry",
+    "cropped",
+    "crop",
+    "occluded",
+    "occlusion",
+    "glare",
+    "shadow",
+    "cut off",
+    "unreadable",
+    "too dark",
+    "low resolution",
+    "small text",
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +64,7 @@ class DocumentImageInput:
 class AIModelSpec:
     provider: str
     model: str
+    priority: int = 100
     enabled: bool = True
     temperature: float = 0.0
 
@@ -151,7 +181,12 @@ class BaseDocumentAIProcessor:
             active_models = repository.list_active()
 
         enabled_models = [
-            AIModelSpec(provider=model.provider, model=model.model_name, enabled=model.is_active)
+            AIModelSpec(
+                provider=model.provider,
+                model=model.model_name,
+                priority=model.priority,
+                enabled=model.is_active,
+            )
             for model in active_models
         ]
         if not enabled_models:
@@ -159,38 +194,79 @@ class BaseDocumentAIProcessor:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="No active AI model is configured.",
             )
-        return enabled_models
+
+        scan_compatible_models = [
+            model_spec
+            for model_spec in enabled_models
+            if is_provider_scan_compatible(model_spec.provider)
+        ]
+        if not scan_compatible_models:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Active AI models are configured, but none currently support this image-based scan pipeline.",
+            )
+        return scan_compatible_models
 
     def get_primary_enabled_model_spec(self) -> AIModelSpec:
         return self._get_enabled_model_specs()[0]
 
     def _create_chat_model(self, model_spec: AIModelSpec) -> Any:
-        if model_spec.provider != "google_genai":
+        provider_entry = get_ai_provider_catalog_entry(model_spec.provider)
+        if provider_entry is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Unsupported AI provider config: {model_spec.provider}",
             )
 
-        if not self._settings.google_api_key:
+        credential = getattr(self._settings, provider_entry.settings_attr, "")
+        if not credential:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="GOOGLE_API_KEY is not configured.",
+                detail=f"{provider_entry.credential_env_var} is not configured.",
             )
 
         try:
-            chat_google_genai = import_module("langchain_google_genai")
-            chat_google_generative_ai = getattr(chat_google_genai, "ChatGoogleGenerativeAI")
+            provider_module = import_module(provider_entry.package_name)
+            chat_model_class = getattr(provider_module, provider_entry.class_name)
         except (ImportError, AttributeError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="The langchain-google-genai package is not installed.",
+                detail=f"The {provider_entry.package_name.replace('_', '-')} package is not installed.",
             ) from exc
 
-        return chat_google_generative_ai(
-            model=model_spec.model,
-            google_api_key=self._settings.google_api_key,
-            temperature=model_spec.temperature,
-        )
+        kwargs: dict[str, Any] = {
+            "model": model_spec.model,
+            "temperature": model_spec.temperature,
+        }
+
+        if model_spec.provider == "google_genai":
+            kwargs["google_api_key"] = credential
+        elif model_spec.provider == "openrouter":
+            kwargs["api_key"] = credential
+            # Avoid LangChain OpenRouter's default attribution fields because the
+            # installed openrouter SDK version in this environment does not
+            # accept the legacy `x_title` constructor argument it forwards.
+            kwargs["app_title"] = None
+            kwargs["app_url"] = None
+        elif model_spec.provider == "ollama":
+            kwargs["base_url"] = OLLAMA_CLOUD_BASE_URL
+            kwargs["client_kwargs"] = {
+                "headers": {
+                    "Authorization": f"Bearer {credential}",
+                },
+            }
+        elif model_spec.provider == "groq":
+            kwargs["api_key"] = credential
+        elif model_spec.provider == "mistralai":
+            kwargs["mistral_api_key"] = credential
+        elif model_spec.provider == "deepseek":
+            kwargs["api_key"] = credential
+        elif model_spec.provider == "cohere":
+            kwargs["cohere_api_key"] = credential
+        elif model_spec.provider == "cerebras":
+            kwargs["api_key"] = credential
+
+        return chat_model_class(**kwargs)
 
     def _normalize_message_content(self, messages: list[Any]) -> list[Any]:
         return messages
@@ -490,8 +566,11 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
 
             for document in image_result.documents:
                 document_label = f"{image_label} document {document.document_index + 1}"
+                has_orientation_only_issue = self._is_non_blocking_orientation_issue(document.reasons)
 
                 if document.decision != "valid":
+                    if has_orientation_only_issue:
+                        continue
                     failures.append(
                         self._build_document_failure(
                             document_label=document_label,
@@ -509,7 +588,7 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     failures.append(f"{document_label}: the uploaded document is not recognized as a medical claim document.")
                     continue
 
-                if not document.readability_ok:
+                if not document.readability_ok and not has_orientation_only_issue:
                     failures.append(f"{document_label}: the document is unreadable, blurred, or cropped.")
 
                 if not document.facility_identity_visible:
@@ -553,3 +632,16 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
             return "; ".join(failures)
 
         return "; ".join([*failures[:3], f"and {len(failures) - 3} more issue(s)."])
+
+    def _is_non_blocking_orientation_issue(self, reasons: list[str]) -> bool:
+        normalized_reasons = [reason.strip().casefold() for reason in reasons if reason.strip()]
+        if not normalized_reasons:
+            return False
+
+        for reason in normalized_reasons:
+            if not any(keyword in reason for keyword in ORIENTATION_REASON_KEYWORDS):
+                return False
+            if any(keyword in reason for keyword in NON_ORIENTATION_READABILITY_KEYWORDS):
+                return False
+
+        return True

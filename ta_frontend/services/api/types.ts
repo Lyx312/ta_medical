@@ -16,7 +16,11 @@ export type AIModelConfiguration = {
   display_name: string;
   model_name: string;
   provider: string;
+  priority: number;
   is_active: boolean;
+  supports_image_input: boolean;
+  is_scan_compatible: boolean;
+  activation_block_reason: string | null;
 };
 
 export type LoginResponse = {
@@ -70,7 +74,8 @@ export type AIMedicalScanResult = {
   summary: {
     detected_documents: string[];
     medical_facility_name: string;
-    transaction_date: string;
+    service_date: string | null;
+    transaction_date?: string | null;
     currency: string;
     total_amount: number;
   };
@@ -126,6 +131,22 @@ export type AdminClaimDetail = ClaimResponse & {
   metadata?: Record<string, unknown> | null;
 };
 
+export type AdminClaimListSort = 'newest' | 'oldest' | 'amount_desc' | 'amount_asc';
+
+export type AdminClaimListParams = {
+  q?: string;
+  linked?: boolean;
+  limit?: number;
+  sort?: AdminClaimListSort;
+};
+
+export type AdminClaimSummary = {
+  total_claims: number;
+  total_claim_amount: number;
+  linked_scan_count: number;
+  manual_submission_count: number;
+};
+
 export type LoginPayload = {
   email: string;
   password: string;
@@ -161,7 +182,8 @@ export type UpdateFamilyMemberPayload = {
 };
 
 export type UpdateAIModelPayload = {
-  is_active: boolean;
+  is_active?: boolean;
+  priority?: number;
 };
 
 export type AdminScanLogSummary = {
@@ -197,4 +219,18 @@ export type AdminScanLogDetail = AdminScanLogSummary & {
   extraction_payload: Record<string, unknown> | null;
   error_payload: Record<string, unknown> | null;
   files: AdminScanLogFile[];
+};
+
+export type AdminScanLogListParams = {
+  status?: string;
+  q?: string;
+  linked?: boolean;
+  limit?: number;
+};
+
+export type AdminScanLogQueueSummary = {
+  total_logs: number;
+  succeeded_count: number;
+  failed_count: number;
+  unlinked_count: number;
 };

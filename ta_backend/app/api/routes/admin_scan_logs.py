@@ -11,6 +11,7 @@ from app.schemas.admin_scan_log import (
     AdminScanLogDetailResponse,
     AdminScanLogFileResponse,
     AdminScanLogListItemResponse,
+    AdminScanLogSummaryResponse,
 )
 from app.schemas.auth import TokenData
 
@@ -65,13 +66,30 @@ async def get_scan_logs(
     token_data: TokenData = Depends(get_current_admin_dependency),
     db: Session = Depends(get_db_session),
     status_filter: str | None = Query(default=None, alias="status"),
+    q: str | None = Query(default=None),
+    linked: bool | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
 ) -> list[AdminScanLogListItemResponse]:
     del token_data
 
     repository = ScanLogRepository(db)
-    scan_logs = repository.list_for_admin(status=status_filter, limit=limit)
+    scan_logs = repository.list_for_admin(status=status_filter, q=q, linked=linked, limit=limit)
     return [build_scan_log_list_item(scan_log) for scan_log in scan_logs]
+
+
+@router.get("/summary", response_model=AdminScanLogSummaryResponse)
+async def get_scan_logs_summary(
+    token_data: TokenData = Depends(get_current_admin_dependency),
+    db: Session = Depends(get_db_session),
+    status_filter: str | None = Query(default=None, alias="status"),
+    q: str | None = Query(default=None),
+    linked: bool | None = Query(default=None),
+) -> AdminScanLogSummaryResponse:
+    del token_data
+
+    repository = ScanLogRepository(db)
+    summary = repository.summarize_for_admin(status=status_filter, q=q, linked=linked)
+    return AdminScanLogSummaryResponse(**summary)
 
 
 @router.get("/{scan_log_id}", response_model=AdminScanLogDetailResponse)

@@ -20,6 +20,12 @@ user_template: |
   - include concise reasons explaining the decision
   Do not infer hidden, occluded, cropped, or ambiguous stamps/signatures.
   If multiple papers are present but cannot be separated clearly, mark the affected document entries as uncertain and explain that separation is unclear.
+  A single uploaded image may contain multiple papers with different orientations.
+  Evaluate each paper independently even if some papers are upright, some are rotated 90/270 degrees, and some are upside down.
+  Do not reject a document only because it is rotated.
+  A rotated document is still readable if the text can be understood after mentally rotating it.
+  Only set readability_ok to false when the content is genuinely unreadable because of blur, crop, occlusion, glare, or low resolution, not merely because of orientation.
+  If orientation is the only issue and the document is otherwise legible, keep the document valid and mention the orientation briefly in reasons if useful.
   Return only the JSON object.
 
 output_contract:

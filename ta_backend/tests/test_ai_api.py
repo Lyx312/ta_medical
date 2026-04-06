@@ -42,7 +42,7 @@ SCAN_RESULT = {
     "summary": {
         "detected_documents": ["HOSPITAL_INVOICE"],
         "medical_facility_name": "RS Sehat Sentosa",
-        "transaction_date": "2024-08-10",
+        "service_date": "2024-08-10",
         "currency": "IDR",
         "total_amount": 125000,
     },
@@ -106,6 +106,7 @@ def build_session_factory_with_ai_models(models: list[dict[str, object]]) -> ses
                     display_name=cast(str, model["display_name"]),
                     model_name=cast(str, model["model_name"]),
                     provider=cast(str, model["provider"]),
+                    priority=cast(int, model.get("priority", 100)),
                     is_active=cast(bool, model["is_active"]),
                 )
             )
@@ -703,12 +704,14 @@ def test_process_uses_first_active_database_model(
                 "display_name": "Model A",
                 "model_name": "model-a",
                 "provider": "google_genai",
+                "priority": 20,
                 "is_active": True,
             },
             {
                 "display_name": "Model B",
                 "model_name": "model-b",
                 "provider": "google_genai",
+                "priority": 5,
                 "is_active": True,
             },
         ]
@@ -740,7 +743,136 @@ def test_process_uses_first_active_database_model(
     )
 
     assert result.model_dump() == SCAN_RESULT
-    assert selected_models == ["model-a"]
+    assert selected_models == ["model-b"]
+
+
+def test_get_enabled_model_specs_ignores_active_providers_that_are_not_scan_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models(
+        [
+            {
+                "display_name": "Groq Model",
+                "model_name": "llama-3.3-70b-versatile",
+                "provider": "groq",
+                "priority": 1,
+                "is_active": True,
+            },
+            {
+                "display_name": "Gemini Model",
+                "model_name": "gemini-1.5-flash",
+                "provider": "google_genai",
+                "priority": 10,
+                "is_active": True,
+            },
+        ]
+    )
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+
+    enabled_models = medical_processor._get_enabled_model_specs()
+
+    assert [model.provider for model in enabled_models] == ["google_genai"]
+    assert [model.model for model in enabled_models] == ["gemini-1.5-flash"]
+
+
+def test_get_enabled_model_specs_rejects_when_all_active_models_are_not_scan_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models(
+        [
+            {
+                "display_name": "Groq Model",
+                "model_name": "llama-3.3-70b-versatile",
+                "provider": "groq",
+                "priority": 1,
+                "is_active": True,
+            }
+        ]
+    )
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+
+    with pytest.raises(HTTPException) as exc_info:
+        medical_processor._get_enabled_model_specs()
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Active AI models are configured, but none currently support this image-based scan pipeline."
+
+
+def test_create_chat_model_uses_ollama_cloud_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    medical_processor = MedicalDocumentProcessor(
+        settings=Settings(
+            app_name="python-backend",
+            app_env="test",
+            openai_api_key="",
+            google_api_key="",
+            jwt_secret="test-secret",
+            access_token_expire_minutes=60,
+            database_url="sqlite:///:memory:",
+            ollama_api_key="test-ollama-key",
+        )
+    )
+
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeChatOllama:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    class FakeModule:
+        ChatOllama = FakeChatOllama
+
+    monkeypatch.setattr("app.services.ai_service.import_module", lambda package_name: FakeModule())
+
+    medical_processor._create_chat_model(AIModelSpec(provider="ollama", model="llama3.2-vision"))
+
+    assert captured_kwargs["model"] == "llama3.2-vision"
+    assert captured_kwargs["base_url"] == "https://ollama.com"
+    assert captured_kwargs["client_kwargs"] == {
+        "headers": {
+            "Authorization": "Bearer test-ollama-key",
+        }
+    }
+
+
+def test_create_chat_model_disables_openrouter_attribution_fields_for_sdk_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(
+        settings=Settings(
+            app_name="python-backend",
+            app_env="test",
+            openai_api_key="",
+            google_api_key="",
+            jwt_secret="test-secret",
+            access_token_expire_minutes=60,
+            database_url="sqlite:///:memory:",
+            openrouter_api_key="test-openrouter-key",
+        )
+    )
+
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeChatOpenRouter:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    class FakeModule:
+        ChatOpenRouter = FakeChatOpenRouter
+
+    monkeypatch.setattr("app.services.ai_service.import_module", lambda package_name: FakeModule())
+
+    medical_processor._create_chat_model(
+        AIModelSpec(provider="openrouter", model="meta-llama/llama-3.2-11b-vision-instruct")
+    )
+
+    assert captured_kwargs["model"] == "meta-llama/llama-3.2-11b-vision-instruct"
+    assert captured_kwargs["api_key"] == "test-openrouter-key"
+    assert captured_kwargs["app_title"] is None
+    assert captured_kwargs["app_url"] is None
 
 
 def test_matches_any_patient_name_candidate_accepts_exact_and_single_typo_match() -> None:
@@ -909,6 +1041,116 @@ def test_document_validation_processor_allows_lab_result_without_stamp(
     )
 
     assert result.model_dump() == lab_result
+
+
+def test_document_validation_processor_allows_rotation_only_issue_for_otherwise_legible_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    rotated_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": False,
+                        "facility_identity_visible": True,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "invalid",
+                        "reasons": ["Document is upside down."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(rotated_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.model_dump() == rotated_result
+
+
+def test_document_validation_processor_still_rejects_rotated_and_blurry_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    invalid_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": False,
+                        "facility_identity_visible": True,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "invalid",
+                        "reasons": ["Document is rotated 90 degrees and blurry."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(invalid_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            validation_processor.process(
+                [
+                    DocumentImageInput(
+                        filename="scan.jpg",
+                        mime_type="image/jpeg",
+                        base64_data="YWJj",
+                    )
+                ]
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["message"] == "Document validation failed."
 
 
 def test_document_validation_processor_rejects_non_medical_and_uncertain_documents(

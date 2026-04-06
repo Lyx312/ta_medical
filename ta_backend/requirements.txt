@@ -16,8 +16,15 @@ jiter==0.13.0
 jsonpatch==1.33
 jsonpointer==3.0.0
 langchain==1.2.13
+langchain-cerebras
+langchain-cohere
 langchain-core==1.2.20
+langchain-deepseek
 langchain-google-genai==2.1.12
+langchain-groq
+langchain-mistralai
+langchain-ollama
+langchain-openrouter
 langgraph==1.1.3
 langgraph-checkpoint==4.0.1
 langgraph-prebuilt==1.0.8

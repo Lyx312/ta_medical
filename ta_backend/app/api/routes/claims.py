@@ -92,11 +92,16 @@ async def read_uploaded_files(files: list[UploadFile]) -> list[BufferedUpload]:
 
 
 def scan_log_matches_uploaded_files(scan_log: Any, uploads: list[BufferedUpload]) -> bool:
-    if scan_log.status != "succeeded":
-        return False
-
     return build_sorted_hashes([scan_file.original_sha256_hash for scan_file in scan_log.files]) == build_sorted_hashes(
         [upload.sha256_hash for upload in uploads]
+    )
+
+
+def can_reuse_scan_log_validation(scan_log: Any, uploads: list[BufferedUpload]) -> bool:
+    return (
+        scan_log.status == "succeeded"
+        and scan_log.validation_payload is not None
+        and scan_log_matches_uploaded_files(scan_log, uploads)
     )
 
 
@@ -130,27 +135,30 @@ async def create_claim(
         ) from exc
 
     buffered_uploads = await read_uploaded_files(files)
-    validation_images: list[DocumentImageInput] = []
-    for upload in buffered_uploads:
-        processed_image = preprocess_document_image(
-            filename=upload.filename,
-            content=upload.content,
-        )
-        validation_images.append(
-            DocumentImageInput(
-                filename=processed_image.filename,
-                mime_type=processed_image.mime_type,
-                base64_data=base64.b64encode(processed_image.content).decode("utf-8"),
-            )
-        )
-
-    await validation_processor.process(validation_images)
+    source_scan_log: Any | None = None
 
     if source_scan_log_id is not None:
         scan_log_repository = ScanLogRepository(db)
         source_scan_log = scan_log_repository.get_by_id_and_user_id(source_scan_log_id, token_data.user_id)
         if source_scan_log is None or not scan_log_matches_uploaded_files(source_scan_log, buffered_uploads):
             raise build_invalid_scan_log_link_error()
+
+    if source_scan_log is None or not can_reuse_scan_log_validation(source_scan_log, buffered_uploads):
+        validation_images: list[DocumentImageInput] = []
+        for upload in buffered_uploads:
+            processed_image = preprocess_document_image(
+                filename=upload.filename,
+                content=upload.content,
+            )
+            validation_images.append(
+                DocumentImageInput(
+                    filename=processed_image.filename,
+                    mime_type=processed_image.mime_type,
+                    base64_data=base64.b64encode(processed_image.content).decode("utf-8"),
+                )
+            )
+
+        await validation_processor.process(validation_images)
 
     claim_repository = ClaimRepository(db)
     claim = claim_repository.create(

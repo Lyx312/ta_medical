@@ -61,15 +61,20 @@ def test_startup_seed_creates_ai_model_rows_once(client: TestClient) -> None:
         repository = AIModelRepository(db)
         first_rows = repository.list_all()
 
-    assert len(first_rows) == 2
+    assert len(first_rows) == 9
     assert first_rows[0].display_name == "Gemini 3.1 Flash Lite Preview"
     assert first_rows[0].model_name == "gemini-3.1-flash-lite-preview"
     assert first_rows[0].provider == "google_genai"
+    assert first_rows[0].priority == 10
     assert first_rows[0].is_active is True
     assert first_rows[1].display_name == "Gemini 3 Flash Preview"
     assert first_rows[1].model_name == "gemini-3-flash-preview"
     assert first_rows[1].provider == "google_genai"
+    assert first_rows[1].priority == 20
     assert first_rows[1].is_active is True
+    assert first_rows[4].provider == "groq"
+    assert first_rows[4].is_active is False
+    assert first_rows[-1].provider == "cerebras"
 
     app = create_app()
     with TestClient(app):
@@ -79,7 +84,7 @@ def test_startup_seed_creates_ai_model_rows_once(client: TestClient) -> None:
         repository = AIModelRepository(db)
         second_rows = repository.list_all()
 
-    assert len(second_rows) == 2
+    assert len(second_rows) == 9
     assert second_rows[0].id == first_rows[0].id
     assert second_rows[1].id == first_rows[1].id
 
@@ -94,19 +99,25 @@ def test_admin_can_list_and_update_ai_models(client: TestClient) -> None:
 
     assert list_response.status_code == 200
     models = list_response.json()
-    assert len(models) == 2
+    assert len(models) == 9
     assert models[0]["display_name"] == "Gemini 3.1 Flash Lite Preview"
     assert models[0]["is_active"] is True
+    assert models[0]["priority"] == 10
+    assert models[0]["supports_image_input"] is True
+    assert models[0]["is_scan_compatible"] is True
+    assert models[0]["activation_block_reason"] is None
+    assert next(model for model in models if model["provider"] == "groq")["is_scan_compatible"] is False
 
     update_response = client.put(
         f"/api/admin/ai-models/{models[0]['id']}",
         headers={"Authorization": f"Bearer {admin_token}"},
-        json={"is_active": False},
+        json={"is_active": False, "priority": 15},
     )
 
     assert update_response.status_code == 200
     updated_model = update_response.json()
     assert updated_model["is_active"] is False
+    assert updated_model["priority"] == 15
 
     final_list_response = client.get(
         "/api/admin/ai-models",
@@ -114,6 +125,32 @@ def test_admin_can_list_and_update_ai_models(client: TestClient) -> None:
     )
     assert final_list_response.status_code == 200
     assert final_list_response.json()[0]["is_active"] is False
+    assert final_list_response.json()[0]["priority"] == 15
+
+
+def test_admin_cannot_activate_provider_that_is_not_scan_compatible(client: TestClient) -> None:
+    admin_token = login_admin(client)
+
+    list_response = client.get(
+        "/api/admin/ai-models",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert list_response.status_code == 200
+    groq_model = next(model for model in list_response.json() if model["provider"] == "groq")
+
+    update_response = client.put(
+        f"/api/admin/ai-models/{groq_model['id']}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"is_active": True},
+    )
+
+    assert update_response.status_code == 422
+    assert update_response.json()["errors"] == [
+        {
+            "field": "is_active",
+            "message": "Not currently supported for image-based medical document scanning.",
+        }
+    ]
 
 
 def test_non_admin_cannot_access_ai_model_admin_routes(client: TestClient) -> None:

@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.scan_log import ScanLog, ScanLogFile
+from app.models.user import User
 
 
 @dataclass(frozen=True)
@@ -142,11 +143,18 @@ class ScanLogRepository:
             )
         ).scalar_one_or_none()
 
-    def list_for_admin(self, *, status: str | None = None, limit: int = 50) -> list[ScanLog]:
+    def list_for_admin(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        linked: bool | None = None,
+        limit: int | None = 50,
+    ) -> list[ScanLog]:
         statement = (
             select(ScanLog)
+            .join(ScanLog.user)
             .order_by(ScanLog.created_at.desc(), ScanLog.id.desc())
-            .limit(limit)
             .options(
                 selectinload(ScanLog.files),
                 selectinload(ScanLog.user),
@@ -156,4 +164,38 @@ class ScanLogRepository:
         if status:
             statement = statement.where(ScanLog.status == status)
 
+        normalized_query = (q or "").strip()
+        if normalized_query:
+            like_pattern = f"%{normalized_query}%"
+            statement = statement.where(
+                or_(
+                    cast(ScanLog.id, String).ilike(like_pattern),
+                    User.full_name.ilike(like_pattern),
+                    User.email.ilike(like_pattern),
+                )
+            )
+
+        if linked is True:
+            statement = statement.where(ScanLog.linked_claims.any())
+        elif linked is False:
+            statement = statement.where(~ScanLog.linked_claims.any())
+
+        if limit is not None:
+            statement = statement.limit(limit)
+
         return list(self._db.execute(statement).scalars())
+
+    def summarize_for_admin(
+        self,
+        *,
+        status: str | None = None,
+        q: str | None = None,
+        linked: bool | None = None,
+    ) -> dict[str, int]:
+        scan_logs = self.list_for_admin(status=status, q=q, linked=linked, limit=None)
+        return {
+            "total_logs": len(scan_logs),
+            "succeeded_count": sum(1 for log in scan_logs if log.status == "succeeded"),
+            "failed_count": sum(1 for log in scan_logs if log.status not in {"pending", "succeeded"}),
+            "unlinked_count": sum(1 for log in scan_logs if len(log.linked_claims) == 0),
+        }

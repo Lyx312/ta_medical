@@ -1,39 +1,65 @@
-import { useCallback, useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, View } from 'react-native';
+import { useCallback, useDeferredValue, useMemo, useState } from 'react';
+import { FlatList, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { Href, router } from 'expo-router';
 
+import { CenteredState } from '@/components/ui/centered-state';
+import { SearchInput } from '@/components/ui/search-input';
+import { Colors, Spacing } from '@/constants/theme';
+import { AdminClaimQueueCard } from '@/features/admin/components/admin-claim-queue-card';
+import { QueueFilterChipRow } from '@/features/admin/components/queue-filter-chip-row';
+import { QueueSummaryStrip } from '@/features/admin/components/queue-summary-strip';
+import {
+  isRecentTimestamp,
+  summarizeClaims,
+} from '@/features/admin/utils/admin-queue';
 import { ThemedText } from '@/components/themed-text';
-import { Colors, getStatusColor, getStatusBadgeBg } from '@/constants/theme';
+import { formatClaimCurrency } from '@/features/claims/utils/claim-display';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { getAdminClaims } from '@/services/api/admin-claims';
-import type { ApiError, ClaimResponse } from '@/services/api/types';
+import { getAdminClaims, getAdminClaimsSummary } from '@/services/api/admin-claims';
+import type { AdminClaimSummary, ApiError, ClaimResponse } from '@/services/api/types';
 
-function formatCurrency(amount: number) {
-  return new Intl.NumberFormat('id-ID', {
-    style: 'currency',
-    currency: 'IDR',
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+type ClaimQueueFilter = 'all' | 'linked' | 'manual' | 'recent';
+type ClaimQueueRow =
+  | { key: 'controls'; type: 'controls' }
+  | { key: string; type: 'claim'; claim: ClaimResponse };
 
-function formatDate(dateString: string) {
-  const dmyMatch = dateString.match(/^(\d{2})-(\d{2})-(\d{4})$/);
-  if (dmyMatch) {
-    const [, day, month, year] = dmyMatch;
-    const date = new Date(Number(year), Number(month) - 1, Number(day));
-    return Number.isNaN(date.getTime()) ? dateString : date.toLocaleDateString('id-ID');
+const CLAIM_QUEUE_FILTERS = [
+  { key: 'all', label: 'All' },
+  { key: 'linked', label: 'Linked Scan' },
+  { key: 'manual', label: 'Manual Entry' },
+  { key: 'recent', label: 'Recent' },
+] as const;
+
+function buildEmptyMessage(filter: ClaimQueueFilter, query: string) {
+  if (query.trim()) {
+    return 'No claims matched this search.';
   }
 
-  const date = new Date(dateString);
-  return Number.isNaN(date.getTime()) ? dateString : date.toLocaleDateString('id-ID');
+  if (filter === 'linked') {
+    return 'No AI-linked claims are available right now.';
+  }
+
+  if (filter === 'manual') {
+    return 'No manual claim submissions are available right now.';
+  }
+
+  if (filter === 'recent') {
+    return 'No recent claims were submitted in the last 7 days.';
+  }
+
+  return 'No claims have been submitted yet.';
 }
 
 export function AdminClaimsScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const [claims, setClaims] = useState<ClaimResponse[]>([]);
+  const [summary, setSummary] = useState<AdminClaimSummary | null>(null);
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const [activeFilter, setActiveFilter] = useState<ClaimQueueFilter>('all');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -47,8 +73,29 @@ export function AdminClaimsScreen() {
       setIsLoading(true);
     }
 
+    const trimmedQuery = deferredQuery.trim();
+    const linkedFilter = activeFilter === 'linked' ? true : activeFilter === 'manual' ? false : undefined;
+
     try {
-      setClaims(await getAdminClaims());
+      const [claimList, serverSummary] = await Promise.all([
+        getAdminClaims({
+          q: trimmedQuery || undefined,
+          linked: linkedFilter,
+          limit: 200,
+          sort: 'newest',
+        }),
+        getAdminClaimsSummary({
+          q: trimmedQuery || undefined,
+          linked: linkedFilter,
+        }),
+      ]);
+
+      const visibleClaims = activeFilter === 'recent'
+        ? claimList.filter((claim) => isRecentTimestamp(claim.created_at))
+        : claimList;
+
+      setClaims(visibleClaims);
+      setSummary(activeFilter === 'recent' ? summarizeClaims(visibleClaims) : serverSummary);
     } catch (err) {
       const apiError = err as ApiError;
       setError(apiError.message ?? 'Unable to load claims right now.');
@@ -56,7 +103,7 @@ export function AdminClaimsScreen() {
       setIsLoading(false);
       setIsRefreshing(false);
     }
-  }, []);
+  }, [activeFilter, deferredQuery]);
 
   useFocusEffect(
     useCallback(() => {
@@ -64,70 +111,129 @@ export function AdminClaimsScreen() {
     }, [loadClaims]),
   );
 
-  const renderItem = ({ item }: { item: ClaimResponse }) => {
-    const statusColor = getStatusColor(item.status, colors.text);
-    const statusBg = getStatusBadgeBg(item.status);
+  const summaryItems = useMemo(
+    () => [
+      {
+        key: 'total',
+        label: 'Claims',
+        value: `${summary?.total_claims ?? 0}`,
+        tone: 'primary' as const,
+      },
+      {
+        key: 'amount',
+        label: 'Claim Amount',
+        value: formatClaimCurrency(summary?.total_claim_amount ?? 0),
+        tone: 'secondary' as const,
+      },
+      {
+        key: 'linked',
+        label: 'Linked Scan',
+        value: `${summary?.linked_scan_count ?? 0}`,
+        tone: 'cta' as const,
+      },
+      {
+        key: 'manual',
+        label: 'Manual Entry',
+        value: `${summary?.manual_submission_count ?? 0}`,
+        tone: 'warning' as const,
+      },
+    ],
+    [summary],
+  );
 
-    return (
-      <Pressable
-        style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}
-        onPress={() => router.push(`/admin/claims/${item.id}` as Href)}>
-        <View style={styles.row}>
-          <ThemedText style={styles.amount}>{formatCurrency(item.nominal_klaim)}</ThemedText>
-          <View style={[styles.statusPill, { backgroundColor: statusBg }]}>
-            <ThemedText style={[styles.status, { color: statusColor }]}>{item.status}</ThemedText>
-          </View>
+  const headerContent = useMemo(
+    () => (
+      <View>
+        <View style={styles.introBlock}>
+          <ThemedText type="title" style={styles.introTitle}>
+            Claims Queue
+          </ThemedText>
+          <ThemedText style={styles.introSubtitle}>
+            Triage claims quickly by source, recency, and claimant context.
+          </ThemedText>
         </View>
-        <ThemedText style={styles.patientName}>{item.nama_pasien}</ThemedText>
-        <ThemedText style={styles.description}>{item.keterangan_penyakit}</ThemedText>
-        <ThemedText style={styles.date}>{formatDate(item.tanggal_pelayanan)}</ThemedText>
-        <View style={styles.actionRow}>
-          <ThemedText style={[styles.metaText, { color: colors.text }]}>{item.user_email}</ThemedText>
-          {item.source_scan_log_id ? (
-            <Pressable
-              onPress={(event) => {
-                event.stopPropagation();
-                router.push(`/admin/logs/${item.source_scan_log_id}` as Href);
-              }}
-              style={[styles.linkButton, { borderColor: colors.primary }]}>
-              <ThemedText style={[styles.linkButtonText, { color: colors.primary }]}>View Scan</ThemedText>
-            </Pressable>
-          ) : null}
+
+        <View style={styles.summaryBlock}>
+          <QueueSummaryStrip items={summaryItems} compact />
         </View>
-      </Pressable>
-    );
-  };
+      </View>
+    ),
+    [summaryItems],
+  );
+
+  const queueRows = useMemo<ClaimQueueRow[]>(
+    () => [
+      { key: 'controls', type: 'controls' },
+      ...claims.map((claim) => ({
+        key: `claim-${claim.id}`,
+        type: 'claim' as const,
+        claim,
+      })),
+    ],
+    [claims],
+  );
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
       <View style={styles.content}>
-        <ThemedText type="title">Claims</ThemedText>
-        <ThemedText style={styles.subtitle}>View and manage all submitted claims</ThemedText>
-
         {isLoading ? (
-          <View style={styles.centerState}>
-            <ActivityIndicator color={colors.primary} />
-          </View>
+          <CenteredState loading minHeight={260} />
         ) : error ? (
-          <View style={styles.centerState}>
-            <ThemedText style={[styles.errorText, { color: colors.error }]}>{error}</ThemedText>
-            <Pressable style={[styles.retryButton, { backgroundColor: colors.primary }]} onPress={() => void loadClaims()}>
-              <ThemedText style={[styles.retryLabel, { color: colors.cardBackground }]}>Try Again</ThemedText>
-            </Pressable>
-          </View>
+          <CenteredState
+            message={error}
+            tone="error"
+            actionLabel="Try Again"
+            onAction={() => void loadClaims()}
+          />
         ) : (
           <FlatList
-            data={claims}
-            keyExtractor={(item) => item.id.toString()}
-            renderItem={renderItem}
-            contentContainerStyle={claims.length === 0 ? styles.emptyList : styles.list}
+            data={queueRows}
+            ListHeaderComponent={headerContent}
+            stickyHeaderIndices={[1]}
+            keyExtractor={(item) => item.key}
+            renderItem={({ item }) => {
+              if (item.type === 'controls') {
+                return (
+                  <View style={[styles.controlsBlock, styles.stickyControls, { backgroundColor: colors.background }]}>
+                    <SearchInput
+                      compact
+                      value={query}
+                      onChangeText={setQuery}
+                      onClear={() => setQuery('')}
+                      placeholder="Search by claim ID, patient, or email"
+                      returnKeyType="search"
+                    />
+                    <QueueFilterChipRow
+                      compact
+                      chips={[...CLAIM_QUEUE_FILTERS]}
+                      selectedKey={activeFilter}
+                      onSelect={(key) => setActiveFilter(key as ClaimQueueFilter)}
+                    />
+                  </View>
+                );
+              }
+
+              return (
+                <AdminClaimQueueCard
+                  claim={item.claim}
+                  onPress={() => router.push(`/admin/claims/${item.claim.id}` as Href)}
+                  onOpenScan={
+                    item.claim.source_scan_log_id
+                      ? () => router.push(`/admin/logs/${item.claim.source_scan_log_id}` as Href)
+                      : undefined
+                  }
+                />
+              );
+            }}
+            contentContainerStyle={styles.list}
+            ItemSeparatorComponent={() => <View style={styles.listSeparator} />}
             refreshing={isRefreshing}
             onRefresh={() => void loadClaims(true)}
             showsVerticalScrollIndicator={false}
-            ListEmptyComponent={
-              <View style={styles.centerState}>
-                <ThemedText style={styles.emptyText}>No claims have been submitted yet.</ThemedText>
-              </View>
+            ListFooterComponent={
+              claims.length === 0
+                ? <CenteredState message={buildEmptyMessage(activeFilter, deferredQuery)} minHeight={260} />
+                : null
             }
           />
         )}
@@ -137,104 +243,42 @@ export function AdminClaimsScreen() {
 }
 
 const styles = StyleSheet.create({
-  amount: {
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  card: {
-    borderRadius: 12,
-    borderWidth: 1,
-    padding: 16,
-  },
-  centerState: {
-    alignItems: 'center',
-    flex: 1,
-    justifyContent: 'center',
-    paddingHorizontal: 24,
-  },
   container: {
     flex: 1,
   },
   content: {
     flex: 1,
-    padding: 20,
+    paddingHorizontal: Spacing.xl,
+    paddingTop: Spacing.lg,
   },
-  date: {
-    fontSize: 12,
-    marginTop: 4,
-    opacity: 0.6,
+  controlsBlock: {
+    gap: Spacing.sm,
+    marginBottom: Spacing.md,
+    paddingBottom: Spacing.sm,
   },
-  description: {
-    fontSize: 16,
-    marginTop: 8,
-    opacity: 0.8,
+  introBlock: {
+    gap: Spacing.xs,
+    marginBottom: Spacing.sm,
   },
-  emptyList: {
-    flexGrow: 1,
+  introSubtitle: {
+    fontSize: 14,
+    opacity: 0.72,
   },
-  emptyText: {
-    opacity: 0.75,
-    textAlign: 'center',
-  },
-  errorText: {
-    textAlign: 'center',
+  introTitle: {
+    fontSize: 28,
+    lineHeight: 30,
   },
   list: {
-    gap: 12,
-    marginTop: 20,
-    paddingBottom: 12,
+    flexGrow: 1,
+    paddingBottom: Spacing.lg,
   },
-  linkButton: {
-    borderRadius: 999,
-    borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+  listSeparator: {
+    height: Spacing.md,
   },
-  linkButtonText: {
-    fontSize: 12,
-    fontWeight: '700',
+  stickyControls: {
+    zIndex: 1,
   },
-  metaText: {
-    flex: 1,
-    fontSize: 12,
-    opacity: 0.7,
-  },
-  patientName: {
-    fontSize: 15,
-    fontWeight: '600',
-    marginTop: 8,
-  },
-  retryButton: {
-    borderRadius: 12,
-    marginTop: 16,
-    paddingHorizontal: 18,
-    paddingVertical: 12,
-  },
-  retryLabel: {
-    fontWeight: '600',
-  },
-  row: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  actionRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 12,
-  },
-  status: {
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  statusPill: {
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  subtitle: {
-    marginTop: 8,
-    opacity: 0.7,
+  summaryBlock: {
+    marginBottom: Spacing.sm,
   },
 });

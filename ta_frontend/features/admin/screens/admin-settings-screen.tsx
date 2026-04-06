@@ -1,10 +1,13 @@
 import { useCallback, useState } from 'react';
-import { ActivityIndicator, Alert, ScrollView, StyleSheet, Switch, View } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Switch, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 
+import { CenteredState } from '@/components/ui/centered-state';
+import { ScreenHeader } from '@/components/ui/screen-header';
+import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
-import { Colors } from '@/constants/theme';
+import { Colors, Opacity, Radii, Spacing } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { getAIModels, updateAIModel } from '@/services/api/admin-ai-models';
 import type { AIModelConfiguration, ApiError } from '@/services/api/types';
@@ -54,25 +57,44 @@ export function AdminSettingsScreen() {
     }
   };
 
+  const handlePriorityChange = async (model: AIModelConfiguration, nextPriority: number) => {
+    if (nextPriority < 1) {
+      return;
+    }
+
+    setUpdatingModelId(model.id);
+    setError('');
+
+    try {
+      const updatedModel = await updateAIModel(model.id, { priority: nextPriority });
+      setModels((prev) =>
+        prev
+          .map((currentModel) => (currentModel.id === updatedModel.id ? updatedModel : currentModel))
+          .sort((left, right) => left.priority - right.priority || left.id - right.id),
+      );
+    } catch (err) {
+      const apiError = err as ApiError;
+      Alert.alert('Update Failed', apiError.message ?? 'Unable to update AI model priority.');
+    } finally {
+      setUpdatingModelId(null);
+    }
+  };
+
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <ThemedText type="title">AI Configuration</ThemedText>
-        <ThemedText style={styles.subtitle}>Choose which seeded AI models are active for backend inference.</ThemedText>
-        <ThemedText style={styles.helperText}>
-          Multiple models can be active, but the backend currently uses only the first active model in database order.
-        </ThemedText>
+        <ScreenHeader
+          title="AI Configuration"
+          subtitle="Choose which seeded AI models are active for backend inference."
+          helperText="Multiple models can be active, but the backend currently uses the first active scan-compatible model by priority."
+        />
 
         {isLoading ? (
-          <View style={styles.centerState}>
-            <ActivityIndicator color={colors.primary} />
-          </View>
+          <CenteredState loading minHeight={180} />
         ) : error ? (
-          <View style={styles.centerState}>
-            <ThemedText style={[styles.errorText, { color: colors.error }]}>{error}</ThemedText>
-          </View>
+          <CenteredState message={error} tone="error" minHeight={180} />
         ) : (
-          <View style={[styles.modelSection, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+          <SurfaceCard style={styles.modelSection}>
             <View style={styles.modelList}>
               {models.map((model, index) => (
                 <View
@@ -84,17 +106,46 @@ export function AdminSettingsScreen() {
                   <View style={styles.modelInfo}>
                     <ThemedText style={styles.modelName}>{model.display_name}</ThemedText>
                     <ThemedText style={styles.modelMeta}>Provider: {model.provider}</ThemedText>
+                    <ThemedText style={styles.modelMeta}>
+                      Priority: {model.priority} | Image input: {model.supports_image_input ? 'Yes' : 'No'}
+                    </ThemedText>
+                    <ThemedText
+                      style={[
+                        styles.modelStatus,
+                        { color: model.is_scan_compatible ? colors.cta : colors.warning },
+                      ]}>
+                      {model.is_scan_compatible ? 'Scan ready' : 'Unsupported for current scan pipeline'}
+                    </ThemedText>
+                    {model.activation_block_reason ? (
+                      <ThemedText style={styles.modelMeta}>{model.activation_block_reason}</ThemedText>
+                    ) : null}
+                  </View>
+                  <View style={styles.modelControls}>
+                    <View style={styles.priorityControls}>
+                      <Pressable
+                        style={[styles.priorityButton, { borderColor: colors.divider }]}
+                        onPress={() => void handlePriorityChange(model, model.priority - 1)}
+                        disabled={updatingModelId === model.id}>
+                        <ThemedText style={styles.priorityButtonText}>-</ThemedText>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.priorityButton, { borderColor: colors.divider }]}
+                        onPress={() => void handlePriorityChange(model, model.priority + 1)}
+                        disabled={updatingModelId === model.id}>
+                        <ThemedText style={styles.priorityButtonText}>+</ThemedText>
+                      </Pressable>
+                    </View>
                   </View>
                   <Switch
                     value={model.is_active}
                     onValueChange={() => void handleToggleModel(model)}
-                    disabled={updatingModelId === model.id}
+                    disabled={updatingModelId === model.id || !model.is_scan_compatible}
                     trackColor={{ false: colors.divider, true: colors.secondary }}
                   />
                 </View>
               ))}
             </View>
-          </View>
+          </SurfaceCard>
         )}
       </ScrollView>
     </SafeAreaView>
@@ -102,58 +153,64 @@ export function AdminSettingsScreen() {
 }
 
 const styles = StyleSheet.create({
-  centerState: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 180,
-    paddingHorizontal: 24,
-  },
   container: {
     flex: 1,
   },
   content: {
-    padding: 20,
-    paddingBottom: 32,
-  },
-  errorText: {
-    textAlign: 'center',
-  },
-  helperText: {
-    lineHeight: 20,
-    marginTop: 12,
-    opacity: 0.75,
+    padding: Spacing.xl,
+    paddingBottom: Spacing.xxxl,
   },
   modelInfo: {
     flex: 1,
     gap: 4,
+  },
+  modelControls: {
+    alignItems: 'flex-end',
+    gap: Spacing.sm,
   },
   modelList: {
     gap: 0,
   },
   modelMeta: {
     fontSize: 14,
-    opacity: 0.75,
+    opacity: Opacity.subtle,
   },
   modelName: {
     fontSize: 17,
     fontWeight: '700',
   },
   modelRow: {
-    alignItems: 'center',
+    alignItems: 'flex-start',
     flexDirection: 'row',
-    gap: 16,
+    gap: Spacing.lg,
     justifyContent: 'space-between',
-    paddingVertical: 16,
+    paddingVertical: Spacing.lg,
+  },
+  modelStatus: {
+    fontSize: 13,
+    fontWeight: '700',
   },
   modelSection: {
-    borderRadius: 14,
-    borderWidth: 1,
-    marginTop: 24,
+    borderRadius: Radii.lg,
+    marginTop: Spacing.xxl,
     overflow: 'hidden',
-    paddingHorizontal: 16,
+    paddingHorizontal: Spacing.lg,
   },
-  subtitle: {
-    marginTop: 8,
-    opacity: 0.7,
+  priorityButton: {
+    alignItems: 'center',
+    borderRadius: Radii.pill,
+    borderWidth: 1,
+    height: 30,
+    justifyContent: 'center',
+    width: 30,
+  },
+  priorityButtonText: {
+    fontSize: 18,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  priorityControls: {
+    flexDirection: 'row',
+    gap: Spacing.sm,
   },
 });

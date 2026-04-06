@@ -1,6 +1,5 @@
 import { useCallback, useState } from 'react';
 import {
-  ActivityIndicator,
   Alert,
   FlatList,
   Image,
@@ -10,7 +9,6 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -19,8 +17,12 @@ import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { useFocusEffect } from '@react-navigation/native';
 
+import { AppButton } from '@/components/ui/app-button';
+import { FieldError, FieldLabel, SelectField, TextAreaField, TextField } from '@/components/ui/form-field';
+import { ScreenHeader } from '@/components/ui/screen-header';
+import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
-import { Colors } from '@/constants/theme';
+import { Colors, Opacity, Radii, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/contexts/auth-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { scanDocuments } from '@/services/api/ai';
@@ -205,8 +207,9 @@ export function NewClaimScreen() {
       setHealthFacility(data.summary.medical_facility_name);
     }
 
-    if (data.summary.transaction_date) {
-      const parsedDate = new Date(data.summary.transaction_date);
+    const extractedServiceDate = data.summary.service_date ?? data.summary.transaction_date;
+    if (extractedServiceDate) {
+      const parsedDate = new Date(extractedServiceDate);
       if (!Number.isNaN(parsedDate.getTime())) {
         setServiceDate(parsedDate);
       }
@@ -347,10 +350,9 @@ export function NewClaimScreen() {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}>
             <View style={viewStyles.content}>
-              <ThemedText type="title">New Claim</ThemedText>
-              <ThemedText style={textStyles.subtitle}>Submit a new insurance claim</ThemedText>
+              <ScreenHeader title="New Claim" subtitle="Submit a new insurance claim" />
 
-              <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+              <SurfaceCard style={viewStyles.card}>
                 <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Document Upload</ThemedText>
                 <ThemedText style={textStyles.sectionDescription}>
                   Upload or take photos of your medical documents
@@ -367,9 +369,7 @@ export function NewClaimScreen() {
                   </Pressable>
                 </View>
 
-                {errors.images ? (
-                  <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.images}</ThemedText>
-                ) : null}
+                <FieldError message={errors.images} />
 
                 {imageUris.length > 0 ? (
                   <View style={viewStyles.imageGrid}>
@@ -385,61 +385,43 @@ export function NewClaimScreen() {
                 ) : null}
 
                 {imageUris.length > 0 ? (
-                  <Pressable
-                    style={[viewStyles.aiScanButton, { backgroundColor: colors.secondary }]}
+                  <AppButton
+                    label="Scan with AI"
+                    tone="secondary"
+                    loading={isScanning}
+                    leftIcon={<Ionicons name="scan-outline" size={20} color={colors.cardBackground} />}
                     onPress={handleAIScan}
-                    disabled={isScanning}>
-                    {isScanning ? (
-                      <ActivityIndicator color={colors.cardBackground} size="small" />
-                    ) : (
-                      <>
-                        <Ionicons name="scan-outline" size={20} color={colors.cardBackground} />
-                        <ThemedText style={[textStyles.aiScanButtonText, { color: colors.cardBackground }]}>
-                          Scan with AI
-                        </ThemedText>
-                      </>
-                    )}
-                  </Pressable>
+                  />
                 ) : null}
-              </View>
+              </SurfaceCard>
 
-              <View style={[viewStyles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+              <SurfaceCard style={viewStyles.card}>
                 <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Claim Details</ThemedText>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Nama Pasien</ThemedText>
-                  <Pressable
-                    style={[viewStyles.pickerButton, { borderColor: colors.divider }]}
-                    onPress={() => setShowPatientPicker(true)}>
-                    <View style={viewStyles.patientPickerTextContainer}>
-                      <ThemedText
-                        style={[textStyles.pickerButtonText, { color: getSelectedPatientOption() ? colors.text : colors.icon }]}>
-                        {getSelectedPatientOption()
-                          ? `${getSelectedPatientOption()?.name} (${getSelectedPatientOption()?.relation})`
-                          : 'Pilih pasien'}
-                      </ThemedText>
-                      {isLoadingFamilyMembers ? (
-                        <ThemedText style={textStyles.pickerHelperText}>Memuat anggota keluarga...</ThemedText>
-                      ) : null}
-                    </View>
-                    <Ionicons name="chevron-down" size={20} color={colors.icon} />
-                  </Pressable>
-                  {familyMemberError ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{familyMemberError}</ThemedText>
-                  ) : null}
-                  {errors.nama_pasien ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.nama_pasien}</ThemedText>
-                  ) : null}
+                  <FieldLabel>Nama Pasien</FieldLabel>
+                  <SelectField
+                    onPress={() => setShowPatientPicker(true)}
+                    value={
+                      getSelectedPatientOption()
+                        ? `${getSelectedPatientOption()?.name} (${getSelectedPatientOption()?.relation})`
+                        : 'Pilih pasien'
+                    }
+                    helperText={isLoadingFamilyMembers ? 'Memuat anggota keluarga...' : undefined}
+                    accessory={<Ionicons name="chevron-down" size={20} color={colors.icon} />}
+                    isPlaceholder={!getSelectedPatientOption()}
+                  />
+                  <FieldError message={familyMemberError} />
+                  <FieldError message={errors.nama_pasien} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Tanggal Pelayanan</ThemedText>
-                  <Pressable style={[viewStyles.dateButton, { borderColor: colors.divider }]} onPress={() => setShowDatePicker(true)}>
-                    <Ionicons name="calendar-outline" size={20} color={colors.icon} />
-                    <ThemedText style={[textStyles.dateText, { color: colors.text }]}>
-                      {formatDateForDisplay(serviceDate)}
-                    </ThemedText>
-                  </Pressable>
+                  <FieldLabel>Tanggal Pelayanan</FieldLabel>
+                  <SelectField
+                    onPress={() => setShowDatePicker(true)}
+                    value={formatDateForDisplay(serviceDate)}
+                    accessory={<Ionicons name="calendar-outline" size={20} color={colors.icon} />}
+                  />
                   {showDatePicker ? (
                     Platform.OS === 'ios' ? (
                       <Modal transparent animationType="slide" visible={showDatePicker}>
@@ -458,108 +440,82 @@ export function NewClaimScreen() {
                       <DateTimePicker value={serviceDate} mode="date" display="default" onChange={handleDateChange} />
                     )
                   ) : null}
-                  {errors.tanggal_pelayanan ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.tanggal_pelayanan}</ThemedText>
-                  ) : null}
+                  <FieldError message={errors.tanggal_pelayanan} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Fasilitas Kesehatan</ThemedText>
-                  <TextInput
+                  <FieldLabel>Fasilitas Kesehatan</FieldLabel>
+                  <TextField
                     value={healthFacility}
                     onChangeText={(text) => {
                       setHealthFacility(text);
                       setErrors((prev) => ({ ...prev, fasilitas_kesehatan: '' }));
                     }}
                     placeholder="e.g., RS IA KEBON JERUK"
-                    placeholderTextColor={colors.icon}
-                    style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
                   />
-                  {errors.fasilitas_kesehatan ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.fasilitas_kesehatan}</ThemedText>
-                  ) : null}
+                  <FieldError message={errors.fasilitas_kesehatan} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Jenis Manfaat</ThemedText>
-                  <Pressable style={[viewStyles.pickerButton, { borderColor: colors.divider }]} onPress={() => setShowBenefitPicker(true)}>
-                    <ThemedText style={[textStyles.pickerButtonText, { color: benefitType ? colors.text : colors.icon }]}>
-                      {benefitType ? BENEFIT_TYPES.find((benefit) => benefit.value === benefitType)?.label : 'Select benefit type'}
-                    </ThemedText>
-                    <Ionicons name="chevron-down" size={20} color={colors.icon} />
-                  </Pressable>
-                  {errors.jenis_manfaat ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.jenis_manfaat}</ThemedText>
-                  ) : null}
+                  <FieldLabel>Jenis Manfaat</FieldLabel>
+                  <SelectField
+                    onPress={() => setShowBenefitPicker(true)}
+                    value={benefitType ? BENEFIT_TYPES.find((benefit) => benefit.value === benefitType)?.label ?? '' : 'Select benefit type'}
+                    accessory={<Ionicons name="chevron-down" size={20} color={colors.icon} />}
+                    isPlaceholder={!benefitType}
+                  />
+                  <FieldError message={errors.jenis_manfaat} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Nominal Klaim (IDR)</ThemedText>
-                  <TextInput
+                  <FieldLabel>Nominal Klaim (IDR)</FieldLabel>
+                  <TextField
                     value={displayedClaimAmount}
                     onChangeText={(text) => {
                       setClaimAmount(sanitizeClaimAmountInput(text));
                       setErrors((prev) => ({ ...prev, nominal_klaim: '' }));
                     }}
                     placeholder="0"
-                    placeholderTextColor={colors.icon}
                     keyboardType="numeric"
-                    style={[textStyles.input, { borderColor: colors.divider, color: colors.text }]}
                   />
-                  {errors.nominal_klaim ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.nominal_klaim}</ThemedText>
-                  ) : null}
+                  <FieldError message={errors.nominal_klaim} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Keterangan Penyakit (Diagnosis)</ThemedText>
-                  <TextInput
+                  <FieldLabel>Keterangan Penyakit (Diagnosis)</FieldLabel>
+                  <TextAreaField
                     value={diseaseDescription}
                     onChangeText={(text) => {
                       setDiseaseDescription(text);
                       setErrors((prev) => ({ ...prev, keterangan_penyakit: '' }));
                     }}
                     placeholder="Describe the illness or condition"
-                    placeholderTextColor={colors.icon}
-                    multiline
                     numberOfLines={2}
-                    style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
                   />
-                  {errors.keterangan_penyakit ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.keterangan_penyakit}</ThemedText>
-                  ) : null}
+                  <FieldError message={errors.keterangan_penyakit} />
                 </View>
 
                 <View style={viewStyles.fieldGroup}>
-                  <ThemedText style={textStyles.fieldLabel}>Kronologi (Anamnesis)</ThemedText>
-                  <TextInput
+                  <FieldLabel>Kronologi (Anamnesis)</FieldLabel>
+                  <TextAreaField
                     value={chronology}
                     onChangeText={(text) => {
                       setChronology(text);
                       setErrors((prev) => ({ ...prev, kronologi: '' }));
                     }}
                     placeholder="Describe the sequence of events"
-                    placeholderTextColor={colors.icon}
-                    multiline
                     numberOfLines={3}
-                    style={[textStyles.input, textStyles.textArea, { borderColor: colors.divider, color: colors.text }]}
                   />
-                  {errors.kronologi ? (
-                    <ThemedText style={[textStyles.errorText, { color: colors.error }]}>{errors.kronologi}</ThemedText>
-                  ) : null}
+                  <FieldError message={errors.kronologi} />
                 </View>
 
-                <Pressable
-                  style={[viewStyles.submitButton, { backgroundColor: colors.cta, opacity: isSubmitting ? 0.7 : 1 }]}
+                <AppButton
+                  label="Submit Claim"
+                  tone="cta"
+                  loading={isSubmitting}
                   onPress={handleSubmit}
-                  disabled={isSubmitting}>
-                  {isSubmitting ? (
-                    <ActivityIndicator color={colors.cardBackground} />
-                  ) : (
-                    <ThemedText style={[textStyles.submitButtonText, { color: colors.cardBackground }]}>Submit Claim</ThemedText>
-                  )}
-                </Pressable>
-              </View>
+                />
+              </SurfaceCard>
             </View>
           </ScrollView>
         </View>
@@ -650,46 +606,25 @@ export function NewClaimScreen() {
 }
 
 const viewStyles = StyleSheet.create({
-  aiScanButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    flexDirection: 'row',
-    gap: 8,
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-  },
   benefitOption: {
     alignItems: 'center',
     borderBottomWidth: 1,
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingHorizontal: 8,
+    paddingHorizontal: Spacing.sm,
     paddingVertical: 14,
   },
   card: {
-    borderRadius: 12,
-    borderWidth: 1,
-    gap: 12,
-    padding: 16,
+    gap: Spacing.md,
   },
   container: {
     flex: 1,
   },
   content: {
     flexGrow: 1,
-    gap: 16,
-    padding: 20,
+    gap: Spacing.lg,
+    padding: Spacing.xl,
     paddingBottom: 120,
-  },
-  dateButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    borderWidth: 1,
-    flexDirection: 'row',
-    gap: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
   },
   fieldGroup: {
     gap: 6,
@@ -700,34 +635,34 @@ const viewStyles = StyleSheet.create({
   },
   imageButton: {
     alignItems: 'center',
-    borderRadius: 12,
+    borderRadius: Radii.md,
     borderWidth: 1,
     flex: 1,
     flexDirection: 'row',
-    gap: 8,
+    gap: Spacing.sm,
     justifyContent: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: Spacing.lg,
     paddingVertical: 14,
   },
   imageGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: Spacing.sm,
   },
   imageThumbContainer: {
     position: 'relative',
   },
   modalContent: {
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
+    borderTopLeftRadius: Spacing.xl,
+    borderTopRightRadius: Spacing.xl,
     maxHeight: '50%',
-    padding: 16,
+    padding: Spacing.lg,
   },
   modalHeader: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 16,
+    marginBottom: Spacing.lg,
   },
   keyboardContainer: {
     flex: 1,
@@ -741,19 +676,6 @@ const viewStyles = StyleSheet.create({
     flex: 1,
     gap: 2,
   },
-  patientPickerTextContainer: {
-    flex: 1,
-    gap: 2,
-  },
-  pickerButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    borderWidth: 1,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
   removeImageButton: {
     position: 'absolute',
     right: -6,
@@ -765,42 +687,15 @@ const viewStyles = StyleSheet.create({
   screen: {
     flex: 1,
   },
-  submitButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    marginTop: 8,
-    paddingVertical: 14,
-  },
 });
 
 const textStyles = StyleSheet.create({
-  aiScanButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
   benefitOptionText: {
     fontSize: 16,
-  },
-  dateText: {
-    fontSize: 16,
-  },
-  errorText: {
-    fontSize: 12,
-  },
-  fieldLabel: {
-    fontSize: 14,
-    fontWeight: '600',
   },
   imageButtonText: {
     fontSize: 14,
     fontWeight: '600',
-  },
-  input: {
-    borderRadius: 12,
-    borderWidth: 1,
-    fontSize: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
   },
   modalTitle: {
     fontSize: 18,
@@ -808,34 +703,14 @@ const textStyles = StyleSheet.create({
   },
   patientOptionMeta: {
     fontSize: 13,
-    opacity: 0.7,
-  },
-  pickerButtonText: {
-    fontSize: 16,
-  },
-  pickerHelperText: {
-    fontSize: 12,
-    opacity: 0.7,
+    opacity: Opacity.muted,
   },
   sectionDescription: {
     fontSize: 14,
-    opacity: 0.7,
+    opacity: Opacity.muted,
   },
   sectionTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  submitButtonText: {
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  subtitle: {
-    marginTop: 8,
-    opacity: 0.7,
-  },
-  textArea: {
-    height: 80,
-    textAlignVertical: 'top',
+    ...Typography.sectionTitle,
   },
 });
 

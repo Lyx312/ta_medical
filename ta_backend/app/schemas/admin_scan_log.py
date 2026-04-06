@@ -37,3 +37,10 @@ class AdminScanLogDetailResponse(AdminScanLogListItemResponse):
     extraction_payload: dict[str, Any] | None
     error_payload: dict[str, Any] | None
     files: list[AdminScanLogFileResponse]
+
+
+class AdminScanLogSummaryResponse(BaseModel):
+    total_logs: int
+    succeeded_count: int
+    failed_count: int
+    unlinked_count: int

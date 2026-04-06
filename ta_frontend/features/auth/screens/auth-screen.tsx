@@ -1,19 +1,20 @@
 import { Ionicons } from '@expo/vector-icons';
 import { useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
-  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AppButton } from '@/components/ui/app-button';
+import { FieldError, FieldLabel, TextField } from '@/components/ui/form-field';
+import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
-import { Colors } from '@/constants/theme';
+import { Colors, Opacity, Spacing, Typography } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuth } from '@/contexts/auth-context';
 import type { ApiError } from '@/services/api/types';
@@ -117,69 +118,45 @@ export function AuthScreen({ mode }: AuthScreenProps) {
                 <ThemedText style={styles.subtitle}>{pageCopy.subtitle}</ThemedText>
               </View>
 
-              <View style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+              <SurfaceCard style={styles.card}>
                 <ThemedText type="subtitle" style={styles.sectionTitle}>
                   {pageCopy.sectionTitle}
                 </ThemedText>
 
                 {!isLogin ? (
                   <View style={styles.fieldGroup}>
-                    <ThemedText style={styles.fieldLabel}>Full Name</ThemedText>
-                    <TextInput
+                    <FieldLabel>Full Name</FieldLabel>
+                    <TextField
                       value={fullName}
                       onChangeText={setFullName}
                       placeholder="Enter your full name"
-                      placeholderTextColor={colors.icon}
                       autoCapitalize="words"
-                      style={[
-                        styles.input,
-                        {
-                          borderColor: colors.divider,
-                          color: colors.text,
-                        },
-                      ]}
                     />
                   </View>
                 ) : null}
 
                 <View style={styles.fieldGroup}>
-                  <ThemedText style={styles.fieldLabel}>Email</ThemedText>
-                  <TextInput
+                  <FieldLabel>Email</FieldLabel>
+                  <TextField
                     value={email}
                     onChangeText={setEmail}
                     placeholder="Enter your email"
-                    placeholderTextColor={colors.icon}
                     keyboardType="email-address"
                     autoCapitalize="none"
-                    style={[
-                      styles.input,
-                      {
-                        borderColor: colors.divider,
-                        color: colors.text,
-                      },
-                    ]}
                   />
                 </View>
 
                 <View style={styles.fieldGroup}>
-                  <ThemedText style={styles.fieldLabel}>Password</ThemedText>
+                  <FieldLabel>Password</FieldLabel>
                   <View style={styles.passwordInputWrapper}>
-                    <TextInput
+                    <TextField
                       value={password}
                       onChangeText={setPassword}
                       placeholder="Enter your password"
-                      placeholderTextColor={colors.icon}
                       autoCapitalize="none"
                       autoCorrect={false}
                       secureTextEntry={!showPassword}
-                      style={[
-                        styles.input,
-                        styles.passwordInput,
-                        {
-                          borderColor: colors.divider,
-                          color: colors.text,
-                        },
-                      ]}
+                      style={styles.passwordInput}
                     />
                     <Pressable
                       onPress={() => setShowPassword((current) => !current)}
@@ -196,24 +173,16 @@ export function AuthScreen({ mode }: AuthScreenProps) {
 
                 {!isLogin ? (
                   <View style={styles.fieldGroup}>
-                    <ThemedText style={styles.fieldLabel}>Confirm Password</ThemedText>
+                    <FieldLabel>Confirm Password</FieldLabel>
                     <View style={styles.passwordInputWrapper}>
-                      <TextInput
+                      <TextField
                         value={confirmPassword}
                         onChangeText={setConfirmPassword}
                         placeholder="Confirm your password"
-                        placeholderTextColor={colors.icon}
                         autoCapitalize="none"
                         autoCorrect={false}
                         secureTextEntry={!showConfirmPassword}
-                        style={[
-                          styles.input,
-                          styles.passwordInput,
-                          {
-                            borderColor: colors.divider,
-                            color: colors.text,
-                          },
-                        ]}
+                        style={styles.passwordInput}
                       />
                       <Pressable
                         onPress={() => setShowConfirmPassword((current) => !current)}
@@ -229,24 +198,15 @@ export function AuthScreen({ mode }: AuthScreenProps) {
                   </View>
                 ) : null}
 
-                {error ? <ThemedText style={[styles.errorText, { color: colors.error }]}>{error}</ThemedText> : null}
+                <FieldError message={error} style={styles.errorText} />
 
-                <Pressable
+                <AppButton
+                  label={pageCopy.action}
+                  tone="cta"
+                  loading={loading}
                   onPress={isLogin ? handleLogin : handleRegister}
-                  disabled={loading}
-                  style={[
-                    styles.primaryButton,
-                    { backgroundColor: colors.cta, opacity: loading ? 0.7 : 1 },
-                  ]}>
-                  {loading ? (
-                    <ActivityIndicator color={colors.cardBackground} />
-                  ) : (
-                    <ThemedText style={[styles.primaryButtonLabel, { color: colors.cardBackground }]}>
-                      {pageCopy.action}
-                    </ThemedText>
-                  )}
-                </Pressable>
-              </View>
+                />
+              </SurfaceCard>
             </View>
           </ScrollView>
 
@@ -272,43 +232,30 @@ const styles = StyleSheet.create({
   container: {
     flexGrow: 1,
     justifyContent: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 24,
-    gap: 20,
+    paddingHorizontal: Spacing.xl,
+    paddingVertical: Spacing.xxl,
+    gap: Spacing.xl,
   },
   headerContainer: {
-    gap: 8,
+    gap: Spacing.sm,
   },
   title: {
     fontSize: 36,
     lineHeight: 40,
   },
   subtitle: {
-    fontSize: 16,
+    ...Typography.subtitle,
     opacity: 0.85,
   },
   card: {
-    borderWidth: 1,
     borderRadius: 18,
-    padding: 16,
-    gap: 12,
+    gap: Spacing.md,
   },
   sectionTitle: {
     fontSize: 24,
   },
   fieldGroup: {
     gap: 6,
-  },
-  fieldLabel: {
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  input: {
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 16,
   },
   passwordInputWrapper: {
     position: 'relative',
@@ -324,16 +271,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   errorText: {
-    fontSize: 14,
-  },
-  primaryButton: {
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  primaryButtonLabel: {
-    fontSize: 16,
-    fontWeight: '700',
+    ...Typography.fieldLabel,
+    opacity: Opacity.subtle,
   },
 });

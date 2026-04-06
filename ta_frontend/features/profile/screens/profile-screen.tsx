@@ -8,14 +8,17 @@ import {
   ScrollView,
   StyleSheet,
   Switch,
-  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 
+import { AppButton } from '@/components/ui/app-button';
+import { FieldError, FieldLabel, TextField } from '@/components/ui/form-field';
+import { ScreenHeader } from '@/components/ui/screen-header';
+import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
-import { Colors } from '@/constants/theme';
+import { Colors, Opacity, Radii, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/contexts/auth-context';
 import { useThemePreference } from '@/contexts/theme-context';
 import { useColorScheme } from '@/hooks/use-color-scheme';
@@ -183,16 +186,16 @@ export function ProfileScreen({ title }: ProfileScreenProps) {
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}>
             <View style={styles.content}>
-              <ThemedText type="title">{title}</ThemedText>
+              <ScreenHeader title={title} />
 
-              <View style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+              <SurfaceCard style={styles.card}>
                 <ThemedText style={styles.cardTitle}>Profile Information</ThemedText>
                 <ThemedText style={styles.info}>Name: {user?.full_name ?? 'Unknown'}</ThemedText>
                 <ThemedText style={styles.info}>Email: {user?.email ?? 'Unknown'}</ThemedText>
                 <ThemedText style={styles.info}>Role: {user?.role ?? 'Unknown'}</ThemedText>
-              </View>
+              </SurfaceCard>
 
-              <View style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+              <SurfaceCard style={styles.card}>
                 <ThemedText style={styles.cardTitle}>Appearance</ThemedText>
                 <View style={styles.preferenceRow}>
                   <View style={styles.preferenceTextBlock}>
@@ -211,113 +214,102 @@ export function ProfileScreen({ title }: ProfileScreenProps) {
                     ios_backgroundColor={colors.divider}
                   />
                 </View>
-              </View>
+              </SurfaceCard>
 
               {isUserProfile ? (
-                <View style={[styles.card, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+                <SurfaceCard style={styles.card}>
                   <ThemedText style={styles.cardTitle}>Family Members</ThemedText>
                   <ThemedText style={styles.sectionDescription}>
                     Save your dependents here so claims and document scanning can use the correct patient name.
                   </ThemedText>
 
-              <View style={styles.fieldGroup}>
-                <ThemedText style={styles.fieldLabel}>Family Member Name</ThemedText>
-                <TextInput
-                  value={memberName}
-                  onChangeText={(text) => {
-                    setMemberName(text);
-                    setFormErrors((prev) => ({ ...prev, name: '' }));
-                  }}
-                  placeholder="Enter family member name"
-                  placeholderTextColor={colors.icon}
-                  style={[styles.input, { borderColor: colors.divider, color: colors.text }]}
-                />
-                {formErrors.name ? <ThemedText style={[styles.errorText, { color: colors.error }]}>{formErrors.name}</ThemedText> : null}
-              </View>
+                  <View style={styles.fieldGroup}>
+                    <FieldLabel>Family Member Name</FieldLabel>
+                    <TextField
+                      value={memberName}
+                      onChangeText={(text) => {
+                        setMemberName(text);
+                        setFormErrors((prev) => ({ ...prev, name: '' }));
+                      }}
+                      placeholder="Enter family member name"
+                    />
+                    <FieldError message={formErrors.name} />
+                  </View>
 
-              <View style={styles.fieldGroup}>
-                <ThemedText style={styles.fieldLabel}>Relation</ThemedText>
-                <TextInput
-                  value={memberRelation}
-                  onChangeText={(text) => {
-                    setMemberRelation(text);
-                    setFormErrors((prev) => ({ ...prev, relation: '' }));
-                  }}
-                  placeholder="e.g., Spouse, Child, Parent"
-                  placeholderTextColor={colors.icon}
-                  style={[styles.input, { borderColor: colors.divider, color: colors.text }]}
-                />
-                {formErrors.relation ? (
-                  <ThemedText style={[styles.errorText, { color: colors.error }]}>{formErrors.relation}</ThemedText>
-                ) : null}
-              </View>
+                  <View style={styles.fieldGroup}>
+                    <FieldLabel>Relation</FieldLabel>
+                    <TextField
+                      value={memberRelation}
+                      onChangeText={(text) => {
+                        setMemberRelation(text);
+                        setFormErrors((prev) => ({ ...prev, relation: '' }));
+                      }}
+                      placeholder="e.g., Spouse, Child, Parent"
+                    />
+                    <FieldError message={formErrors.relation} />
+                  </View>
 
-              {memberError ? <ThemedText style={[styles.errorText, { color: colors.error }]}>{memberError}</ThemedText> : null}
+                  <FieldError message={memberError} />
 
-              <View style={styles.actionRow}>
-                <Pressable
-                  style={[styles.primaryButton, styles.flexButton, { backgroundColor: colors.primary, opacity: isSavingMember ? 0.7 : 1 }]}
-                  onPress={() => void handleSubmitMember()}
-                  disabled={isSavingMember}>
-                  {isSavingMember ? (
-                    <ActivityIndicator color={colors.cardBackground} />
-                  ) : (
-                    <ThemedText style={[styles.buttonText, { color: colors.cardBackground }]}>
-                      {editingMemberId === null ? 'Add Family Member' : 'Save Changes'}
-                    </ThemedText>
-                  )}
-                </Pressable>
+                  <View style={styles.actionRow}>
+                    <AppButton
+                      label={editingMemberId === null ? 'Add Family Member' : 'Save Changes'}
+                      loading={isSavingMember}
+                      onPress={() => void handleSubmitMember()}
+                      style={styles.flexButton}
+                    />
 
-                {editingMemberId !== null ? (
-                  <Pressable
-                    style={[styles.secondaryButton, { borderColor: colors.divider }]}
-                    onPress={resetMemberForm}
-                    disabled={isSavingMember}>
-                    <ThemedText style={[styles.secondaryButtonText, { color: colors.text }]}>Cancel</ThemedText>
-                  </Pressable>
-                ) : null}
-              </View>
+                    {editingMemberId !== null ? (
+                      <AppButton
+                        label="Cancel"
+                        variant="outline"
+                        onPress={resetMemberForm}
+                        disabled={isSavingMember}
+                        style={styles.flexButton}
+                      />
+                    ) : null}
+                  </View>
 
-              {isLoadingMembers ? (
-                <View style={styles.loadingState}>
-                  <ActivityIndicator color={colors.primary} />
-                </View>
-              ) : familyMembers.length === 0 ? (
-                <ThemedText style={styles.emptyText}>No family members saved yet.</ThemedText>
-              ) : (
-                <View style={styles.familyMemberList}>
-                  {familyMembers.map((familyMember) => (
-                    <View
-                      key={familyMember.id}
-                      style={[styles.familyMemberCard, { borderColor: colors.divider, backgroundColor: colors.background }]}>
-                      <View style={styles.familyMemberInfo}>
-                        <ThemedText style={styles.familyMemberName}>{familyMember.name}</ThemedText>
-                        <ThemedText style={styles.familyMemberRelation}>{familyMember.relation}</ThemedText>
-                      </View>
-                      <View style={styles.memberActionButtons}>
-                        <Pressable onPress={() => handleEditMember(familyMember)}>
-                          <ThemedText style={{ color: colors.primary }}>Edit</ThemedText>
-                        </Pressable>
-                        <Pressable onPress={() => confirmDeleteMember(familyMember)}>
-                          <ThemedText style={{ color: colors.error }}>Delete</ThemedText>
-                        </Pressable>
-                      </View>
+                  {isLoadingMembers ? (
+                    <View style={styles.loadingState}>
+                      <ActivityIndicator color={colors.primary} />
                     </View>
-                  ))}
-                </View>
-              )}
-                </View>
+                  ) : familyMembers.length === 0 ? (
+                    <ThemedText style={styles.emptyText}>No family members saved yet.</ThemedText>
+                  ) : (
+                    <View style={styles.familyMemberList}>
+                      {familyMembers.map((familyMember) => (
+                        <View
+                          key={familyMember.id}
+                          style={[
+                            styles.familyMemberCard,
+                            { borderColor: colors.divider, backgroundColor: colors.background },
+                          ]}>
+                          <View style={styles.familyMemberInfo}>
+                            <ThemedText style={styles.familyMemberName}>{familyMember.name}</ThemedText>
+                            <ThemedText style={styles.familyMemberRelation}>{familyMember.relation}</ThemedText>
+                          </View>
+                          <View style={styles.memberActionButtons}>
+                            <Pressable onPress={() => handleEditMember(familyMember)}>
+                              <ThemedText style={{ color: colors.primary }}>Edit</ThemedText>
+                            </Pressable>
+                            <Pressable onPress={() => confirmDeleteMember(familyMember)}>
+                              <ThemedText style={{ color: colors.error }}>Delete</ThemedText>
+                            </Pressable>
+                          </View>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </SurfaceCard>
               ) : (
-                <Pressable
-                  style={[styles.primaryButton, { backgroundColor: colors.primary }]}
-                  onPress={() => Alert.alert('Update Profile', 'Profile update functionality coming soon')}>
-                  <ThemedText style={[styles.buttonText, { color: colors.cardBackground }]}>Update Profile</ThemedText>
-                </Pressable>
+                <AppButton
+                  label="Update Profile"
+                  onPress={() => Alert.alert('Update Profile', 'Profile update functionality coming soon')}
+                />
               )}
 
-              <Pressable style={[styles.primaryButton, { backgroundColor: colors.error }]} onPress={handleLogout}>
-                <ThemedText style={[styles.buttonText, { color: colors.cardBackground }]}>Logout</ThemedText>
-              </Pressable>
+              <AppButton label="Logout" tone="error" onPress={handleLogout} />
             </View>
           </ScrollView>
         </View>
@@ -329,18 +321,11 @@ export function ProfileScreen({ title }: ProfileScreenProps) {
 const styles = StyleSheet.create({
   actionRow: {
     flexDirection: 'row',
-    gap: 12,
-  },
-  buttonText: {
-    fontSize: 16,
-    fontWeight: '600',
+    gap: Spacing.md,
   },
   card: {
-    borderRadius: 12,
-    borderWidth: 1,
     gap: 10,
-    marginTop: 20,
-    padding: 16,
+    marginTop: Spacing.xl,
   },
   cardTitle: {
     fontSize: 18,
@@ -351,17 +336,15 @@ const styles = StyleSheet.create({
   },
   content: {
     flexGrow: 1,
-    padding: 20,
+    padding: Spacing.xl,
     paddingBottom: 120,
   },
   emptyText: {
-    opacity: 0.7,
-  },
-  errorText: {
-    fontSize: 12,
+    opacity: Opacity.muted,
   },
   familyMemberCard: {
-    borderRadius: 12,
+    backgroundColor: 'transparent',
+    borderRadius: Radii.md,
     borderWidth: 1,
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -375,51 +358,39 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   familyMemberName: {
-    fontSize: 16,
-    fontWeight: '600',
+    ...Typography.bodyStrong,
   },
   familyMemberRelation: {
-    opacity: 0.75,
+    opacity: Opacity.subtle,
   },
   fieldGroup: {
     gap: 6,
-  },
-  fieldLabel: {
-    fontSize: 14,
-    fontWeight: '600',
   },
   flexButton: {
     flex: 1,
   },
   info: {
     fontSize: 16,
-    opacity: 0.8,
-  },
-  input: {
-    borderRadius: 12,
-    borderWidth: 1,
-    fontSize: 16,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
-  loadingState: {
-    paddingVertical: 16,
+    opacity: Opacity.secondary,
   },
   keyboardContainer: {
     flex: 1,
   },
+  loadingState: {
+    paddingVertical: Spacing.lg,
+  },
   memberActionButtons: {
     alignItems: 'flex-end',
-    gap: 12,
+    gap: Spacing.md,
     justifyContent: 'center',
   },
   preferenceDescription: {
-    opacity: 0.75,
+    opacity: Opacity.subtle,
   },
   preferenceRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 16,
+    gap: Spacing.lg,
     justifyContent: 'space-between',
   },
   preferenceTextBlock: {
@@ -427,14 +398,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   preferenceTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  primaryButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    marginTop: 16,
-    paddingVertical: 14,
+    ...Typography.bodyStrong,
   },
   scrollContent: {
     flexGrow: 1,
@@ -442,20 +406,7 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
   },
-  secondaryButton: {
-    alignItems: 'center',
-    borderRadius: 12,
-    borderWidth: 1,
-    flex: 1,
-    justifyContent: 'center',
-    marginTop: 16,
-    paddingHorizontal: 18,
-  },
-  secondaryButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
   sectionDescription: {
-    opacity: 0.75,
+    opacity: Opacity.subtle,
   },
 });

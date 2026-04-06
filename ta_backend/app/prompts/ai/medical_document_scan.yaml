@@ -8,6 +8,10 @@ system_template: |
 user_template: |
   Analyze the {image_count} uploaded medical document image(s).
   Treat the full set of images as one claim packet and combine information across pages.
+  Extract the service date as the date the patient was examined, consulted, or received treatment from the doctor or medical facility.
+  Prioritize the date shown on the medical consultation document, doctor note, medical form, or other primary clinical document over later pharmacy or medicine-purchase dates.
+  If multiple dates appear across the packet, do not simply choose the latest receipt date.
+  Use the consultation/treatment date for service_date whenever the documents support it.
   Known patient name candidates for this user: {patient_name_candidates_json}
   Use the candidate names only as hints to disambiguate patient names found in the documents.
   If the document shows a patient name that clearly matches one candidate, prefer that supported candidate spelling.
@@ -35,7 +39,7 @@ output_contract:
       detected_documents:
         - string
       medical_facility_name: string | null
-      transaction_date: string | null
+      service_date: string | null
       currency: string | null
       total_amount: number | null
     patient_info:

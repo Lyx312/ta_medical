@@ -1,54 +1,114 @@
-import { useCallback, useMemo, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { useCallback, useDeferredValue, useMemo, useState } from 'react';
+import { FlatList, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { Href, router } from 'expo-router';
 
+import { CenteredState } from '@/components/ui/centered-state';
+import { SearchInput } from '@/components/ui/search-input';
+import { Colors, Spacing } from '@/constants/theme';
+import { AdminScanLogQueueCard } from '@/features/admin/components/admin-scan-log-queue-card';
+import { QueueFilterChipRow } from '@/features/admin/components/queue-filter-chip-row';
+import { QueueSummaryStrip } from '@/features/admin/components/queue-summary-strip';
+import {
+  isFailedScanStatus,
+  summarizeScanLogs,
+} from '@/features/admin/utils/admin-queue';
 import { ThemedText } from '@/components/themed-text';
-import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { getAdminScanLogs } from '@/services/api/admin-scan-logs';
-import type { AdminScanLogSummary, ApiError } from '@/services/api/types';
+import { getAdminScanLogs, getAdminScanLogsSummary } from '@/services/api/admin-scan-logs';
+import type { AdminScanLogQueueSummary, AdminScanLogSummary, ApiError } from '@/services/api/types';
 
-function formatTimestamp(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
+type ScanQueueFilter = 'all' | 'pending' | 'succeeded' | 'failed' | 'unlinked';
+type ScanQueueRow =
+  | { key: 'controls'; type: 'controls' }
+  | { key: string; type: 'log'; log: AdminScanLogSummary };
+
+const SCAN_QUEUE_FILTERS = [
+  { key: 'all', label: 'All' },
+  { key: 'pending', label: 'Pending' },
+  { key: 'succeeded', label: 'Succeeded' },
+  { key: 'failed', label: 'Failed' },
+  { key: 'unlinked', label: 'Unlinked' },
+] as const;
+
+function buildEmptyMessage(filter: ScanQueueFilter, query: string) {
+  if (query.trim()) {
+    return 'No scan logs matched this search.';
   }
 
-  return new Intl.DateTimeFormat('en-GB', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(date);
-}
+  if (filter === 'pending') {
+    return 'No pending scan logs need attention right now.';
+  }
 
-function formatStatusLabel(status: string) {
-  return status.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  if (filter === 'succeeded') {
+    return 'No successful scan logs were found.';
+  }
+
+  if (filter === 'failed') {
+    return 'No failed scan logs are waiting for review.';
+  }
+
+  if (filter === 'unlinked') {
+    return 'No unlinked scan logs are waiting to be connected to a claim.';
+  }
+
+  return 'No scan logs have been recorded yet.';
 }
 
 export function AdminScanLogsScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const [logs, setLogs] = useState<AdminScanLogSummary[]>([]);
+  const [summary, setSummary] = useState<AdminScanLogQueueSummary | null>(null);
+  const [query, setQuery] = useState('');
+  const deferredQuery = useDeferredValue(query);
+  const [activeFilter, setActiveFilter] = useState<ScanQueueFilter>('all');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const loadLogs = useCallback(async () => {
-    setIsLoading(true);
+  const loadLogs = useCallback(async (refresh: boolean = false) => {
+    if (refresh) {
+      setIsRefreshing(true);
+    } else {
+      setIsLoading(true);
+    }
     setError('');
 
+    const trimmedQuery = deferredQuery.trim();
+    const statusFilter = activeFilter === 'pending' || activeFilter === 'succeeded' ? activeFilter : undefined;
+    const linkedFilter = activeFilter === 'unlinked' ? false : undefined;
+
     try {
-      setLogs(await getAdminScanLogs());
+      const [logList, serverSummary] = await Promise.all([
+        getAdminScanLogs({
+          status: statusFilter,
+          q: trimmedQuery || undefined,
+          linked: linkedFilter,
+          limit: 100,
+        }),
+        getAdminScanLogsSummary({
+          status: statusFilter,
+          q: trimmedQuery || undefined,
+          linked: linkedFilter,
+        }),
+      ]);
+
+      const visibleLogs = activeFilter === 'failed'
+        ? logList.filter((log) => isFailedScanStatus(log.status))
+        : logList;
+
+      setLogs(visibleLogs);
+      setSummary(activeFilter === 'failed' ? summarizeScanLogs(visibleLogs) : serverSummary);
     } catch (err) {
       const apiError = err as ApiError;
       setError(apiError.message ?? 'Unable to load scan logs right now.');
     } finally {
       setIsLoading(false);
+      setIsRefreshing(false);
     }
-  }, []);
+  }, [activeFilter, deferredQuery]);
 
   useFocusEffect(
     useCallback(() => {
@@ -56,181 +116,175 @@ export function AdminScanLogsScreen() {
     }, [loadLogs]),
   );
 
-  const content = useMemo(() => {
-    if (isLoading) {
-      return (
-        <View style={styles.centerState}>
-          <ActivityIndicator color={colors.primary} />
+  const summaryItems = useMemo(
+    () => [
+      {
+        key: 'total',
+        label: 'Logs',
+        value: `${summary?.total_logs ?? 0}`,
+        tone: 'primary' as const,
+      },
+      {
+        key: 'succeeded',
+        label: 'Succeeded',
+        value: `${summary?.succeeded_count ?? 0}`,
+        tone: 'cta' as const,
+      },
+      {
+        key: 'failed',
+        label: 'Failed',
+        value: `${summary?.failed_count ?? 0}`,
+        tone: 'error' as const,
+      },
+      {
+        key: 'unlinked',
+        label: 'Unlinked',
+        value: `${summary?.unlinked_count ?? 0}`,
+        tone: 'warning' as const,
+      },
+    ],
+    [summary],
+  );
+
+  const headerContent = useMemo(
+    () => (
+      <View>
+        <View style={styles.introBlock}>
+          <ThemedText type="title" style={styles.introTitle}>
+            Scan Queue
+          </ThemedText>
+          <ThemedText style={styles.introSubtitle}>
+            Review AI scan attempts and jump into the right claim faster.
+          </ThemedText>
         </View>
-      );
-    }
 
-    if (error) {
-      return (
-        <View style={styles.centerState}>
-          <ThemedText style={[styles.errorText, { color: colors.error }]}>{error}</ThemedText>
+        <View style={styles.summaryBlock}>
+          <QueueSummaryStrip items={summaryItems} compact />
         </View>
-      );
-    }
-
-    if (logs.length === 0) {
-      return (
-        <View style={styles.centerState}>
-          <ThemedText style={styles.emptyText}>No scan logs have been recorded yet.</ThemedText>
-        </View>
-      );
-    }
-
-    return (
-      <View style={styles.logList}>
-        {logs.map((log) => {
-          const isLinked = log.linked_claim_ids.length > 0;
-
-          return (
-            <Pressable
-              key={log.id}
-              style={[styles.logCard, { backgroundColor: colors.cardBackground, borderColor: colors.divider }]}
-              onPress={() => router.push(`/admin/logs/${log.id}` as Href)}>
-              <View style={styles.rowBetween}>
-                <View style={styles.titleBlock}>
-                  <ThemedText style={styles.logTitle}>Scan #{log.id}</ThemedText>
-                  <ThemedText style={styles.metaText}>{log.user_full_name}</ThemedText>
-                  <ThemedText style={styles.metaText}>{log.user_email}</ThemedText>
-                </View>
-                <View
-                  style={[
-                    styles.statusPill,
-                    {
-                      backgroundColor: log.status === 'succeeded' ? `${colors.cta}20` : `${colors.warning}20`,
-                    },
-                  ]}>
-                  <ThemedText
-                    style={[
-                      styles.statusText,
-                      { color: log.status === 'succeeded' ? colors.cta : colors.warning },
-                    ]}>
-                    {formatStatusLabel(log.status)}
-                  </ThemedText>
-                </View>
-              </View>
-
-              <View style={styles.infoGrid}>
-                <View style={styles.infoItem}>
-                  <ThemedText style={styles.infoLabel}>Created</ThemedText>
-                  <ThemedText style={styles.infoValue}>{formatTimestamp(log.created_at)}</ThemedText>
-                </View>
-                <View style={styles.infoItem}>
-                  <ThemedText style={styles.infoLabel}>Files</ThemedText>
-                  <ThemedText style={styles.infoValue}>{log.file_count}</ThemedText>
-                </View>
-                <View style={styles.infoItem}>
-                  <ThemedText style={styles.infoLabel}>Claims</ThemedText>
-                  <ThemedText style={styles.infoValue}>
-                    {isLinked ? log.linked_claim_ids.join(', ') : 'Not linked'}
-                  </ThemedText>
-                </View>
-                <View style={styles.infoItem}>
-                  <ThemedText style={styles.infoLabel}>Model</ThemedText>
-                  <ThemedText style={styles.infoValue}>
-                    {log.ai_model_name ? `${log.ai_model_provider}/${log.ai_model_name}` : 'Unavailable'}
-                  </ThemedText>
-                </View>
-              </View>
-            </Pressable>
-          );
-        })}
       </View>
-    );
-  }, [colors.cardBackground, colors.cta, colors.divider, colors.error, colors.primary, colors.warning, error, isLoading, logs]);
+    ),
+    [summaryItems],
+  );
+
+  const queueRows = useMemo<ScanQueueRow[]>(
+    () => [
+      { key: 'controls', type: 'controls' },
+      ...logs.map((log) => ({
+        key: `log-${log.id}`,
+        type: 'log' as const,
+        log,
+      })),
+    ],
+    [logs],
+  );
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <ThemedText type="title">Scan Logs</ThemedText>
-        <ThemedText style={styles.subtitle}>
-          Review every AI document scan attempt, including failures and scans that were never submitted as claims.
-        </ThemedText>
-        {content}
-      </ScrollView>
+      <View style={styles.content}>
+        {isLoading ? (
+          <CenteredState loading minHeight={260} />
+        ) : error ? (
+          <CenteredState
+            message={error}
+            tone="error"
+            minHeight={260}
+            actionLabel="Try Again"
+            onAction={() => void loadLogs()}
+          />
+        ) : (
+          <FlatList
+            data={queueRows}
+            ListHeaderComponent={headerContent}
+            stickyHeaderIndices={[1]}
+            keyExtractor={(item) => item.key}
+            renderItem={({ item }) => {
+              if (item.type === 'controls') {
+                return (
+                  <View style={[styles.controlsBlock, styles.stickyControls, { backgroundColor: colors.background }]}>
+                    <SearchInput
+                      compact
+                      value={query}
+                      onChangeText={setQuery}
+                      onClear={() => setQuery('')}
+                      placeholder="Search by scan ID, user, or email"
+                      returnKeyType="search"
+                    />
+                    <QueueFilterChipRow
+                      compact
+                      chips={[...SCAN_QUEUE_FILTERS]}
+                      selectedKey={activeFilter}
+                      onSelect={(key) => setActiveFilter(key as ScanQueueFilter)}
+                    />
+                  </View>
+                );
+              }
+
+              return (
+                <AdminScanLogQueueCard
+                  log={item.log}
+                  onPress={() => router.push(`/admin/logs/${item.log.id}` as Href)}
+                  onOpenClaim={
+                    item.log.linked_claim_ids.length === 1
+                      ? () => router.push(`/admin/claims/${item.log.linked_claim_ids[0]}` as Href)
+                      : undefined
+                  }
+                />
+              );
+            }}
+            contentContainerStyle={styles.list}
+            ItemSeparatorComponent={() => <View style={styles.listSeparator} />}
+            refreshing={isRefreshing}
+            onRefresh={() => void loadLogs(true)}
+            showsVerticalScrollIndicator={false}
+            ListFooterComponent={
+              logs.length === 0
+                ? <CenteredState message={buildEmptyMessage(activeFilter, deferredQuery)} minHeight={260} />
+                : null
+            }
+          />
+        )}
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  centerState: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 220,
-    paddingHorizontal: 24,
-  },
   container: {
     flex: 1,
   },
   content: {
-    padding: 20,
-    paddingBottom: 32,
-  },
-  emptyText: {
-    textAlign: 'center',
-  },
-  errorText: {
-    textAlign: 'center',
-  },
-  infoGrid: {
-    gap: 12,
-  },
-  infoItem: {
-    gap: 4,
-  },
-  infoLabel: {
-    fontSize: 12,
-    fontWeight: '700',
-    opacity: 0.75,
-    textTransform: 'uppercase',
-  },
-  infoValue: {
-    fontSize: 14,
-  },
-  logCard: {
-    borderRadius: 16,
-    borderWidth: 1,
-    gap: 16,
-    padding: 16,
-  },
-  logList: {
-    gap: 16,
-    marginTop: 24,
-  },
-  logTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  metaText: {
-    fontSize: 14,
-    opacity: 0.75,
-  },
-  rowBetween: {
-    flexDirection: 'row',
-    gap: 12,
-    justifyContent: 'space-between',
-  },
-  statusPill: {
-    alignItems: 'center',
-    alignSelf: 'flex-start',
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  statusText: {
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  subtitle: {
-    marginTop: 8,
-    opacity: 0.7,
-  },
-  titleBlock: {
     flex: 1,
-    gap: 4,
+    paddingHorizontal: Spacing.xl,
+    paddingTop: Spacing.lg,
+  },
+  controlsBlock: {
+    gap: Spacing.sm,
+    marginBottom: Spacing.md,
+    paddingBottom: Spacing.sm,
+  },
+  introBlock: {
+    gap: Spacing.xs,
+    marginBottom: Spacing.sm,
+  },
+  introSubtitle: {
+    fontSize: 14,
+    opacity: 0.72,
+  },
+  introTitle: {
+    fontSize: 28,
+    lineHeight: 30,
+  },
+  list: {
+    flexGrow: 1,
+    paddingBottom: Spacing.xxxl,
+  },
+  listSeparator: {
+    height: Spacing.md,
+  },
+  stickyControls: {
+    zIndex: 1,
+  },
+  summaryBlock: {
+    marginBottom: Spacing.sm,
   },
 });

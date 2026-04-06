@@ -1,13 +1,19 @@
 import base64
 from typing import Any
+from typing import Literal
+from typing import cast
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_admin_dependency
 from app.db.session import get_db_session
 from app.repositories.claim_repository import ClaimRepository
-from app.schemas.admin_claim import AdminClaimDetailResponse, AdminClaimFileResponse
+from app.schemas.admin_claim import (
+    AdminClaimDetailResponse,
+    AdminClaimFileResponse,
+    AdminClaimSummaryResponse,
+)
 from app.schemas.auth import TokenData
 from app.schemas.claim import ClaimResponse
 
@@ -41,12 +47,35 @@ def build_claim_response(claim: Any) -> ClaimResponse:
 async def get_admin_claims(
     token_data: TokenData = Depends(get_current_admin_dependency),
     db: Session = Depends(get_db_session),
+    q: str | None = Query(default=None),
+    linked: bool | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    sort: Literal["newest", "oldest", "amount_desc", "amount_asc"] = Query(default="newest"),
 ) -> list[ClaimResponse]:
     del token_data
 
     repository = ClaimRepository(db)
-    claims = repository.list_all()
+    claims = repository.list_for_admin(
+        q=q,
+        linked=linked,
+        limit=limit,
+        sort=sort,
+    )
     return [build_claim_response(claim) for claim in claims]
+
+
+@router.get("/summary", response_model=AdminClaimSummaryResponse)
+async def get_admin_claims_summary(
+    token_data: TokenData = Depends(get_current_admin_dependency),
+    db: Session = Depends(get_db_session),
+    q: str | None = Query(default=None),
+    linked: bool | None = Query(default=None),
+) -> AdminClaimSummaryResponse:
+    del token_data
+
+    repository = ClaimRepository(db)
+    summary = repository.summarize_for_admin(q=q, linked=linked)
+    return AdminClaimSummaryResponse(**cast(dict[str, Any], summary))
 
 
 @router.get("/{claim_id}", response_model=AdminClaimDetailResponse)

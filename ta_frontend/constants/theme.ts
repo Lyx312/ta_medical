@@ -1,3 +1,5 @@
+import type { TextStyle } from 'react-native';
+
 // --- Core Brand Palette ---
 const brandNavy = '#1A365D';
 const brandSkyBlue = '#4299E1';
@@ -14,6 +16,69 @@ const sysInfo = '#3182CE';
 const statusApproved = '#22c55e';
 const statusPending = '#eab308';
 const statusRejected = sysError;
+
+export const Spacing = {
+  xs: 4,
+  sm: 8,
+  md: 12,
+  lg: 16,
+  xl: 20,
+  xxl: 24,
+  xxxl: 32,
+} as const;
+
+export const Radii = {
+  sm: 8,
+  md: 12,
+  lg: 14,
+  xl: 16,
+  pill: 999,
+} as const;
+
+export const Opacity = {
+  muted: 0.7,
+  subtle: 0.75,
+  secondary: 0.8,
+  faint: 0.6,
+} as const;
+
+export const Typography = {
+  subtitle: {
+    fontSize: 16,
+    opacity: Opacity.muted,
+  } satisfies TextStyle,
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+  } satisfies TextStyle,
+  fieldLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+  } satisfies TextStyle,
+  helper: {
+    fontSize: 12,
+    opacity: Opacity.subtle,
+  } satisfies TextStyle,
+  error: {
+    fontSize: 12,
+  } satisfies TextStyle,
+  button: {
+    fontSize: 16,
+    fontWeight: '700',
+  } satisfies TextStyle,
+  bodyStrong: {
+    fontSize: 16,
+    fontWeight: '600',
+  } satisfies TextStyle,
+  meta: {
+    fontSize: 12,
+    opacity: Opacity.muted,
+  } satisfies TextStyle,
+  badge: {
+    fontSize: 12,
+    fontWeight: '700',
+  } satisfies TextStyle,
+} as const;
 
 export function getStatusColor(status: string, textColor: string) {
   const normalizedStatus = status.toLowerCase();

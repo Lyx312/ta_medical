@@ -22,6 +22,7 @@ SCAN_RESULT = {
         "detected_documents": ["HOSPITAL_INVOICE"],
         "medical_facility_name": "RS Sehat Sentosa",
         "service_date": "2024-08-10",
+        "transaction_date": "2024-08-10",
         "currency": "IDR",
         "total_amount": 125000,
     },

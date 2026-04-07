@@ -8,6 +8,7 @@ from app.api.routes.auth import get_current_admin_dependency
 from app.db.session import get_db_session
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.admin_scan_log import (
+    AdminScanLogAIRunResponse,
     AdminScanLogDetailResponse,
     AdminScanLogFileResponse,
     AdminScanLogListItemResponse,
@@ -31,8 +32,8 @@ def build_scan_log_list_item(scan_log: Any) -> AdminScanLogListItemResponse:
         status=scan_log.status,
         file_count=len(scan_log.files),
         linked_claim_ids=[claim.id for claim in scan_log.linked_claims],
-        ai_model_provider=scan_log.ai_model_provider,
-        ai_model_name=scan_log.ai_model_name,
+        primary_model_provider=scan_log.primary_model_provider,
+        primary_model_name=scan_log.primary_model_name,
         created_at=scan_log.created_at,
         updated_at=scan_log.updated_at,
     )
@@ -111,8 +112,24 @@ async def get_scan_log(
     list_item = build_scan_log_list_item(scan_log)
     return AdminScanLogDetailResponse(
         **list_item.model_dump(),
+        ai_execution_mode=scan_log.ai_execution_mode,
         validation_payload=scan_log.validation_payload,
         extraction_payload=scan_log.extraction_payload,
+        ai_model_runs=[
+            AdminScanLogAIRunResponse(
+                producer_id=run.producer_id,
+                provider=run.provider,
+                model_name=run.model_name,
+                producer_rank=run.producer_rank,
+                run_index=run.run_index,
+                temperature=run.temperature,
+                success=run.success,
+                error_message=run.error_message,
+                payload=run.payload,
+            )
+            for run in scan_log.ai_runs
+        ],
+        extraction_meta_payload=scan_log.extraction_meta_payload,
         error_payload=scan_log.error_payload,
         files=[build_scan_log_file_response(scan_log_file) for scan_log_file in scan_log.files],
     )

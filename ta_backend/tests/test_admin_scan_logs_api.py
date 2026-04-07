@@ -19,6 +19,7 @@ SCAN_RESULT = {
         "detected_documents": ["HOSPITAL_INVOICE"],
         "medical_facility_name": "RS Sehat Sentosa",
         "service_date": "2024-08-10",
+        "transaction_date": "2024-08-10",
         "currency": "IDR",
         "total_amount": 125000,
     },
@@ -177,8 +178,11 @@ def test_admin_can_list_and_view_scan_logs(
     assert detail_response.status_code == 200
     detail_payload = detail_response.json()
     assert detail_payload["id"] == scan_log_id
+    assert detail_payload["ai_execution_mode"] == "single_model"
     assert detail_payload["validation_payload"]["images"][0]["filename"] == "scan.jpg"
     assert detail_payload["extraction_payload"] == SCAN_RESULT
+    assert detail_payload["ai_model_runs"] == []
+    assert detail_payload["extraction_meta_payload"]["calibration_version"] == "legacy"
     assert detail_payload["files"][0]["original_image_data_url"].startswith("data:image/png;base64,")
     assert detail_payload["files"][0]["processed_image_data_url"].startswith("data:image/jpeg;base64,")
 

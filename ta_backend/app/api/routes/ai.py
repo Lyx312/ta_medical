@@ -1,7 +1,8 @@
 import base64
 import hashlib
+import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
@@ -10,10 +11,11 @@ from app.api.routes.auth import get_current_user_dependency
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.repositories.family_member_repository import FamilyMemberRepository
-from app.repositories.scan_log_repository import ScanLogFileCreate, ScanLogRepository
+from app.repositories.scan_log_repository import ScanLogAIRunCreate, ScanLogFileCreate, ScanLogRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.ai import AIScanDocumentsResponse
+from app.schemas.ai import AIMedicalScanResponse, AIScanDocumentsResponse
 from app.schemas.auth import TokenData
+from app.services.ai_ensemble import MedicalExtractionOutcome, ProducerInferenceTrace
 from app.services.ai_service import (
     DocumentImageInput,
     DocumentValidationProcessor,
@@ -75,6 +77,49 @@ def build_scan_log_error_payload(http_error: HTTPException) -> dict[str, Any]:
     }
 
 
+def sanitize_json_compatible(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [sanitize_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_json_compatible(item) for key, item in value.items()}
+    return value
+
+
+def normalize_extraction_outcome(
+    extraction_result: AIMedicalScanResponse | MedicalExtractionOutcome,
+    *,
+    fallback_provider: str | None,
+    fallback_model: str | None,
+) -> MedicalExtractionOutcome:
+    if isinstance(extraction_result, MedicalExtractionOutcome):
+        return extraction_result
+
+    sanitized_result = AIMedicalScanResponse.model_validate(sanitize_json_compatible(extraction_result.model_dump()))
+
+    return MedicalExtractionOutcome(
+        result=sanitized_result,
+        overall_confidence=None,
+        field_confidence={},
+        review_required=False,
+        review_reasons=[],
+        calibration_version="legacy",
+        ai_execution_mode="single_model",
+        primary_model_provider=fallback_provider,
+        primary_model_name=fallback_model,
+        ai_runs=[],
+        extraction_meta_payload={
+            "fusion_version": "legacy-single-model",
+            "calibration_version": "legacy",
+            "field_confidence": {},
+            "review_required": False,
+            "review_reasons": [],
+            "overall_confidence": None,
+        },
+    )
+
+
 def resolve_scan_failure_status(
     http_error: HTTPException,
     *,
@@ -91,6 +136,25 @@ def resolve_scan_failure_status(
     if validation_payload is not None:
         return "extraction_failed"
     return "scan_failed"
+
+
+def traces_to_ai_run_creates(traces: list[ProducerInferenceTrace] | None) -> list[ScanLogAIRunCreate] | None:
+    if not traces:
+        return None
+    return [
+        ScanLogAIRunCreate(
+            producer_id=trace.producer_id,
+            provider=trace.provider,
+            model_name=trace.model,
+            producer_rank=trace.producer_rank,
+            run_index=trace.run_index,
+            temperature=trace.temperature,
+            success=trace.success,
+            error_message=trace.error,
+            payload=trace.payload.model_dump() if trace.payload else None,
+        )
+        for trace in traces
+    ]
 
 
 async def read_uploaded_files(files: list[UploadFile]) -> list[BufferedUpload]:
@@ -143,14 +207,13 @@ async def scan_documents(
 
     validation_payload: dict[str, Any] | None = None
     extraction_payload: dict[str, Any] | None = None
-    ai_model_provider: str | None = None
-    ai_model_name: str | None = None
+    extraction_meta_payload: dict[str, Any] | None = None
+    ai_runs: list[ProducerInferenceTrace] | None = None
+    primary_model_provider: str | None = None
+    primary_model_name: str | None = None
+    ai_execution_mode: str | None = None
 
     try:
-        model_spec = processor.get_primary_enabled_model_spec()
-        ai_model_provider = model_spec.provider
-        ai_model_name = model_spec.model
-
         images: list[DocumentImageInput] = []
         for upload, scan_log_file in zip(buffered_uploads, scan_log.files):
             processed_image = preprocess_document_image(
@@ -180,10 +243,24 @@ async def scan_documents(
             user_full_name=user.full_name,
             family_member_names=[family_member.name for family_member in family_members],
         )
-        extraction_result = await processor.process(images, patient_name_candidates=patient_name_candidates)
-        extraction_payload = extraction_result.model_dump()
+        fallback_model_spec = processor.get_primary_enabled_model_spec()
+        primary_model_provider = fallback_model_spec.provider
+        primary_model_name = fallback_model_spec.model
+        raw_extraction_result = await processor.process(images, patient_name_candidates=patient_name_candidates)
+        extraction_result = normalize_extraction_outcome(
+            raw_extraction_result,
+            fallback_provider=primary_model_provider,
+            fallback_model=primary_model_name,
+        )
+        extraction_payload = cast(dict[str, Any], sanitize_json_compatible(extraction_result.result.model_dump()))
+        extraction_result_payload = AIMedicalScanResponse.model_validate(extraction_payload)
+        extraction_meta_payload = extraction_result.extraction_meta_payload
+        ai_runs = extraction_result.ai_runs
+        primary_model_provider = extraction_result.primary_model_provider
+        primary_model_name = extraction_result.primary_model_name
+        ai_execution_mode = extraction_result.ai_execution_mode
 
-        extracted_patient_name = extraction_result.patient_info.get("name")
+        extracted_patient_name = extraction_result.result.patient_info.name
         if isinstance(extracted_patient_name, str) and not matches_any_patient_name_candidate(
             extracted_patient_name,
             patient_name_candidates,
@@ -206,8 +283,11 @@ async def scan_documents(
                 error_payload=build_scan_log_error_payload(patient_name_error),
                 validation_payload=validation_payload,
                 extraction_payload=extraction_payload,
-                ai_model_provider=ai_model_provider,
-                ai_model_name=ai_model_name,
+                ai_execution_mode=ai_execution_mode,
+                ai_runs=traces_to_ai_run_creates(ai_runs),
+                extraction_meta_payload=extraction_meta_payload,
+                primary_model_provider=primary_model_provider,
+                primary_model_name=primary_model_name,
             )
             raise patient_name_error
 
@@ -215,14 +295,29 @@ async def scan_documents(
             scan_log,
             validation_payload=validation_payload,
             extraction_payload=extraction_payload,
-            ai_model_provider=ai_model_provider,
-            ai_model_name=ai_model_name,
+            ai_execution_mode=ai_execution_mode,
+            ai_runs=traces_to_ai_run_creates(ai_runs),
+            extraction_meta_payload=extraction_meta_payload,
+            primary_model_provider=primary_model_provider,
+            primary_model_name=primary_model_name,
         )
         return AIScanDocumentsResponse(
             scan_log_id=scan_log.id,
-            **extraction_result.model_dump(),
+            overall_confidence=extraction_result.overall_confidence,
+            field_confidence=extraction_result.field_confidence,
+            review_required=extraction_result.review_required,
+            review_reasons=extraction_result.review_reasons,
+            calibration_version=extraction_result.calibration_version,
+            **extraction_result_payload.model_dump(),
         )
     except HTTPException as exc:
+        ai_execution_mode = cast(str | None, getattr(exc, "ai_execution_mode", ai_execution_mode))
+        exc_ai_runs = cast(list[ProducerInferenceTrace] | None, getattr(exc, "ai_runs", None))
+        if exc_ai_runs is not None:
+            ai_runs = exc_ai_runs
+        extraction_meta_payload = cast(dict[str, Any] | None, getattr(exc, "extraction_meta_payload", extraction_meta_payload))
+        primary_model_provider = cast(str | None, getattr(exc, "primary_model_provider", primary_model_provider))
+        primary_model_name = cast(str | None, getattr(exc, "primary_model_name", primary_model_name))
         if scan_log.status == "pending":
             scan_log_repository.mark_failed(
                 scan_log,
@@ -230,8 +325,11 @@ async def scan_documents(
                 error_payload=build_scan_log_error_payload(exc),
                 validation_payload=validation_payload,
                 extraction_payload=extraction_payload,
-                ai_model_provider=ai_model_provider,
-                ai_model_name=ai_model_name,
+                ai_execution_mode=ai_execution_mode,
+                ai_runs=traces_to_ai_run_creates(ai_runs),
+                extraction_meta_payload=extraction_meta_payload,
+                primary_model_provider=primary_model_provider,
+                primary_model_name=primary_model_name,
             )
         raise
     except Exception as exc:
@@ -245,7 +343,10 @@ async def scan_documents(
                 },
                 validation_payload=validation_payload,
                 extraction_payload=extraction_payload,
-                ai_model_provider=ai_model_provider,
-                ai_model_name=ai_model_name,
+                ai_execution_mode=ai_execution_mode,
+                ai_runs=traces_to_ai_run_creates(ai_runs),
+                extraction_meta_payload=extraction_meta_payload,
+                primary_model_provider=primary_model_provider,
+                primary_model_name=primary_model_name,
             )
         raise

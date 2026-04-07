@@ -232,6 +232,7 @@ def test_admin_claim_filters_and_summary(
                     "detected_documents": ["HOSPITAL_INVOICE"],
                     "medical_facility_name": "RS Sehat Sentosa",
                     "service_date": "2026-03-31",
+                    "transaction_date": "2026-03-31",
                     "currency": "IDR",
                     "total_amount": 200000,
                 },

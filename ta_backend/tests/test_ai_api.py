@@ -38,11 +38,17 @@ def get_message_block(content: Any, index: int) -> dict[str, Any]:
     assert isinstance(block, dict)
     return cast(dict[str, Any], block)
 
+
+def get_http_exception_detail_dict(exc: HTTPException) -> dict[str, Any]:
+    assert isinstance(exc.detail, dict)
+    return cast(dict[str, Any], exc.detail)
+
 SCAN_RESULT = {
     "summary": {
         "detected_documents": ["HOSPITAL_INVOICE"],
         "medical_facility_name": "RS Sehat Sentosa",
         "service_date": "2024-08-10",
+        "transaction_date": "2024-08-10",
         "currency": "IDR",
         "total_amount": 125000,
     },
@@ -230,20 +236,81 @@ def test_scan_documents_returns_validated_ai_payload(
     assert response.status_code == 200
     payload = response.json()
     assert payload["scan_log_id"] > 0
-    assert {key: value for key, value in payload.items() if key != "scan_log_id"} == SCAN_RESULT
+    assert payload["summary"] == SCAN_RESULT["summary"]
+    assert payload["patient_info"] == SCAN_RESULT["patient_info"]
+    assert payload["medical_context"] == SCAN_RESULT["medical_context"]
+    assert payload["medicines"] == SCAN_RESULT["medicines"]
+    assert payload["other_charges"] == SCAN_RESULT["other_charges"]
+    assert payload["financial_recap"] == SCAN_RESULT["financial_recap"]
+    assert payload["field_confidence"] == {}
+    assert payload["review_required"] is False
+    assert payload["review_reasons"] == []
+    assert payload["calibration_version"] == "legacy"
 
     scan_log = get_scan_log_by_id(payload["scan_log_id"])
     assert scan_log is not None
     assert scan_log.status == "succeeded"
     assert scan_log.validation_payload == VALIDATION_RESULT
     assert scan_log.extraction_payload == SCAN_RESULT
-    assert scan_log.ai_model_provider == "google_genai"
-    assert scan_log.ai_model_name == "gemini-3.1-flash-lite-preview"
+    assert scan_log.primary_model_provider == "google_genai"
+    assert scan_log.primary_model_name == "gemini-3.1-flash-lite-preview"
+    assert scan_log.ai_execution_mode == "single_model"
+    assert len(scan_log.ai_runs) == 0
+    assert scan_log.extraction_meta_payload is not None
     assert len(scan_log.files) == 1
     assert scan_log.files[0].original_content == b"abc"
     assert scan_log.files[0].processed_content == b"processed-image"
     assert scan_log.files[0].original_sha256_hash == hashlib.sha256(b"abc").hexdigest()
     assert scan_log.files[0].processed_sha256_hash == hashlib.sha256(b"processed-image").hexdigest()
+
+
+def test_scan_documents_sanitizes_nan_numbers_in_ai_payload(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, email="scan-nan-payload@example.com", full_name="Budi Saputra")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "scan.png"
+        assert content == b"abc"
+        return ProcessedDocumentImage(
+            filename="scan.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return DocumentValidationResponse.model_validate(VALIDATION_RESULT)
+
+    async def fake_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+    ) -> AIMedicalScanResponse:
+        del images, patient_name_candidates
+        return AIMedicalScanResponse.model_validate(
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    **SCAN_RESULT["summary"],
+                    "total_amount": float("nan"),
+                },
+            }
+        )
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(processor, "process", fake_process)
+
+    response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("scan.png", b"abc", "image/png"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["total_amount"] is None
 
 
 def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates(
@@ -456,7 +523,12 @@ def test_scan_documents_accepts_multi_document_validation_result_for_single_imag
     assert response.status_code == 200
     payload = response.json()
     assert payload["scan_log_id"] > 0
-    assert {key: value for key, value in payload.items() if key != "scan_log_id"} == SCAN_RESULT
+    assert payload["summary"] == SCAN_RESULT["summary"]
+    assert payload["patient_info"] == SCAN_RESULT["patient_info"]
+    assert payload["medical_context"] == SCAN_RESULT["medical_context"]
+    assert payload["medicines"] == SCAN_RESULT["medicines"]
+    assert payload["other_charges"] == SCAN_RESULT["other_charges"]
+    assert payload["financial_recap"] == SCAN_RESULT["financial_recap"]
 
     scan_log = get_scan_log_by_id(payload["scan_log_id"])
     assert scan_log is not None
@@ -592,7 +664,9 @@ def test_process_returns_validated_result_from_model_json(monkeypatch: pytest.Mo
         )
     )
 
-    assert result.model_dump() == SCAN_RESULT
+    assert result.result.model_dump() == SCAN_RESULT
+    assert result.ai_execution_mode == "ensemble"
+    assert result.overall_confidence is not None
 
 
 def test_process_rejects_non_json_model_output(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -628,7 +702,7 @@ def test_process_rejects_non_json_model_output(monkeypatch: pytest.MonkeyPatch) 
         )
 
     assert exc_info.value.status_code == 502
-    assert exc_info.value.detail == "AI model returned non-JSON response."
+    assert exc_info.value.detail == "AI ensemble failed to produce enough valid outputs."
 
 
 def test_process_rejects_invalid_json_shape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -664,7 +738,7 @@ def test_process_rejects_invalid_json_shape(monkeypatch: pytest.MonkeyPatch) -> 
         )
 
     assert exc_info.value.status_code == 502
-    assert exc_info.value.detail == "AI model returned invalid response shape."
+    assert exc_info.value.detail == "AI ensemble failed to produce enough valid outputs."
 
 
 def test_create_chat_model_requires_google_api_key() -> None:
@@ -742,8 +816,287 @@ def test_process_uses_first_active_database_model(
         )
     )
 
-    assert result.model_dump() == SCAN_RESULT
-    assert selected_models == ["model-b"]
+    assert result.result.model_dump() == SCAN_RESULT
+    assert selected_models == ["model-b", "model-b", "model-a", "model-a"]
+
+
+def test_process_uses_judge_for_service_date_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            payload = {
+                **SCAN_RESULT,
+                "summary": {
+                    **SCAN_RESULT["summary"],
+                    "service_date": "2024-08-10" if self.model_name == "model-a" else "2024-08-11",
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def fake_judge_field_conflict(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        assert field_path == "summary.service_date"
+        del images
+        selected = next(candidate for candidate in candidates if candidate["raw_value"] == "2024-08-11")
+        return cast(str, selected["normalized_key"]), "Consultation note date is better supported."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", fake_judge_field_conflict)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.summary.service_date == "2024-08-11"
+    assert result.field_confidence["summary.service_date"]["judge_used"] is True
+    assert result.extraction_meta_payload["judge_invocations"][0]["field_path"] == "summary.service_date"
+
+
+def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    google_outputs = [
+        {
+            "summary": {
+                "detected_documents": ["Formulir Rawat Jalan", "Kwitansi Klinik Utama Makmuri", "Salinan Resep", "Kwitansi Apotek Pojodo"],
+                "medical_facility_name": "Klinik Utama Makmuri",
+                "service_date": "28/08/2025",
+                "transaction_date": None,
+                "currency": "IDR",
+                "total_amount": 356900,
+            },
+            "patient_info": {
+                "name": "Nick Frederic Kristian",
+                "date_of_birth": None,
+                "age": 13,
+                "gender": "Pria",
+                "address": None,
+            },
+            "medical_context": {
+                "anamnesis": "panas, batuk, pilek, tenggorokan",
+                "diagnoses": [{"description": "pharyngitis + tonsillitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                "therapy_note": "Poliver, Isprinol, obat batuk pilek",
+            },
+            "medicines": [{"name": "Meiactin tab 500mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None}],
+            "other_charges": [
+                {"category": "Consultation", "description": "Biaya dokter Klinik Utama Makmuri", "amount": 278000},
+                {"category": "Medicine", "description": "Obat-obatan Apotek Pojodo", "amount": 78900},
+            ],
+            "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+        },
+        {
+            "summary": {
+                "detected_documents": ["Formulir Rawat Jalan", "Kwitansi Klinik Utama Makmuri", "Salinan Resep Apotek Pojodo", "Kwitansi Apotek Pojodo"],
+                "medical_facility_name": "Klinik Utama Makmuri",
+                "service_date": "28/08/2025",
+                "transaction_date": None,
+                "currency": "IDR",
+                "total_amount": 356900,
+            },
+            "patient_info": {
+                "name": "Nick Frederic Kristian",
+                "date_of_birth": None,
+                "age": 13,
+                "gender": "Pria",
+                "address": None,
+            },
+            "medical_context": {
+                "anamnesis": "panas, batuk, pilek, tenggorokan",
+                "diagnoses": [{"description": "pharyngitis + asma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                "therapy_note": "Poline, sirup batuk pilek, diet",
+            },
+            "medicines": [{"name": "Meiactin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": 78900}],
+            "other_charges": [{"category": "Consultation", "description": "Biaya konsultasi dokter di Klinik Utama Makmuri", "amount": 278000}],
+            "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+        },
+    ]
+    ollama_outputs = [
+        {
+            "summary": {
+                "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Pharmacy Receipt"],
+                "medical_facility_name": "Klinik Makmuri",
+                "service_date": "28/08/2025",
+                "transaction_date": None,
+                "currency": "IDR",
+                "total_amount": 356900,
+            },
+            "patient_info": {
+                "name": "Nick Frederic Kristian",
+                "date_of_birth": None,
+                "age": 13,
+                "gender": "Pria",
+                "address": None,
+            },
+            "medical_context": {
+                "anamnesis": "fanos, batuk pilek lama",
+                "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                "therapy_note": "Policare, Zithromax",
+            },
+            "medicines": [],
+            "other_charges": [
+                {"category": "Medical Consultation/Medicine", "description": "Kwitansi No. 2225/25", "amount": 278000},
+                {"category": "Medicine", "description": "Apotek Bogor", "amount": 78900},
+            ],
+            "financial_recap": {"total_medicines": None, "total_other_charges": 356900, "grand_total": 356900},
+        },
+        {
+            "summary": {
+                "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Pharmacy Receipt"],
+                "medical_facility_name": "Klinik Utama Makmuri",
+                "service_date": "28/08/2025",
+                "transaction_date": None,
+                "currency": "IDR",
+                "total_amount": 358900,
+            },
+            "patient_info": {
+                "name": "Nick Frederic Kristian",
+                "date_of_birth": None,
+                "age": 13,
+                "gender": "Pria",
+                "address": None,
+            },
+            "medical_context": {
+                "anamnesis": "fanos, batuk pilek lama",
+                "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                "therapy_note": "Polirese, Zyrtec",
+            },
+            "medicines": [{"name": "Obat-obatan", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": 78900}],
+            "other_charges": [{"category": "Consultation/Treatment", "description": "Resep", "amount": 279000}],
+            "financial_recap": {"total_medicines": 78900, "total_other_charges": 279000, "grand_total": 357900},
+        },
+    ]
+    call_counts = {"model-google": 0, "model-ollama": 0}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            if self.model_name == "model-openrouter":
+                raise HTTPException(status_code=502, detail="Upstream model failure.")
+
+            outputs = google_outputs if self.model_name == "model-google" else ollama_outputs
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[call_index]))
+
+    async def conservative_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images
+        if field_path == "medical_context.anamnesis":
+            raise AssertionError("Judge should not have been invoked for medical_context.anamnesis")
+        return cast(str, candidates[0]["normalized_key"]), "Preserve the leading candidate."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-google"),
+            AIModelSpec(provider="openrouter", model="model-openrouter"),
+            AIModelSpec(provider="ollama", model="model-ollama"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", conservative_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.summary.total_amount == 356900
+    assert result.result.financial_recap.total_medicines == 78900
+    assert result.result.financial_recap.total_other_charges == 278000
+    assert result.result.financial_recap.grand_total == 356900
+    assert len(result.result.medical_context.diagnoses) == 1
+    assert result.result.medical_context.diagnoses[0].description in {"pharyngitis + asma", "pharyngitis + asthma"}
+    assert len(result.result.medicines) == 1
+    assert result.result.medicines[0].total_price == 78900
+    assert len(result.result.other_charges) == 1
+    assert result.result.other_charges[0].amount == 278000
+    assert result.field_confidence["medical_context.anamnesis"]["judge_used"] is False
+    assert result.extraction_meta_payload["constraint_checks"]["financial_recap.grand_total"]["used_derived_value"] is False
+    assert "financial_recap.grand_total did not match derived financial totals." not in result.review_reasons
+
+
+def test_process_requires_minimum_successful_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FailingModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            raise HTTPException(status_code=502, detail="Upstream model failure.")
+
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FailingModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            medical_processor.process(
+                [
+                    DocumentImageInput(
+                        filename="scan.png",
+                        mime_type="image/png",
+                        base64_data="YWJj",
+                    )
+                ]
+            )
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "AI ensemble failed to produce enough valid outputs."
 
 
 def test_get_enabled_model_specs_ignores_active_providers_that_are_not_scan_compatible(
@@ -982,11 +1335,12 @@ def test_document_validation_processor_rejects_receipt_without_stamp_or_signatur
                     )
                 ]
             )
-        )
+    )
 
     assert exc_info.value.status_code == 422
-    assert exc_info.value.detail["message"] == "Document validation failed."
-    assert "visible facility stamp or doctor signature is required" in exc_info.value.detail["errors"][0]["message"]
+    detail = get_http_exception_detail_dict(exc_info.value)
+    assert detail["message"] == "Document validation failed."
+    assert "visible facility stamp or doctor signature is required" in detail["errors"][0]["message"]
 
 
 def test_document_validation_processor_allows_lab_result_without_stamp(
@@ -1150,7 +1504,8 @@ def test_document_validation_processor_still_rejects_rotated_and_blurry_document
         )
 
     assert exc_info.value.status_code == 422
-    assert exc_info.value.detail["message"] == "Document validation failed."
+    detail = get_http_exception_detail_dict(exc_info.value)
+    assert detail["message"] == "Document validation failed."
 
 
 def test_document_validation_processor_rejects_non_medical_and_uncertain_documents(
@@ -1217,5 +1572,6 @@ def test_document_validation_processor_rejects_non_medical_and_uncertain_documen
         )
 
     assert exc_info.value.status_code == 422
-    assert exc_info.value.detail["message"] == "Document validation failed."
-    assert "non-medical document" in exc_info.value.detail["errors"][0]["message"]
+    detail = get_http_exception_detail_dict(exc_info.value)
+    assert detail["message"] == "Document validation failed."
+    assert "non-medical document" in detail["errors"][0]["message"]

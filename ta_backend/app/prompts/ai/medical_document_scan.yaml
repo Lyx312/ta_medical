@@ -19,6 +19,9 @@ user_template: |
   Do not invent or force a candidate name if the documents do not support it.
   If a value is missing or unreadable, use null, an empty string, an empty object, or an empty array as appropriate.
   Preserve the existing response structure exactly and keep number fields numeric.
+  For every date field (including summary.service_date, summary.transaction_date when present, and patient_info.date_of_birth), use ISO format YYYY-MM-DD (example: 2025-08-28).
+  Do not translate or rewrite wording across languages.
+  Preserve the original language used in the source image text for extracted textual fields.
   Return only the JSON object.
 
 output_contract:
@@ -27,6 +30,8 @@ output_contract:
     - Do not rename keys, do not add extra top-level keys, and do not wrap the JSON in markdown.
     - Keep monetary and quantity fields as numbers, not strings, whenever the source document provides a numeric value.
     - Use arrays for medicines, diagnoses, and other_charges even if there is only one item.
+    - All date strings must be formatted as ISO YYYY-MM-DD (example: 2025-08-28).
+    - Keep extracted text in the same language as shown in the document; do not translate.
   expected_types:
     summary: object
     patient_info: object

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, LargeBinary, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -19,10 +19,12 @@ class ScanLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
-    ai_model_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    ai_model_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    ai_execution_mode: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    primary_model_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    primary_model_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
     validation_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     extraction_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    extraction_meta_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -41,6 +43,11 @@ class ScanLog(Base):
         back_populates="scan_log",
         cascade="all, delete-orphan",
         order_by="ScanLogFile.id.asc()",
+    )
+    ai_runs: Mapped[list["ScanLogAIRun"]] = relationship(
+        back_populates="scan_log",
+        cascade="all, delete-orphan",
+        order_by="ScanLogAIRun.id.asc()",
     )
     linked_claims: Mapped[list[Claim]] = relationship(
         "Claim",
@@ -67,3 +74,26 @@ class ScanLogFile(Base):
     processed_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     scan_log: Mapped[ScanLog] = relationship(back_populates="files")
+
+
+class ScanLogAIRun(Base):
+    __tablename__ = "scan_log_ai_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_log_id: Mapped[int] = mapped_column(ForeignKey("scan_logs.id"), index=True, nullable=False)
+    producer_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    producer_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    run_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    temperature: Mapped[float] = mapped_column(Float, nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    scan_log: Mapped[ScanLog] = relationship(back_populates="ai_runs")

@@ -1,6 +1,7 @@
+import asyncio
 import json
 from importlib import import_module
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,19 @@ from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
+from app.services.ai_ensemble import (
+    AI_EXTRACTION_MAX_PRODUCERS,
+    AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
+    AI_EXTRACTION_RUNS_PER_MODEL,
+    AI_EXTRACTION_TEMPERATURE,
+    CALIBRATION_VERSION,
+    FUSION_VERSION,
+    MedicalExtractionFusionEngine,
+    MedicalExtractionOutcome,
+    ProducerInferenceTrace,
+    SuccessfulProducerInferenceTrace,
+    to_successful_trace,
+)
 from app.services.ai_provider_catalog import (
     get_ai_provider_catalog_entry,
     is_provider_scan_compatible,
@@ -22,6 +36,7 @@ from app.services.ai_provider_catalog import (
 
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
 VALIDATION_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_validation.yaml"
+FIELD_JUDGE_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_field_judge.yaml"
 STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"receipt", "medical_form", "doctor_note", "prescription"}
 STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"lab_result", "radiology_result"}
 SUPPORTED_MEDICAL_DOCUMENT_TYPES = STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
@@ -143,9 +158,10 @@ class BaseDocumentAIProcessor:
         self._settings = settings
         self._prompt_file_path = prompt_file_path or PROMPT_FILE_PATH
 
-    def _load_prompt_bundle(self) -> PromptBundle:
+    def _load_prompt_bundle(self, prompt_file_path: Path | None = None) -> PromptBundle:
+        target_path = prompt_file_path or self._prompt_file_path
         try:
-            with self._prompt_file_path.open("r", encoding="utf-8") as prompt_file:
+            with target_path.open("r", encoding="utf-8") as prompt_file:
                 prompt_config = yaml.safe_load(prompt_file) or {}
         except FileNotFoundError as exc:
             raise HTTPException(
@@ -335,13 +351,31 @@ class BaseDocumentAIProcessor:
             lines = lines[:-1]
         return "\n".join(lines).strip()
 
+    def _build_image_messages(self, prompt_text: str, images: list[DocumentImageInput]) -> list[Any]:
+        human_content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": prompt_text,
+            }
+        ]
+        for image in images:
+            human_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
+                    },
+                }
+            )
+        return cast(list[Any], human_content)
+
 
 class MedicalDocumentProcessor(BaseDocumentAIProcessor):
     async def process(
         self,
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
-    ) -> AIMedicalScanResponse:
+    ) -> MedicalExtractionOutcome:
         if not images:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -349,31 +383,99 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             )
 
         prompt_bundle = self._load_prompt_bundle()
-        model_specs = self._get_enabled_model_specs()
+        model_specs = self._get_enabled_model_specs()[:AI_EXTRACTION_MAX_PRODUCERS]
+        execution_mode = "ensemble" if len(model_specs) > 1 or AI_EXTRACTION_RUNS_PER_MODEL > 1 else "single_model"
 
-        inference_results: list[AIMedicalScanResponse] = []
-        for model_spec in model_specs[:1]:
-            inference_results.append(
-                await self._run_model_inference(
-                    model_spec=model_spec,
+        traces = await asyncio.gather(
+            *[
+                self._run_single_inference_trace(
+                    model_spec=replace(model_spec, temperature=AI_EXTRACTION_TEMPERATURE),
+                    producer_rank=producer_rank,
+                    run_index=run_index,
                     images=images,
                     patient_name_candidates=patient_name_candidates or [],
                     prompt_bundle=prompt_bundle,
                 )
+                for producer_rank, model_spec in enumerate(model_specs)
+                for run_index in range(AI_EXTRACTION_RUNS_PER_MODEL)
+            ]
+        )
+
+        successful_traces = [
+            to_successful_trace(trace)
+            for trace in traces
+            if trace.success and trace.payload is not None
+        ]
+        if len(successful_traces) < AI_EXTRACTION_MIN_SUCCESSFUL_RUNS:
+            error = HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="AI ensemble failed to produce enough valid outputs.",
             )
+            setattr(error, "ai_execution_mode", execution_mode)
+            setattr(error, "ai_runs", list(traces))
+            setattr(error, "primary_model_provider", model_specs[0].provider if model_specs else None)
+            setattr(error, "primary_model_name", model_specs[0].model if model_specs else None)
+            setattr(
+                error,
+                "extraction_meta_payload",
+                {
+                    "fusion_version": FUSION_VERSION,
+                    "calibration_version": CALIBRATION_VERSION,
+                    "review_required": True,
+                    "review_reasons": ["AI ensemble did not produce enough successful runs."],
+                },
+            )
+            raise error
 
-        return self.combine_inference_results(inference_results)
+        fusion_engine = MedicalExtractionFusionEngine(judge_field=self._judge_field_conflict)
+        return await fusion_engine.fuse(
+            successful_traces=successful_traces,
+            all_traces=list(traces),
+            images=images,
+            execution_mode=execution_mode,
+            primary_model_provider=model_specs[0].provider if model_specs else None,
+            primary_model_name=model_specs[0].model if model_specs else None,
+        )
 
-    def combine_inference_results(
+    async def _run_single_inference_trace(
         self,
-        results: list[AIMedicalScanResponse],
-    ) -> AIMedicalScanResponse:
-        if not results:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="No AI inference result was produced.",
+        *,
+        model_spec: AIModelSpec,
+        producer_rank: int,
+        run_index: int,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str],
+        prompt_bundle: PromptBundle,
+    ) -> ProducerInferenceTrace:
+        producer_id = f"{model_spec.provider}:{model_spec.model}"
+        try:
+            payload = await self._run_model_inference(
+                model_spec=model_spec,
+                images=images,
+                patient_name_candidates=patient_name_candidates,
+                prompt_bundle=prompt_bundle,
             )
-        return results[0]
+            return ProducerInferenceTrace(
+                producer_id=producer_id,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                producer_rank=producer_rank,
+                run_index=run_index,
+                temperature=model_spec.temperature,
+                success=True,
+                payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ProducerInferenceTrace(
+                producer_id=producer_id,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                producer_rank=producer_rank,
+                run_index=run_index,
+                temperature=model_spec.temperature,
+                success=False,
+                error=self._describe_exception(exc),
+            )
 
     async def _run_model_inference(
         self,
@@ -421,26 +523,60 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             prompt_bundle.user_template,
         ).format(**template_input)
 
-        human_content: list[dict[str, object]] = [
-            {
-                "type": "text",
-                "text": user_prompt,
-            }
-        ]
-        for image in images:
-            human_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
-                    },
-                }
-            )
-
         return [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=cast(list[str | dict[object, object]], human_content)),
+            HumanMessage(content=self._build_image_messages(user_prompt, images)),
         ]
+
+    async def _judge_field_conflict(
+        self,
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
+        prompt_bundle = self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
+        template_input = {
+            "field_path": field_path,
+            "candidates_json": json.dumps(
+                [
+                    {
+                        "index": index,
+                        "value": candidate["raw_value"],
+                        "support_count": candidate["run_count"],
+                        "producer_count": len(candidate["producers"]),
+                    }
+                    for index, candidate in enumerate(candidates)
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+        }
+        system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
+        user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
+        model = self._create_chat_model(judge_model_spec)
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=self._build_image_messages(user_prompt, cast(list[DocumentImageInput], images))),
+            ]
+        )
+        payload = self._parse_ai_response_to_json(response.content)
+        selected_index = payload.get("selected_candidate_index")
+        if selected_index is None or not isinstance(selected_index, int):
+            return None, cast(str | None, payload.get("reason"))
+        if selected_index < 0 or selected_index >= len(candidates):
+            return None, cast(str | None, payload.get("reason"))
+        return cast(str, candidates[selected_index]["normalized_key"]), cast(str | None, payload.get("reason"))
+
+    def _describe_exception(self, exc: Exception) -> str:
+        if isinstance(exc, HTTPException):
+            if isinstance(exc.detail, str):
+                return exc.detail
+            if isinstance(exc.detail, dict):
+                return str(exc.detail.get("message", "HTTP error"))
+        return str(exc) or exc.__class__.__name__
 
 class DocumentValidationProcessor(BaseDocumentAIProcessor):
     def __init__(
@@ -522,25 +658,9 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
             prompt_bundle.user_template,
         ).format(**template_input)
 
-        human_content: list[dict[str, object]] = [
-            {
-                "type": "text",
-                "text": user_prompt,
-            }
-        ]
-        for image in images:
-            human_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{image.mime_type};base64,{image.base64_data}",
-                    },
-                }
-            )
-
         return [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=cast(list[str | dict[object, object]], human_content)),
+            HumanMessage(content=self._build_image_messages(user_prompt, images)),
         ]
 
     def _enforce_validation_rules(self, result: DocumentValidationResponse) -> None:

@@ -192,6 +192,26 @@ export function NewClaimScreen() {
     return `${day}-${month}-${year}`;
   };
 
+  const parseExtractedDate = (value: string): Date | null => {
+    const ymdMatch = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (ymdMatch) {
+      const [, yearRaw, monthRaw, dayRaw] = ymdMatch;
+      const day = Number(dayRaw);
+      const month = Number(monthRaw);
+      const year = Number(yearRaw);
+      const parsed = new Date(year, month - 1, day);
+      if (
+        parsed.getFullYear() === year &&
+        parsed.getMonth() === month - 1 &&
+        parsed.getDate() === day
+      ) {
+        return parsed;
+      }
+      return null;
+    }
+    return null;
+  };
+
   const displayedClaimAmount = formatClaimAmountForDisplay(claimAmount);
 
   const applyAIScanData = (data: AIMedicalScanResult) => {
@@ -209,8 +229,8 @@ export function NewClaimScreen() {
 
     const extractedServiceDate = data.summary.service_date ?? data.summary.transaction_date;
     if (extractedServiceDate) {
-      const parsedDate = new Date(extractedServiceDate);
-      if (!Number.isNaN(parsedDate.getTime())) {
+      const parsedDate = parseExtractedDate(extractedServiceDate);
+      if (parsedDate) {
         setServiceDate(parsedDate);
       }
     }

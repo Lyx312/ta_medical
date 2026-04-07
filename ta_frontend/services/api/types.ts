@@ -71,6 +71,11 @@ export type AIOtherCharge = {
 
 export type AIMedicalScanResult = {
   scan_log_id: number;
+  overall_confidence: number | null;
+  field_confidence: Record<string, unknown>;
+  review_required: boolean;
+  review_reasons: string[];
+  calibration_version: string | null;
   summary: {
     detected_documents: string[];
     medical_facility_name: string;
@@ -194,8 +199,8 @@ export type AdminScanLogSummary = {
   status: string;
   file_count: number;
   linked_claim_ids: number[];
-  ai_model_provider: string | null;
-  ai_model_name: string | null;
+  primary_model_provider: string | null;
+  primary_model_name: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -214,9 +219,24 @@ export type AdminScanLogFile = {
   processed_image_data_url: string | null;
 };
 
+export type AdminScanLogAIRun = {
+  producer_id: string;
+  provider: string;
+  model_name: string;
+  producer_rank: number;
+  run_index: number;
+  temperature: number;
+  success: boolean;
+  error_message: string | null;
+  payload: Record<string, unknown> | null;
+};
+
 export type AdminScanLogDetail = AdminScanLogSummary & {
+  ai_execution_mode: string | null;
   validation_payload: Record<string, unknown> | null;
   extraction_payload: Record<string, unknown> | null;
+  ai_model_runs: AdminScanLogAIRun[];
+  extraction_meta_payload: Record<string, unknown> | null;
   error_payload: Record<string, unknown> | null;
   files: AdminScanLogFile[];
 };

@@ -1,0 +1,31 @@
+system_template: |
+  You are an expert medical document extraction adjudicator.
+  You must choose the best supported candidate for one field from the provided candidate list.
+  Return only valid JSON with no markdown, no explanation outside the JSON object, and no extra keys.
+  Follow this exact output JSON format:
+  {output_contract_json}
+
+user_template: |
+  Review the uploaded medical document images and choose the best-supported candidate for the field `{field_path}`.
+  Candidate values:
+  {candidates_json}
+
+  Rules:
+  - Choose only one of the provided candidate indices.
+  - Do not invent a new value.
+  - Prefer the candidate that is most directly supported by the visible documents.
+  - If none of the candidates are clearly supported, return null.
+  - Keep the reason short and evidence-focused.
+  Return only the JSON object.
+
+output_contract:
+  instructions:
+    - Return exactly these keys: selected_candidate_index, reason.
+    - selected_candidate_index must be a number or null.
+    - reason must be a string or null.
+  expected_types:
+    selected_candidate_index: number | null
+    reason: string | null
+  expected_json:
+    selected_candidate_index: number | null
+    reason: string | null

@@ -12,8 +12,8 @@ class AdminScanLogListItemResponse(BaseModel):
     status: str
     file_count: int
     linked_claim_ids: list[int]
-    ai_model_provider: str | None
-    ai_model_name: str | None
+    primary_model_provider: str | None
+    primary_model_name: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -32,9 +32,24 @@ class AdminScanLogFileResponse(BaseModel):
     processed_image_data_url: str | None
 
 
+class AdminScanLogAIRunResponse(BaseModel):
+    producer_id: str
+    provider: str
+    model_name: str
+    producer_rank: int
+    run_index: int
+    temperature: float
+    success: bool
+    error_message: str | None
+    payload: dict[str, Any] | None
+
+
 class AdminScanLogDetailResponse(AdminScanLogListItemResponse):
+    ai_execution_mode: str | None = None
     validation_payload: dict[str, Any] | None
     extraction_payload: dict[str, Any] | None
+    ai_model_runs: list[AdminScanLogAIRunResponse] = []
+    extraction_meta_payload: dict[str, Any] | None = None
     error_payload: dict[str, Any] | None
     files: list[AdminScanLogFileResponse]
 

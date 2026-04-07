@@ -1,3 +1,5 @@
+from typing import Any
+
 from sqlalchemy import inspect, select, text
 
 from app.db.base import Base
@@ -75,6 +77,7 @@ DEFAULT_AI_MODEL_CATALOG = [
 def initialize_database() -> None:
     Base.metadata.create_all(bind=get_engine())
     ensure_ai_model_schema()
+    ensure_scan_log_schema()
     seed_default_admin()
     seed_default_ai_models()
 
@@ -119,3 +122,127 @@ def ensure_ai_model_schema() -> None:
 
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE ai_models ADD COLUMN priority INTEGER NOT NULL DEFAULT 100"))
+
+
+def ensure_scan_log_schema() -> None:
+    """
+    Version-aware migration for scan_logs table.
+
+    Detects legacy schema (has ai_model_provider, ai_model_name, ai_model_runs_payload)
+    and rebuilds the table with new schema (primary_model_provider, primary_model_name).
+    Creates scan_log_ai_runs table for structured per-run data.
+    Does NOT backfill ai_model_runs_payload data - historical run debug data is discarded.
+    """
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    if "scan_logs" not in tables:
+        return
+
+    column_names = {column["name"] for column in inspector.get_columns("scan_logs")}
+
+    is_legacy = "ai_model_provider" in column_names
+    has_new_schema = "primary_model_provider" in column_names
+
+    if has_new_schema and not is_legacy:
+        _ensure_scan_log_ai_runs_table(engine, inspector)
+        return
+
+    if not is_legacy:
+        _ensure_scan_log_ai_runs_table(engine, inspector)
+        return
+
+    _migrate_scan_logs_to_new_schema(engine)
+    _ensure_scan_log_ai_runs_table(engine, inspector)
+
+
+def _ensure_scan_log_ai_runs_table(engine: Any, inspector: Any) -> None:
+    """Create scan_log_ai_runs table if it doesn't exist."""
+    tables = set(inspector.get_table_names())
+    if "scan_log_ai_runs" in tables:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE scan_log_ai_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_log_id INTEGER NOT NULL REFERENCES scan_logs(id),
+                    producer_id VARCHAR(200) NOT NULL,
+                    provider VARCHAR(50) NOT NULL,
+                    model_name VARCHAR(150) NOT NULL,
+                    producer_rank INTEGER NOT NULL,
+                    run_index INTEGER NOT NULL,
+                    temperature REAL NOT NULL,
+                    success BOOLEAN NOT NULL,
+                    error_message TEXT,
+                    payload JSON,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX ix_scan_log_ai_runs_scan_log_id ON scan_log_ai_runs(scan_log_id)"))
+
+
+def _migrate_scan_logs_to_new_schema(engine: Any) -> None:
+    """
+    Rebuild scan_logs table with new schema, preserving main scan-log data.
+
+    SQLite does not support DROP COLUMN, so we rebuild the table:
+    1. Create scan_logs_new with new schema
+    2. Copy data (mapping ai_model_provider -> primary_model_provider, etc.)
+    3. Drop old scan_logs
+    4. Rename scan_logs_new to scan_logs
+    5. Recreate indexes
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE scan_logs_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+                    ai_execution_mode VARCHAR(50),
+                    primary_model_provider VARCHAR(50),
+                    primary_model_name VARCHAR(150),
+                    validation_payload JSON,
+                    extraction_payload JSON,
+                    extraction_meta_payload JSON,
+                    error_payload JSON,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                INSERT INTO scan_logs_new (
+                    id, user_id, status, ai_execution_mode,
+                    primary_model_provider, primary_model_name,
+                    validation_payload, extraction_payload,
+                    extraction_meta_payload, error_payload,
+                    created_at, updated_at
+                )
+                SELECT
+                    id, user_id, status, ai_execution_mode,
+                    ai_model_provider, ai_model_name,
+                    validation_payload, extraction_payload,
+                    extraction_meta_payload, error_payload,
+                    created_at, updated_at
+                FROM scan_logs
+                """
+            )
+        )
+
+        connection.execute(text("DROP TABLE scan_logs"))
+
+        connection.execute(text("ALTER TABLE scan_logs_new RENAME TO scan_logs"))
+
+        connection.execute(text("CREATE INDEX ix_scan_logs_user_id ON scan_logs(user_id)"))

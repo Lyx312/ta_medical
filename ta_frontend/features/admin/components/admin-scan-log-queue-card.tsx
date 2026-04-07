@@ -84,7 +84,7 @@ export function AdminScanLogQueueCard({ log, onPress, onOpenClaim }: AdminScanLo
           <View style={styles.gridItemWide}>
             <ThemedText style={styles.gridLabel}>Model</ThemedText>
             <ThemedText style={styles.gridValue}>
-              {log.ai_model_name ? `${log.ai_model_provider}/${log.ai_model_name}` : 'Unavailable'}
+              {log.primary_model_name ? `${log.primary_model_provider}/${log.primary_model_name}` : 'Unavailable'}
             </ThemedText>
           </View>
         </View>

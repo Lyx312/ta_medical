@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models.scan_log import ScanLog, ScanLogFile
+from app.models.scan_log import ScanLog, ScanLogAIRun, ScanLogFile
 from app.models.user import User
 
 
@@ -24,6 +24,19 @@ class ScanLogFileCreate:
     processed_content: bytes | None = None
 
 
+@dataclass(frozen=True)
+class ScanLogAIRunCreate:
+    producer_id: str
+    provider: str
+    model_name: str
+    producer_rank: int
+    run_index: int
+    temperature: float
+    success: bool
+    error_message: str | None = None
+    payload: dict[str, Any] | None = None
+
+
 class ScanLogRepository:
     def __init__(self, db: Session) -> None:
         self._db = db
@@ -33,14 +46,12 @@ class ScanLogRepository:
         *,
         user_id: int,
         file_records: list[ScanLogFileCreate],
-        ai_model_provider: str | None = None,
-        ai_model_name: str | None = None,
+        ai_execution_mode: str | None = None,
     ) -> ScanLog:
         scan_log = ScanLog(
             user_id=user_id,
             status="pending",
-            ai_model_provider=ai_model_provider,
-            ai_model_name=ai_model_name,
+            ai_execution_mode=ai_execution_mode,
         )
         scan_log.files.extend(
             ScanLogFile(
@@ -86,15 +97,22 @@ class ScanLogRepository:
         *,
         validation_payload: dict[str, Any],
         extraction_payload: dict[str, Any],
-        ai_model_provider: str | None,
-        ai_model_name: str | None,
+        primary_model_provider: str | None,
+        primary_model_name: str | None,
+        ai_execution_mode: str | None = None,
+        ai_runs: list[ScanLogAIRunCreate] | None = None,
+        extraction_meta_payload: dict[str, Any] | None = None,
     ) -> ScanLog:
         scan_log.status = "succeeded"
-        scan_log.ai_model_provider = ai_model_provider
-        scan_log.ai_model_name = ai_model_name
+        scan_log.primary_model_provider = primary_model_provider
+        scan_log.primary_model_name = primary_model_name
+        scan_log.ai_execution_mode = ai_execution_mode
         scan_log.validation_payload = validation_payload
         scan_log.extraction_payload = extraction_payload
+        scan_log.extraction_meta_payload = extraction_meta_payload
         scan_log.error_payload = None
+        if ai_runs:
+            self._persist_ai_runs(scan_log, ai_runs)
         self._db.commit()
         return self.get_by_id(scan_log.id) or scan_log
 
@@ -106,17 +124,41 @@ class ScanLogRepository:
         error_payload: dict[str, Any],
         validation_payload: dict[str, Any] | None = None,
         extraction_payload: dict[str, Any] | None = None,
-        ai_model_provider: str | None = None,
-        ai_model_name: str | None = None,
+        primary_model_provider: str | None = None,
+        primary_model_name: str | None = None,
+        ai_execution_mode: str | None = None,
+        ai_runs: list[ScanLogAIRunCreate] | None = None,
+        extraction_meta_payload: dict[str, Any] | None = None,
     ) -> ScanLog:
         scan_log.status = status
-        scan_log.ai_model_provider = ai_model_provider
-        scan_log.ai_model_name = ai_model_name
+        scan_log.primary_model_provider = primary_model_provider
+        scan_log.primary_model_name = primary_model_name
+        scan_log.ai_execution_mode = ai_execution_mode
         scan_log.validation_payload = validation_payload
         scan_log.extraction_payload = extraction_payload
+        scan_log.extraction_meta_payload = extraction_meta_payload
         scan_log.error_payload = error_payload
+        if ai_runs:
+            self._persist_ai_runs(scan_log, ai_runs)
         self._db.commit()
         return self.get_by_id(scan_log.id) or scan_log
+
+    def _persist_ai_runs(self, scan_log: ScanLog, runs: list[ScanLogAIRunCreate]) -> None:
+        for run in runs:
+            self._db.add(
+                ScanLogAIRun(
+                    scan_log_id=scan_log.id,
+                    producer_id=run.producer_id,
+                    provider=run.provider,
+                    model_name=run.model_name,
+                    producer_rank=run.producer_rank,
+                    run_index=run.run_index,
+                    temperature=run.temperature,
+                    success=run.success,
+                    error_message=run.error_message,
+                    payload=run.payload,
+                )
+            )
 
     def get_by_id(self, scan_log_id: int) -> ScanLog | None:
         return self._db.execute(
@@ -126,6 +168,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.files),
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
+                selectinload(ScanLog.ai_runs),
             )
         ).scalar_one_or_none()
 
@@ -140,6 +183,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.files),
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
+                selectinload(ScanLog.ai_runs),
             )
         ).scalar_one_or_none()
 
@@ -159,6 +203,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.files),
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
+                selectinload(ScanLog.ai_runs),
             )
         )
         if status:

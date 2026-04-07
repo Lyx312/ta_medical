@@ -3,19 +3,87 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class AIScanSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detected_documents: list[str] = Field(default_factory=list)
+    medical_facility_name: str | None = None
+    service_date: str | None = None
+    transaction_date: str | None = None
+    currency: str | None = None
+    total_amount: float | int | None = None
+
+
+class AIScanPatientInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    date_of_birth: str | None = None
+    age: float | int | None = None
+    gender: str | None = None
+    address: str | None = None
+
+
+class AIScanDiagnosis(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str | None = None
+    doctor_name: str | None = None
+
+
+class AIScanMedicalContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    anamnesis: str | None = None
+    diagnoses: list["AIScanDiagnosis"] = Field(default_factory=list)
+    therapy_note: str | None = None
+
+
+class AIScanMedicine(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    quantity: float | int | None = None
+    unit: str | None = None
+    dosage_instruction: str | None = None
+    unit_price: float | int | None = None
+    total_price: float | int | None = None
+
+
+class AIScanOtherCharge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: str | None = None
+    description: str | None = None
+    amount: float | int | None = None
+
+
+class AIScanFinancialRecap(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_medicines: float | int | None = None
+    total_other_charges: float | int | None = None
+    grand_total: float | int | None = None
+
+
 class AIMedicalScanResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary: dict[str, Any]
-    patient_info: dict[str, Any]
-    medical_context: dict[str, Any]
-    medicines: list[dict[str, Any]]
-    other_charges: list[dict[str, Any]]
-    financial_recap: dict[str, Any]
+    summary: AIScanSummary
+    patient_info: AIScanPatientInfo
+    medical_context: AIScanMedicalContext
+    medicines: list[AIScanMedicine]
+    other_charges: list[AIScanOtherCharge]
+    financial_recap: AIScanFinancialRecap
 
 
 class AIScanDocumentsResponse(AIMedicalScanResponse):
     scan_log_id: int
+    overall_confidence: float | None = None
+    field_confidence: dict[str, Any] = Field(default_factory=dict)
+    review_required: bool = False
+    review_reasons: list[str] = Field(default_factory=list)
+    calibration_version: str | None = None
 
 
 ValidationDocumentType = Literal[

@@ -93,6 +93,9 @@ def login_admin(client: TestClient) -> str:
 def build_valid_validation_response(filename: str) -> DocumentValidationResponse:
     return DocumentValidationResponse.model_validate(
         {
+            "packet_patient_name": None,
+            "patient_name_match_status": "not_checked",
+            "patient_name_match_reason": None,
             "images": [
                 {
                     "image_index": 0,
@@ -133,12 +136,13 @@ def test_admin_can_list_and_view_scan_logs(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         return build_valid_validation_response(images[0].filename)
 
     async def fake_scan_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        **_: object,
     ) -> AIMedicalScanResponse:
         assert patient_name_candidates == ["Admin Log User"]
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
@@ -200,12 +204,13 @@ def test_non_admin_cannot_access_scan_log_admin_routes(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         return build_valid_validation_response(images[0].filename)
 
     async def fake_scan_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        **_: object,
     ) -> AIMedicalScanResponse:
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
 
@@ -255,12 +260,13 @@ def test_admin_scan_log_filters_and_summary(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         return build_valid_validation_response(images[0].filename)
 
     async def fake_scan_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        **_: object,
     ) -> AIMedicalScanResponse:
         candidate_name = patient_name_candidates[0] if patient_name_candidates else "Unknown"
         extracted_name = "Unexpected Person" if images[0].filename == "queue-failed.jpg" else candidate_name

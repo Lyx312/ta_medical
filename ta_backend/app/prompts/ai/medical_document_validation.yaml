@@ -8,8 +8,19 @@ system_template: |
 user_template: |
   Analyze the {image_count} uploaded medical document image(s).
   The uploaded filenames in order are: {filenames_json}
+  Known patient name candidates for this user: {patient_name_candidates_json}
+  Expected selected patient name: {expected_patient_name_json}
   For each image, detect how many distinct documents are visible.
   If one image contains multiple papers, validate each paper as a separate document entry.
+  Also assess the patient name at the full claim-packet level across all uploaded images:
+  - extract the best-supported packet_patient_name when a patient name is visible
+  - set patient_name_match_status to matched, mismatched, not_found, uncertain, or not_checked
+  - use matched only when the visible patient name clearly matches the expected selected patient or one candidate name
+  - use mismatched only when the visible patient name is clear and does not match the expected selected patient or any candidate name
+  - use not_found when no patient name is visible anywhere in the packet
+  - use uncertain when the patient name may be present but is too unclear or ambiguous to verify confidently
+  - use not_checked only when no expected patient name and no candidate names are provided
+  - include a concise patient_name_match_reason when the status is not matched
   For each detected document:
   - classify the document type
   - decide whether it is a medical claim document
@@ -19,7 +30,12 @@ user_template: |
   - set decision to valid, invalid, or uncertain
   - include concise reasons explaining the decision
   Do not infer hidden, occluded, cropped, or ambiguous stamps/signatures.
+  A receipt may still be valid without a visible stamp or doctor signature if the receipt is otherwise readable and the medical facility identity is clearly visible.
+  In collage images, a prescription sheet such as "Resep" or "Salinan Resep" must be classified as prescription, not receipt, even when it appears beside receipts or payment slips.
+  For medical_form, doctor_note, and prescription, only mark stamp_detected or signature_detected true when the mark is clearly visible.
   If multiple papers are present but cannot be separated clearly, mark the affected document entries as uncertain and explain that separation is unclear.
+  When multiple papers are present in one uploaded image, prefer readable document-level assessments over rejecting the whole image.
+  If a smaller paper in a multi-paper image has an ambiguous stamp/signature because of the collage layout but is otherwise readable, keep the reason concise and mention the ambiguity rather than inventing a missing mark.
   A single uploaded image may contain multiple papers with different orientations.
   Evaluate each paper independently even if some papers are upright, some are rotated 90/270 degrees, and some are upside down.
   Do not reject a document only because it is rotated.
@@ -30,7 +46,7 @@ user_template: |
 
 output_contract:
   instructions:
-    - Return exactly one top-level key: images.
+    - Return exactly these top-level keys: images, packet_patient_name, patient_name_match_status, patient_name_match_reason.
     - Keep image_index zero-based and aligned with the upload order.
     - Keep document_index zero-based within each image.
     - Use one image result entry for every uploaded image.
@@ -38,7 +54,13 @@ output_contract:
     - Keep booleans as booleans, numbers as numbers, and reasons as arrays of strings.
   expected_types:
     images: array<object>
+    packet_patient_name: string | null
+    patient_name_match_status: string
+    patient_name_match_reason: string | null
   expected_json:
+    packet_patient_name: string | null
+    patient_name_match_status: matched | mismatched | not_found | uncertain | not_checked
+    patient_name_match_reason: string | null
     images:
       - image_index: number
         filename: string

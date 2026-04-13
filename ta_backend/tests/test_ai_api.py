@@ -121,6 +121,11 @@ def build_session_factory_with_ai_models(models: list[dict[str, object]]) -> ses
 
 
 VALIDATION_RESULT = {
+    "packet_patient_name": None,
+    "patient_name_match_status": "not_checked",
+    "patient_name_match_reason": None,
+    "review_required": False,
+    "review_reasons": [],
     "images": [
         {
             "image_index": 0,
@@ -207,7 +212,7 @@ def test_scan_documents_returns_validated_ai_payload(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         assert images[0].filename == "scan.jpg"
         return DocumentValidationResponse.model_validate(VALIDATION_RESULT)
@@ -215,12 +220,14 @@ def test_scan_documents_returns_validated_ai_payload(
     async def fake_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
     ) -> AIMedicalScanResponse:
         assert len(images) == 1
         assert images[0].filename == "scan.jpg"
         assert images[0].mime_type == "image/jpeg"
         assert images[0].base64_data == base64.b64encode(b"processed-image").decode("utf-8")
         assert patient_name_candidates == ["Siti Aminah", "Budi Saputra"]
+        assert validation_hints is not None
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
 
     monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
@@ -242,10 +249,11 @@ def test_scan_documents_returns_validated_ai_payload(
     assert payload["medicines"] == SCAN_RESULT["medicines"]
     assert payload["other_charges"] == SCAN_RESULT["other_charges"]
     assert payload["financial_recap"] == SCAN_RESULT["financial_recap"]
-    assert payload["field_confidence"] == {}
-    assert payload["review_required"] is False
-    assert payload["review_reasons"] == []
-    assert payload["calibration_version"] == "legacy"
+    assert "overall_confidence" not in payload
+    assert "field_confidence" not in payload
+    assert "review_required" not in payload
+    assert "review_reasons" not in payload
+    assert "calibration_version" not in payload
 
     scan_log = get_scan_log_by_id(payload["scan_log_id"])
     assert scan_log is not None
@@ -279,15 +287,16 @@ def test_scan_documents_sanitizes_nan_numbers_in_ai_payload(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         return DocumentValidationResponse.model_validate(VALIDATION_RESULT)
 
     async def fake_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
     ) -> AIMedicalScanResponse:
-        del images, patient_name_candidates
+        del images, patient_name_candidates, validation_hints
         return AIMedicalScanResponse.model_validate(
             {
                 **SCAN_RESULT,
@@ -313,7 +322,7 @@ def test_scan_documents_sanitizes_nan_numbers_in_ai_payload(
     assert payload["summary"]["total_amount"] is None
 
 
-def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates(
+def test_scan_documents_rejects_validation_patient_name_outside_family_candidates_before_extraction(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -334,14 +343,97 @@ def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
-        return DocumentValidationResponse.model_validate(VALIDATION_RESULT)
+        return DocumentValidationResponse.model_validate(
+            {
+                **VALIDATION_RESULT,
+                "packet_patient_name": "Andi Saputra",
+                "patient_name_match_status": "mismatched",
+                "patient_name_match_reason": "Document patient name 'Andi Saputra' does not match the user or any saved family member.",
+            }
+        )
 
     async def fake_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
     ) -> AIMedicalScanResponse:
+        raise AssertionError("Extraction should not run when validation already found a patient-name mismatch.")
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(processor, "process", fake_process)
+
+    response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("scan.png", b"abc", "image/png"))],
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["message"] == "Patient name verification failed."
+    assert payload["errors"] == [
+        {
+            "field": "non_field",
+            "message": "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document.",
+        }
+    ]
+
+    scan_log = get_scan_log_by_id(1)
+    assert scan_log is not None
+    assert scan_log.status == "patient_name_mismatch"
+    assert scan_log.validation_payload == {
+        **VALIDATION_RESULT,
+        "packet_patient_name": "Andi Saputra",
+        "patient_name_match_status": "mismatched",
+        "patient_name_match_reason": "Document patient name 'Andi Saputra' does not match the user or any saved family member.",
+    }
+    assert scan_log.extraction_payload is None
+    assert scan_log.error_payload is not None
+    assert scan_log.error_payload["detail"]["message"] == "Patient name verification failed."
+
+
+def test_scan_documents_rejects_extraction_patient_name_on_fallback_when_validation_name_is_not_found(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, email="scan-name-fallback@example.com", full_name="Siti Aminah")
+    family_member_response = client.post(
+        "/api/family-members",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Budi Saputra", "relation": "Child"},
+    )
+    assert family_member_response.status_code == 201
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "scan.png"
+        assert content == b"abc"
+        return ProcessedDocumentImage(
+            filename="scan.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return DocumentValidationResponse.model_validate(
+            {
+                **VALIDATION_RESULT,
+                "patient_name_match_status": "not_found",
+                "patient_name_match_reason": "Patient name is not visible clearly enough in the uploaded documents.",
+                "review_required": True,
+                "review_reasons": ["Patient name is not visible clearly enough in the uploaded documents."],
+            }
+        )
+
+    async def fake_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
+    ) -> AIMedicalScanResponse:
+        del validation_hints
         assert patient_name_candidates == ["Siti Aminah", "Budi Saputra"]
         mismatched_result = {
             **SCAN_RESULT,
@@ -375,11 +467,10 @@ def test_scan_documents_rejects_extracted_patient_name_outside_family_candidates
     scan_log = get_scan_log_by_id(1)
     assert scan_log is not None
     assert scan_log.status == "patient_name_mismatch"
-    assert scan_log.validation_payload == VALIDATION_RESULT
+    assert scan_log.validation_payload is not None
+    assert scan_log.validation_payload["patient_name_match_status"] == "not_found"
     assert scan_log.extraction_payload is not None
     assert scan_log.extraction_payload["patient_info"]["name"] == "Andi Saputra"
-    assert scan_log.error_payload is not None
-    assert scan_log.error_payload["detail"]["message"] == "Patient name verification failed."
 
 
 def test_scan_documents_returns_validation_failure_before_extraction(
@@ -397,7 +488,7 @@ def test_scan_documents_returns_validation_failure_before_extraction(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         raise HTTPException(
             status_code=422,
@@ -415,6 +506,7 @@ def test_scan_documents_returns_validation_failure_before_extraction(
     async def fake_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
     ) -> AIMedicalScanResponse:
         raise AssertionError("Extraction should not run when validation fails.")
 
@@ -465,7 +557,7 @@ def test_scan_documents_accepts_multi_document_validation_result_for_single_imag
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         return DocumentValidationResponse.model_validate(
             {
@@ -506,8 +598,38 @@ def test_scan_documents_accepts_multi_document_validation_result_for_single_imag
     async def fake_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
     ) -> AIMedicalScanResponse:
         assert len(images) == 1
+        assert validation_hints == {
+            "ordered_documents": [
+                {
+                    "image_index": 0,
+                    "document_index": 0,
+                    "document_type": "receipt",
+                    "decision": "valid",
+                },
+                {
+                    "image_index": 0,
+                    "document_index": 1,
+                    "document_type": "prescription",
+                    "decision": "valid",
+                },
+            ],
+            "document_type_counts": {
+                "receipt": 1,
+                "prescription": 1,
+            },
+            "image_document_counts": [
+                {
+                    "image_index": 0,
+                    "filename": "scan.jpg",
+                    "document_count_detected": 2,
+                    "validated_document_count": 2,
+                }
+            ],
+            "total_detected_documents": 2,
+        }
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
 
     monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
@@ -519,6 +641,95 @@ def test_scan_documents_accepts_multi_document_validation_result_for_single_imag
         headers={"Authorization": f"Bearer {token}"},
         files=[("files", ("scan.png", b"abc", "image/png"))],
     )
+
+    assert response.status_code == 200
+
+
+def test_scan_documents_merges_validation_review_flags_into_response(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, email="scan-validation-review@example.com", full_name="Siti Aminah")
+    family_member_response = client.post(
+        "/api/family-members",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Budi Saputra", "relation": "Child"},
+    )
+    assert family_member_response.status_code == 201
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "scan.png"
+        assert content == b"abc"
+        return ProcessedDocumentImage(
+            filename="scan.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return DocumentValidationResponse.model_validate(
+            {
+                "review_required": True,
+                "review_reasons": [
+                    "Image 1: multiple documents were present but could not be validated clearly.",
+                ],
+                "images": [
+                    {
+                        "image_index": 0,
+                        "filename": "scan.jpg",
+                        "document_count_detected": 2,
+                        "documents": [
+                            {
+                                "document_index": 0,
+                                "document_type": "receipt",
+                                "is_medical_document": True,
+                                "readability_ok": True,
+                                "facility_identity_visible": True,
+                                "stamp_detected": False,
+                                "signature_detected": False,
+                                "decision": "valid",
+                                "reasons": ["Facility identity is visible."],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    async def fake_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
+    ) -> AIMedicalScanResponse:
+        del images, patient_name_candidates, validation_hints
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(processor, "process", fake_process)
+
+    response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("scan.png", b"abc", "image/png"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "overall_confidence" not in payload
+    assert "field_confidence" not in payload
+    assert "review_required" not in payload
+    assert "review_reasons" not in payload
+    assert "calibration_version" not in payload
+
+    scan_log = get_scan_log_by_id(payload["scan_log_id"])
+    assert scan_log is not None
+    assert scan_log.validation_payload is not None
+    assert scan_log.validation_payload["review_required"] is True
+    assert scan_log.validation_payload["review_reasons"] == [
+        "Image 1: multiple documents were present but could not be validated clearly."
+    ]
 
     assert response.status_code == 200
     payload = response.json()
@@ -881,6 +1092,158 @@ def test_process_uses_judge_for_service_date_conflict(
     assert result.extraction_meta_payload["judge_invocations"][0]["field_path"] == "summary.service_date"
 
 
+def test_process_keeps_transaction_date_null_when_not_explicitly_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "summary": {
+                    **SCAN_RESULT["summary"],
+                    "service_date": "2024-08-10",
+                    "transaction_date": None,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.summary.service_date == "2024-08-10"
+    assert result.result.summary.transaction_date is None
+
+
+def test_process_prefers_null_gender_when_support_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "gender": "Pria" if self.model_name == "model-a" else None,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.gender is None
+    assert "prefer null over inferred gender when model support is ambiguous" in result.field_confidence["patient_info.gender"]["rule_hits"]
+
+
+def test_process_normalizes_explicit_gender_labels_to_canonical_enum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "gender": "Pria",
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.gender == "MALE"
+    assert "normalized local gender label to canonical enum" in result.field_confidence["patient_info.gender"]["rule_hits"]
+    assert result.extraction_meta_payload["marked_choice_inferences"] == [
+        {
+            "field_path": "patient_info.gender",
+            "value": "MALE",
+            "reason": "preserved explicit gender selection from a marked exclusive-choice form field",
+        }
+    ]
+
+
 def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1018,8 +1381,6 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
         candidates: list[dict[str, object]],
     ) -> tuple[str | None, str | None]:
         del images
-        if field_path == "medical_context.anamnesis":
-            raise AssertionError("Judge should not have been invoked for medical_context.anamnesis")
         return cast(str, candidates[0]["normalized_key"]), "Preserve the leading candidate."
 
     monkeypatch.setattr(
@@ -1060,9 +1421,791 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
     assert result.result.medicines[0].total_price == 78900
     assert len(result.result.other_charges) == 1
     assert result.result.other_charges[0].amount == 278000
-    assert result.field_confidence["medical_context.anamnesis"]["judge_used"] is False
+    assert result.field_confidence["medical_context.anamnesis"]["judge_used"] is True
+    assert "judge_resolved" in result.field_confidence["medical_context.anamnesis"]["review_flags"]
     assert result.extraction_meta_payload["constraint_checks"]["financial_recap.grand_total"]["used_derived_value"] is False
     assert "financial_recap.grand_total did not match derived financial totals." not in result.review_reasons
+    assert result.extraction_meta_payload["reconciliation_version"] == "financial-reconciliation-v2"
+    assert "list_group_meta" in result.extraction_meta_payload
+    assert "field_source_summary" not in result.extraction_meta_payload
+    selected_total_medicines_candidate = next(
+        candidate
+        for candidate in result.field_confidence["financial_recap.total_medicines"]["candidates"]
+        if candidate["selected"]
+    )
+    assert selected_total_medicines_candidate["value"] == 78900
+
+
+def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-lite": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["DR MAHE receipt", "Apotek Podojodo receipt", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "DR MAHE",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 595000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilu demam hags",
+                    "diagnoses": [{"description": "perhesis", "doctor_name": "dr. Mahendra, Sp.A(K), Ph.D."}],
+                    "therapy_note": "fibramax, puyer bapd, prover",
+                },
+                "medicines": [
+                    {"name": "Micropect", "quantity": None, "unit": None, "dosage_instruction": "3 ddl pnr", "unit_price": None, "total_price": None},
+                    {"name": "Lasal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                    {"name": "Tricore", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                    {"name": "Equal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Medical Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 195000},
+                    {"category": "Pharmacy", "description": "Apotek Podojodo", "amount": 102900},
+                    {"category": "Medical Consultation", "description": "jasa dokter", "amount": 300000},
+                ],
+                "financial_recap": {"total_medicines": 0, "total_other_charges": 597900, "grand_total": 595000},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["DR MAHE receipt", "Apotek Podojodo receipt", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "DR MAHE",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 687000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilu demam hags",
+                    "diagnoses": [{"description": "perhesis", "doctor_name": "dr. Mahendra, Sp.A(K), Ph.D."}],
+                    "therapy_note": "Ibramax, puyer bapd, prover",
+                },
+                "medicines": [
+                    {"name": "Micropect", "quantity": None, "unit": None, "dosage_instruction": "3 ddl pmv", "unit_price": None, "total_price": None},
+                    {"name": "Lasal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                    {"name": "Tricone", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                    {"name": "Equal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Medical Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 195000},
+                    {"category": "Pharmacy", "description": "Obat-obatan", "amount": 102000},
+                    {"category": "Medical Consultation", "description": "jasa dokter", "amount": 390000},
+                ],
+                "financial_recap": {"total_medicines": 102000, "total_other_charges": 585000, "grand_total": 687000},
+            },
+        ],
+        "model-flash": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi DR MAHE", "Struk dr. Mahendra", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 597900,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngikil demam hng",
+                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
+                    "therapy_note": "Zibramax, puyer batuk, profen",
+                },
+                "medicines": [
+                    {"name": "Zibramax", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
+                    {"name": "Profen Suspens", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
+                    {"name": "Mucospect", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                    {"name": "Lasal", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                    {"name": "Triam", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                    {"name": "Equal", "quantity": None, "unit": "sachet", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                    {"name": "Racikan Puyer (Mucospect, Lasal, Triam, Equal)", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": 102900},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
+                ],
+                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi DR MAHE", "Struk dr. Mahendra", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 597900,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngikil demam hngs",
+                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
+                    "therapy_note": "Zibramax, puyer batuk, prover",
+                },
+                "medicines": [
+                    {"name": "Zibramax", "quantity": 1, "unit": "x", "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
+                    {"name": "Profen (scusens)", "quantity": 1, "unit": "x", "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
+                    {"name": "Mucospect 7.5mg", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd p1v", "unit_price": None, "total_price": None},
+                    {"name": "Lasal 1.25mg", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd p1v", "unit_price": None, "total_price": None},
+                    {"name": "Trilac 3mg", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd p1v", "unit_price": None, "total_price": None},
+                    {"name": "Equal 1/3 sachet", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd p1v", "unit_price": None, "total_price": None},
+                    {"name": "Obat Racikan (Puyer)", "quantity": 1, "unit": "R/", "dosage_instruction": None, "unit_price": 102900, "total_price": 102900},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
+                ],
+                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
+            },
+        ],
+        "model-ollama": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["receipt", "prescription", "medical_form"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D.",
+                    "service_date": "2025-08-01",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 1145000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilili demam hanya",
+                    "diagnoses": [{"description": "perburuan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
+                    "therapy_note": "Abramax puyer bapd, prover",
+                },
+                "medicines": [
+                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
+                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Konsultasi", "description": "Pemeriksaan & Pengobatan Anak", "amount": 100000},
+                    {"category": "Konsultasi", "description": "Jasa dokter", "amount": 900000},
+                    {"category": "Obat", "description": "Apotek Podojodo", "amount": 145000},
+                ],
+                "financial_recap": {"total_medicines": None, "total_other_charges": 1145000, "grand_total": 1145000},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["receipt", "prescription", "medical_form"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D.",
+                    "service_date": "2025-08-01",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 1145000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilili demam hanya",
+                    "diagnoses": [{"description": "perburuan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
+                    "therapy_note": "Abramax puyer bap d. prover",
+                },
+                "medicines": [
+                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
+                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 100000},
+                    {"category": "Consultation", "description": "Jasa dokter", "amount": 900000},
+                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 145000},
+                    {"category": "Pharmacy", "description": "Apotek Podojodo", "amount": 100000},
+                ],
+                "financial_recap": {"total_medicines": 0, "total_other_charges": 1145000, "grand_total": 1145000},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-lite"),
+            AIModelSpec(provider="google_genai", model="model-flash"),
+            AIModelSpec(provider="ollama", model="model-ollama"),
+        ],
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_field_conflict",
+        lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={
+                "ordered_documents": [
+                    {"image_index": 0, "document_index": 0, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 2, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 3, "document_type": "prescription", "decision": "valid"},
+                    {"image_index": 1, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
+                    {"image_index": 2, "document_index": 0, "document_type": "receipt", "decision": "valid"},
+                ]
+            },
+        )
+    )
+
+    assert result.result.summary.total_amount == 597900
+    assert result.result.financial_recap.total_medicines == 102900
+    assert result.result.financial_recap.total_other_charges == 495000
+    assert result.result.financial_recap.grand_total == 597900
+    assert {charge.amount for charge in result.result.other_charges} == {195000, 300000}
+
+    ledger_source = result.extraction_meta_payload["derived_financials"]["canonical_medicine_ledger_source"]
+    assert ledger_source["amount"] == 102900
+    assert ledger_source["source_type"] == "other_charge"
+    assert any(
+        entry["field_path"].endswith(".total_price") and entry["amount"] in {160000, 35000} and entry["counted"] is False
+        for entry in result.extraction_meta_payload["derived_financials"]["price_counted_in_ledger"]
+    )
+    assert any(
+        suppression["amount"] == 900000
+        for suppression in result.extraction_meta_payload["derived_financials"]["financial_outlier_suppressions"]
+    )
+
+
+def test_process_uses_judge_for_low_confidence_dosage_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "medicines": [
+                    {
+                        "name": "Mucopret",
+                        "quantity": None,
+                        "unit": None,
+                        "dosage_instruction": "3 dd pulv" if self.model_name == "model-a" else "3 ddl pnv",
+                        "unit_price": None,
+                        "total_price": None,
+                    }
+                ],
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def dosage_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images
+        assert field_path == "medicines.dosage_instruction"
+        selected = next(candidate for candidate in candidates if candidate["raw_value"] == "3 dd pulv")
+        return cast(str, selected["normalized_key"]), "Prescription dosage is clearer in the primary image."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", dosage_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    dosage_field_key = next(key for key in result.field_confidence if key.endswith(".dosage_instruction"))
+    assert result.field_confidence[dosage_field_key]["judge_used"] is True
+    assert result.result.medicines[0].dosage_instruction == "3 dd pulv"
+
+
+def test_process_preserves_primary_supported_packet_document_when_validation_hints_confirm_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payloads = [
+        {
+            **SCAN_RESULT,
+            "summary": {
+                **SCAN_RESULT["summary"],
+                "detected_documents": [
+                    "Kwitansi DR MAHE",
+                    "Struk Apotek Podojodo",
+                    "Salinan Resep",
+                    "Formulir Rawat Jalan Mandiri Inhealth",
+                    "Kwitansi DR MAHE (Jasa Dokter)",
+                ],
+            },
+        },
+        {
+            **SCAN_RESULT,
+            "summary": {
+                **SCAN_RESULT["summary"],
+                "detected_documents": [
+                    "Kwitansi DR MAHE",
+                    "Salinan Resep",
+                    "Formulir Rawat Jalan Mandiri Inhealth",
+                    "Kwitansi DR MAHE (Jasa Dokter)",
+                ],
+            },
+        },
+    ]
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payloads.pop(0)))
+
+    async def inventory_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images
+        assert field_path == "summary.detected_documents"
+        selected = next(candidate for candidate in candidates if candidate["normalized_key"] == "expanded")
+        return cast(str, selected["normalized_key"]), "Validation-backed packet inventory preserves the extra receipt."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", inventory_judge)
+
+    validation_hints = {
+        "ordered_documents": [
+            {"image_index": 0, "document_index": 0, "document_type": "receipt", "decision": "valid"},
+            {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+            {"image_index": 0, "document_index": 2, "document_type": "prescription", "decision": "valid"},
+            {"image_index": 1, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
+            {"image_index": 2, "document_index": 0, "document_type": "receipt", "decision": "valid"},
+        ],
+        "document_type_counts": {"receipt": 3, "prescription": 1, "medical_form": 1},
+        "image_document_counts": [],
+        "total_detected_documents": 5,
+    }
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints=validation_hints,
+        )
+    )
+
+    assert "Struk Apotek Podojodo" in result.result.summary.detected_documents
+    assert len(result.result.summary.detected_documents) == 5
+    assert result.extraction_meta_payload["packet_inventory_hints"] == validation_hints
+
+
+def test_process_preserves_sparse_primary_medicines_beyond_stable_group_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payloads = [
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {"name": "Mucopret", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                {"name": "Equal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                {"name": "Lasal", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+                {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+            ],
+        },
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {"name": "Mucopret", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None},
+            ],
+        },
+    ]
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payloads.pop(0)))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={
+                "ordered_documents": [
+                    {"image_index": 0, "document_index": 0, "document_type": "prescription", "decision": "valid"},
+                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+                ]
+            },
+        )
+    )
+
+    assert [medicine.name for medicine in result.result.medicines] == ["Mucopret", "Equal", "Lasal", "Tritone"]
+    assert result.extraction_meta_payload["list_group_meta"]["medicines"]["target_count"] == 4
+
+
+def test_process_avoids_duplicate_receipt_padding_in_collage_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payloads = [
+        {
+            **SCAN_RESULT,
+            "summary": {
+                **SCAN_RESULT["summary"],
+                "detected_documents": [
+                    "dr. Mahendra Kwitansi",
+                    "Apotek Podojodo Receipt",
+                    "Apotek Podojodo Receipt",
+                    "Apotek Podojodo Receipt",
+                    "Salinan Resep",
+                    "Formulir Rawat Jalan",
+                ],
+            },
+        },
+        {
+            **SCAN_RESULT,
+            "summary": {
+                **SCAN_RESULT["summary"],
+                "detected_documents": [
+                    "dr. Mahendra Kwitansi",
+                    "Apotek Podojodo Receipt",
+                    "Salinan Resep",
+                    "Mandiri Inhealth Formulir Rawat Jalan",
+                ],
+            },
+        },
+    ]
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payloads.pop(0)))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={
+                "ordered_documents": [
+                    {"image_index": 0, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
+                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 2, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 3, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 1, "document_index": 0, "document_type": "prescription", "decision": "valid"},
+                    {"image_index": 2, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
+                ]
+            },
+        )
+    )
+
+    assert result.result.summary.detected_documents.count("Apotek Podojodo Receipt") == 1
+    assert "Salinan Resep" in result.result.summary.detected_documents
+    assert "Formulir Rawat Jalan" in result.result.summary.detected_documents
+
+
+def test_process_prefers_split_handwritten_ingredients_over_grouped_summary_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payloads = [
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {"name": "Mucopret", "quantity": None, "unit": None, "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                {"name": "Lasal", "quantity": None, "unit": None, "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                {"name": "Equal", "quantity": None, "unit": None, "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+            ],
+        },
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {"name": "Mucoprect, Lasal, Tritone, Equal", "quantity": 15, "unit": "pulv", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": 102900},
+                {"name": "Obat-obatan (Apotek Podojodo)", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": 102900},
+            ],
+        },
+    ]
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payloads.pop(0)))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={
+                "ordered_documents": [
+                    {"image_index": 0, "document_index": 0, "document_type": "prescription", "decision": "valid"},
+                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+                ]
+            },
+        )
+    )
+
+    assert {medicine.name for medicine in result.result.medicines} == {"Mucopret", "Lasal", "Tritone", "Equal"}
+    assert "preferred split ingredient extraction over grouped compound" in {
+        group["excluded_reason"]
+        for group in result.extraction_meta_payload["list_group_meta"]["medicines"]["groups"]
+        if group["excluded_reason"] is not None
+    }
+
+
+def test_process_nullifies_ambiguous_handwritten_semantic_field_when_judge_cannot_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payloads = [
+        {
+            **SCAN_RESULT,
+            "medical_context": {
+                **SCAN_RESULT["medical_context"],
+                "anamnesis": "Batuk ngikil demam hags",
+            },
+        },
+        {
+            **SCAN_RESULT,
+            "medical_context": {
+                **SCAN_RESULT["medical_context"],
+                "anamnesis": "Batuk ngiluh demam hari 3",
+            },
+        },
+    ]
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payloads.pop(0)))
+
+    async def unresolved_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, "Handwriting is too ambiguous."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", unresolved_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.medical_context.anamnesis is None
+    assert result.extraction_meta_payload["nullified_fields"] == [
+        {
+            "field_path": "medical_context.anamnesis",
+            "original_value": "Batuk ngikil demam hags",
+            "reason": "ambiguous handwritten field remained unresolved after adjudication",
+        }
+    ]
+
+
+def test_process_canonicalizes_structured_medical_terms_and_records_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    payload = {
+        **SCAN_RESULT,
+        "medical_context": {
+            **SCAN_RESULT["medical_context"],
+            "diagnoses": [{"description": "pertesis", "doctor_name": "dr. Budi"}],
+        },
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.medical_context.diagnoses[0].description == "Pertusis"
+    assert result.extraction_meta_payload["normalized_terms"] == [
+        {
+            "field_path": "diagnoses[pertesis].description",
+            "raw_value": "pertesis",
+            "canonical_value": "Pertusis",
+            "similarity": 0.875,
+        }
+    ]
 
 
 def test_process_requires_minimum_successful_runs(
@@ -1285,7 +2428,70 @@ def test_document_validation_processor_accepts_valid_receipt_with_stamp(
     assert result.model_dump() == VALIDATION_RESULT
 
 
-def test_document_validation_processor_rejects_receipt_without_stamp_or_signature(
+def test_document_validation_processor_allows_receipt_without_stamp_or_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    receipt_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": False,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": [],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(receipt_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.review_required is False
+    assert result.review_reasons == []
+    assert result.model_dump() == {
+        "packet_patient_name": None,
+        "patient_name_match_status": "not_checked",
+        "patient_name_match_reason": None,
+        "review_required": False,
+        "review_reasons": [],
+        **receipt_result,
+    }
+
+
+def test_document_validation_processor_rejects_standalone_prescription_without_stamp_or_signature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     validation_processor = DocumentValidationProcessor(settings=build_settings())
@@ -1298,7 +2504,7 @@ def test_document_validation_processor_rejects_receipt_without_stamp_or_signatur
                 "documents": [
                     {
                         "document_index": 0,
-                        "document_type": "receipt",
+                        "document_type": "prescription",
                         "is_medical_document": True,
                         "readability_ok": True,
                         "facility_identity_visible": True,
@@ -1335,7 +2541,7 @@ def test_document_validation_processor_rejects_receipt_without_stamp_or_signatur
                     )
                 ]
             )
-    )
+        )
 
     assert exc_info.value.status_code == 422
     detail = get_http_exception_detail_dict(exc_info.value)
@@ -1394,7 +2600,14 @@ def test_document_validation_processor_allows_lab_result_without_stamp(
         )
     )
 
-    assert result.model_dump() == lab_result
+    assert result.model_dump() == {
+        "packet_patient_name": None,
+        "patient_name_match_status": "not_checked",
+        "patient_name_match_reason": None,
+        "review_required": False,
+        "review_reasons": [],
+        **lab_result,
+    }
 
 
 def test_document_validation_processor_allows_rotation_only_issue_for_otherwise_legible_document(
@@ -1448,7 +2661,14 @@ def test_document_validation_processor_allows_rotation_only_issue_for_otherwise_
         )
     )
 
-    assert result.model_dump() == rotated_result
+    assert result.model_dump() == {
+        "packet_patient_name": None,
+        "patient_name_match_status": "not_checked",
+        "patient_name_match_reason": None,
+        "review_required": False,
+        "review_reasons": [],
+        **rotated_result,
+    }
 
 
 def test_document_validation_processor_still_rejects_rotated_and_blurry_document(
@@ -1575,3 +2795,309 @@ def test_document_validation_processor_rejects_non_medical_and_uncertain_documen
     detail = get_http_exception_detail_dict(exc_info.value)
     assert detail["message"] == "Document validation failed."
     assert "non-medical document" in detail["errors"][0]["message"]
+
+
+def test_document_validation_processor_soft_reviews_collage_with_missing_signature_on_strict_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    collage_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 2,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": False,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Facility identity is visible."],
+                    },
+                    {
+                        "document_index": 1,
+                        "document_type": "prescription",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": False,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Stamp/signature is hard to verify because multiple papers are present in one image."],
+                    },
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(collage_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.review_required is True
+    assert result.review_reasons == [
+        "Image 1 document 2: a visible facility stamp or doctor signature is required."
+    ]
+
+
+def test_document_validation_processor_soft_reviews_collage_separation_ambiguity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    collage_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 2,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": False,
+                        "signature_detected": False,
+                        "decision": "uncertain",
+                        "reasons": ["Multiple papers are present but cannot be separated clearly."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(collage_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.review_required is True
+    assert result.review_reasons == [
+        "Image 1: multiple documents were present but could not be validated clearly.",
+        "Image 1 document 1: Multiple papers are present but cannot be separated clearly.",
+    ]
+
+
+def test_document_validation_processor_marks_family_patient_name_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    validation_result = {
+        "packet_patient_name": "Andi Saputra",
+        "patient_name_match_status": "matched",
+        "patient_name_match_reason": None,
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Visible facility stamp detected."],
+                    }
+                ],
+            }
+        ],
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(validation_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ],
+            patient_name_candidates=["Siti Aminah", "Budi Saputra"],
+        )
+    )
+
+    assert result.packet_patient_name == "Andi Saputra"
+    assert result.patient_name_match_status == "mismatched"
+    assert result.patient_name_match_reason == "Document patient name 'Andi Saputra' does not match the user or any saved family member."
+
+
+def test_document_validation_processor_marks_expected_patient_name_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    validation_result = {
+        "packet_patient_name": "Andi Saputra",
+        "patient_name_match_status": "matched",
+        "patient_name_match_reason": None,
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Visible facility stamp detected."],
+                    }
+                ],
+            }
+        ],
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(validation_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ],
+            expected_patient_name="Budi Santoso",
+        )
+    )
+
+    assert result.patient_name_match_status == "mismatched"
+    assert result.patient_name_match_reason == "Document patient name 'Andi Saputra' does not match the selected patient."
+
+
+def test_document_validation_processor_marks_missing_patient_name_as_review_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    validation_result = {
+        "packet_patient_name": None,
+        "patient_name_match_status": "not_found",
+        "patient_name_match_reason": None,
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": True,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Visible facility stamp detected."],
+                    }
+                ],
+            }
+        ],
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(validation_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ],
+            patient_name_candidates=["Siti Aminah"],
+        )
+    )
+
+    assert result.patient_name_match_status == "not_found"
+    assert result.patient_name_match_reason == "Patient name is not visible clearly enough in the uploaded documents."
+    assert result.review_required is True
+    assert "Patient name is not visible clearly enough in the uploaded documents." in result.review_reasons

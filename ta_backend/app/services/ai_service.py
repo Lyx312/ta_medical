@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
-from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
+from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse, ValidationPatientNameMatchStatus
 from app.services.ai_ensemble import (
     AI_EXTRACTION_MAX_PRODUCERS,
     AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
@@ -37,9 +37,9 @@ from app.services.ai_provider_catalog import (
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
 VALIDATION_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_validation.yaml"
 FIELD_JUDGE_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_field_judge.yaml"
-STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"receipt", "medical_form", "doctor_note", "prescription"}
-STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"lab_result", "radiology_result"}
-SUPPORTED_MEDICAL_DOCUMENT_TYPES = STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
+STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"medical_form", "doctor_note", "prescription"}
+STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"receipt", "lab_result", "radiology_result"}
+SUPPORTED_MEDICAL_DOCUMENT_TYPES = STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
 MIN_FUZZY_NAME_LENGTH = 4
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
 ORIENTATION_REASON_KEYWORDS = (
@@ -146,6 +146,61 @@ def matches_any_patient_name_candidate(extracted_name: str | None, candidates: l
     return any(
         is_single_typo_match(normalized_extracted_name, normalized_candidate)
         for normalized_candidate in normalized_candidates
+    )
+
+
+def build_validation_packet_hints(
+    validation_result: DocumentValidationResponse | None,
+) -> dict[str, Any]:
+    if validation_result is None:
+        return {}
+
+    ordered_documents: list[dict[str, Any]] = []
+    document_type_counts: dict[str, int] = {}
+    image_document_counts: list[dict[str, Any]] = []
+
+    for image_result in sorted(validation_result.images, key=lambda item: item.image_index):
+        image_document_counts.append(
+            {
+                "image_index": image_result.image_index,
+                "filename": image_result.filename,
+                "document_count_detected": image_result.document_count_detected,
+                "validated_document_count": len(image_result.documents),
+            }
+        )
+        for document in sorted(image_result.documents, key=lambda item: item.document_index):
+            if not document.is_medical_document or document.document_type in {"non_medical", "unknown"}:
+                continue
+            ordered_documents.append(
+                {
+                    "image_index": image_result.image_index,
+                    "document_index": document.document_index,
+                    "document_type": document.document_type,
+                    "decision": document.decision,
+                }
+            )
+            document_type_counts[document.document_type] = document_type_counts.get(document.document_type, 0) + 1
+
+    return {
+        "ordered_documents": ordered_documents,
+        "document_type_counts": document_type_counts,
+        "image_document_counts": image_document_counts,
+        "total_detected_documents": sum(max(item.document_count_detected, len(item.documents)) for item in validation_result.images),
+    }
+
+
+def build_patient_name_verification_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "message": "Patient name verification failed.",
+            "errors": [
+                {
+                    "field": "non_field",
+                    "message": message,
+                }
+            ],
+        },
     )
 
 
@@ -375,6 +430,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         self,
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, Any] | None = None,
     ) -> MedicalExtractionOutcome:
         if not images:
             raise HTTPException(
@@ -394,6 +450,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                     run_index=run_index,
                     images=images,
                     patient_name_candidates=patient_name_candidates or [],
+                    validation_hints=validation_hints or {},
                     prompt_bundle=prompt_bundle,
                 )
                 for producer_rank, model_spec in enumerate(model_specs)
@@ -432,6 +489,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             successful_traces=successful_traces,
             all_traces=list(traces),
             images=images,
+            validation_hints=validation_hints or {},
             execution_mode=execution_mode,
             primary_model_provider=model_specs[0].provider if model_specs else None,
             primary_model_name=model_specs[0].model if model_specs else None,
@@ -445,6 +503,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         run_index: int,
         images: list[DocumentImageInput],
         patient_name_candidates: list[str],
+        validation_hints: dict[str, Any],
         prompt_bundle: PromptBundle,
     ) -> ProducerInferenceTrace:
         producer_id = f"{model_spec.provider}:{model_spec.model}"
@@ -453,6 +512,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 model_spec=model_spec,
                 images=images,
                 patient_name_candidates=patient_name_candidates,
+                validation_hints=validation_hints,
                 prompt_bundle=prompt_bundle,
             )
             return ProducerInferenceTrace(
@@ -482,6 +542,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         model_spec: AIModelSpec,
         images: list[DocumentImageInput],
         patient_name_candidates: list[str],
+        validation_hints: dict[str, Any],
         prompt_bundle: PromptBundle,
     ) -> AIMedicalScanResponse:
         model = self._create_chat_model(model_spec)
@@ -489,6 +550,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             self._build_messages(
                 images=images,
                 patient_name_candidates=patient_name_candidates,
+                validation_hints=validation_hints,
                 prompt_bundle=prompt_bundle,
             )
         )
@@ -509,11 +571,13 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         images: list[DocumentImageInput],
         patient_name_candidates: list[str],
         prompt_bundle: PromptBundle,
+        validation_hints: dict[str, Any] | None = None,
     ) -> list[Any]:
         template_input = {
             "image_count": len(images),
             "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
             "patient_name_candidates_json": json.dumps(patient_name_candidates, ensure_ascii=False),
+            "validation_packet_hints_json": json.dumps(validation_hints or {}, ensure_ascii=False, indent=2),
         }
 
         system_prompt = PromptTemplate.from_template(
@@ -586,7 +650,12 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
     ) -> None:
         super().__init__(settings=settings, prompt_file_path=prompt_file_path or VALIDATION_PROMPT_FILE_PATH)
 
-    async def process(self, images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def process(
+        self,
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        expected_patient_name: str | None = None,
+    ) -> DocumentValidationResponse:
         if not images:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -603,11 +672,17 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     model_spec=model_spec,
                     images=images,
                     prompt_bundle=prompt_bundle,
+                    patient_name_candidates=patient_name_candidates or [],
+                    expected_patient_name=expected_patient_name,
                 )
             )
 
         validation_result = self.combine_inference_results(inference_results)
-        self._enforce_validation_rules(validation_result)
+        self._enforce_validation_rules(
+            validation_result,
+            patient_name_candidates=patient_name_candidates or [],
+            expected_patient_name=expected_patient_name,
+        )
         return validation_result
 
     def combine_inference_results(
@@ -626,9 +701,16 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
         model_spec: AIModelSpec,
         images: list[DocumentImageInput],
         prompt_bundle: PromptBundle,
+        patient_name_candidates: list[str],
+        expected_patient_name: str | None,
     ) -> DocumentValidationResponse:
         model = self._create_chat_model(model_spec)
-        messages = self._build_messages(images=images, prompt_bundle=prompt_bundle)
+        messages = self._build_messages(
+            images=images,
+            prompt_bundle=prompt_bundle,
+            patient_name_candidates=patient_name_candidates,
+            expected_patient_name=expected_patient_name,
+        )
         response = await model.ainvoke(messages)
         payload = self._parse_ai_response_to_json(response.content)
 
@@ -644,10 +726,14 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
         self,
         images: list[DocumentImageInput],
         prompt_bundle: PromptBundle,
+        patient_name_candidates: list[str],
+        expected_patient_name: str | None,
     ) -> list[Any]:
         template_input = {
             "image_count": len(images),
             "filenames_json": json.dumps([image.filename for image in images], ensure_ascii=False),
+            "patient_name_candidates_json": json.dumps(patient_name_candidates, ensure_ascii=False),
+            "expected_patient_name_json": json.dumps(expected_patient_name, ensure_ascii=False),
             "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
         }
 
@@ -663,22 +749,32 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
             HumanMessage(content=self._build_image_messages(user_prompt, images)),
         ]
 
-    def _enforce_validation_rules(self, result: DocumentValidationResponse) -> None:
+    def _enforce_validation_rules(
+        self,
+        result: DocumentValidationResponse,
+        *,
+        patient_name_candidates: list[str],
+        expected_patient_name: str | None,
+    ) -> None:
         failures: list[str] = []
+        review_reasons: list[str] = []
 
         if not result.images:
             failures.append("No document images could be validated.")
 
         for image_result in result.images:
             image_label = f"Image {image_result.image_index + 1}"
+            is_multi_document_image = image_result.document_count_detected > 1
 
             if image_result.document_count_detected <= 0:
                 failures.append(f"{image_label}: no medical document could be detected.")
 
             if image_result.document_count_detected != len(image_result.documents):
-                failures.append(
-                    f"{image_label}: multiple documents were present but could not be validated clearly."
-                )
+                message = f"{image_label}: multiple documents were present but could not be validated clearly."
+                if is_multi_document_image:
+                    review_reasons.append(message)
+                else:
+                    failures.append(message)
 
             if not image_result.documents:
                 failures.append(f"{image_label}: no documents could be validated.")
@@ -687,9 +783,19 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
             for document in image_result.documents:
                 document_label = f"{image_label} document {document.document_index + 1}"
                 has_orientation_only_issue = self._is_non_blocking_orientation_issue(document.reasons)
+                has_collage_ambiguity_issue = is_multi_document_image and self._is_collage_ambiguity_issue(document.reasons)
 
                 if document.decision != "valid":
                     if has_orientation_only_issue:
+                        continue
+                    if has_collage_ambiguity_issue:
+                        review_reasons.append(
+                            self._build_document_failure(
+                                document_label=document_label,
+                                reasons=document.reasons,
+                                fallback_message="multiple papers are present and should be uploaded separately for clearer validation.",
+                            )
+                        )
                         continue
                     failures.append(
                         self._build_document_failure(
@@ -715,10 +821,14 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     failures.append(f"{document_label}: the medical facility identity is not clearly visible.")
 
                 if (
-                    document.document_type in STAMP_OR_SIGNATURE_REQUIRED_TYPES
+                    document.document_type in STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES
                     and not (document.stamp_detected or document.signature_detected)
                 ):
-                    failures.append(f"{document_label}: a visible facility stamp or doctor signature is required.")
+                    message = f"{document_label}: a visible facility stamp or doctor signature is required."
+                    if is_multi_document_image:
+                        review_reasons.append(message)
+                    else:
+                        failures.append(message)
 
         if failures:
             deduped_failures = list(dict.fromkeys(failures))
@@ -734,6 +844,23 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     ],
                 },
             )
+
+        (
+            result.patient_name_match_status,
+            result.patient_name_match_reason,
+            patient_name_review_reason,
+        ) = self._resolve_patient_name_match(
+            packet_patient_name=result.packet_patient_name,
+            model_status=result.patient_name_match_status,
+            model_reason=result.patient_name_match_reason,
+            patient_name_candidates=patient_name_candidates,
+            expected_patient_name=expected_patient_name,
+        )
+        if patient_name_review_reason:
+            review_reasons.append(patient_name_review_reason)
+
+        result.review_reasons = list(dict.fromkeys(review_reasons))
+        result.review_required = bool(result.review_reasons)
 
     def _build_document_failure(
         self,
@@ -765,3 +892,79 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                 return False
 
         return True
+
+    def _is_collage_ambiguity_issue(self, reasons: list[str]) -> bool:
+        normalized_reasons = [reason.strip().casefold() for reason in reasons if reason.strip()]
+        if not normalized_reasons:
+            return False
+
+        collage_keywords = (
+            "multiple papers",
+            "multiple documents",
+            "cannot be separated",
+            "separation is unclear",
+            "separate clearly",
+            "collage",
+        )
+        blocking_keywords = (
+            *NON_ORIENTATION_READABILITY_KEYWORDS,
+            "non-medical",
+            "not medical",
+            "unsupported",
+            "facility identity",
+            "identity is not clearly visible",
+        )
+
+        has_collage_reason = any(
+            any(keyword in reason for keyword in collage_keywords)
+            for reason in normalized_reasons
+        )
+        if not has_collage_reason:
+            return False
+
+        return not any(
+            any(keyword in reason for keyword in blocking_keywords)
+            for reason in normalized_reasons
+        )
+
+    def _resolve_patient_name_match(
+        self,
+        *,
+        packet_patient_name: str | None,
+        model_status: ValidationPatientNameMatchStatus,
+        model_reason: str | None,
+        patient_name_candidates: list[str],
+        expected_patient_name: str | None,
+    ) -> tuple[ValidationPatientNameMatchStatus, str | None, str | None]:
+        normalized_packet_name = packet_patient_name.strip() if isinstance(packet_patient_name, str) else ""
+        normalized_model_reason = model_reason.strip() if isinstance(model_reason, str) and model_reason.strip() else None
+
+        if not expected_patient_name and not patient_name_candidates:
+            return "not_checked", None, None
+
+        if model_status == "uncertain":
+            review_reason = normalized_model_reason or "Patient name could not be verified confidently from the uploaded documents."
+            return "uncertain", review_reason, review_reason
+
+        if not normalized_packet_name:
+            reason = normalized_model_reason or "Patient name is not visible clearly enough in the uploaded documents."
+            return "not_found", reason, reason
+
+        if expected_patient_name:
+            if matches_any_patient_name_candidate(normalized_packet_name, [expected_patient_name]):
+                return "matched", None, None
+
+            return (
+                "mismatched",
+                f"Document patient name '{normalized_packet_name}' does not match the selected patient.",
+                None,
+            )
+
+        if matches_any_patient_name_candidate(normalized_packet_name, patient_name_candidates):
+            return "matched", None, None
+
+        return (
+            "mismatched",
+            f"Document patient name '{normalized_packet_name}' does not match the user or any saved family member.",
+            None,
+        )

@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -79,11 +79,6 @@ class AIMedicalScanResponse(BaseModel):
 
 class AIScanDocumentsResponse(AIMedicalScanResponse):
     scan_log_id: int
-    overall_confidence: float | None = None
-    field_confidence: dict[str, Any] = Field(default_factory=dict)
-    review_required: bool = False
-    review_reasons: list[str] = Field(default_factory=list)
-    calibration_version: str | None = None
 
 
 ValidationDocumentType = Literal[
@@ -97,6 +92,7 @@ ValidationDocumentType = Literal[
     "unknown",
 ]
 ValidationDecision = Literal["valid", "invalid", "uncertain"]
+ValidationPatientNameMatchStatus = Literal["matched", "mismatched", "not_found", "uncertain", "not_checked"]
 
 
 class DocumentValidationItem(BaseModel):
@@ -126,3 +122,8 @@ class DocumentValidationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     images: list[ImageValidationResult]
+    packet_patient_name: str | None = None
+    patient_name_match_status: ValidationPatientNameMatchStatus = "not_checked"
+    patient_name_match_reason: str | None = None
+    review_required: bool = False
+    review_reasons: list[str] = Field(default_factory=list)

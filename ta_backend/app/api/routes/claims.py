@@ -15,6 +15,8 @@ from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.auth import TokenData
 from app.schemas.claim import ClaimResponse, parse_claim_date
 from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
+from app.services.ai_service import build_patient_name_verification_error
+from app.services.ai_service import matches_any_patient_name_candidate
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/claims", tags=["claims"])
@@ -105,6 +107,29 @@ def can_reuse_scan_log_validation(scan_log: Any, uploads: list[BufferedUpload]) 
     )
 
 
+def get_validation_payload_patient_name(validation_payload: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    if not isinstance(validation_payload, dict):
+        return None, None
+
+    packet_patient_name = validation_payload.get("packet_patient_name")
+    patient_name_match_status = validation_payload.get("patient_name_match_status")
+    return (
+        packet_patient_name.strip() if isinstance(packet_patient_name, str) and packet_patient_name.strip() else None,
+        patient_name_match_status if isinstance(patient_name_match_status, str) else None,
+    )
+
+
+def has_usable_validation_patient_name(validation_payload: dict[str, Any] | None) -> bool:
+    packet_patient_name, patient_name_match_status = get_validation_payload_patient_name(validation_payload)
+    return packet_patient_name is not None and patient_name_match_status in {"matched", "mismatched"}
+
+
+def build_selected_patient_name_error() -> HTTPException:
+    return build_patient_name_verification_error(
+        "Uploaded documents do not match the selected patient. Please choose the correct patient or upload the correct documents."
+    )
+
+
 @router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
 async def create_claim(
     token_data: TokenData = Depends(get_current_user_dependency),
@@ -136,14 +161,26 @@ async def create_claim(
 
     buffered_uploads = await read_uploaded_files(files)
     source_scan_log: Any | None = None
+    should_run_validation = source_scan_log_id is None
+    should_reuse_existing_validation = source_scan_log_id is not None
 
     if source_scan_log_id is not None:
         scan_log_repository = ScanLogRepository(db)
         source_scan_log = scan_log_repository.get_by_id_and_user_id(source_scan_log_id, token_data.user_id)
         if source_scan_log is None or not scan_log_matches_uploaded_files(source_scan_log, buffered_uploads):
             raise build_invalid_scan_log_link_error()
+        if not can_reuse_scan_log_validation(source_scan_log, buffered_uploads):
+            should_run_validation = True
+            should_reuse_existing_validation = False
+        elif has_usable_validation_patient_name(source_scan_log.validation_payload):
+            packet_patient_name, _ = get_validation_payload_patient_name(source_scan_log.validation_payload)
+            if not matches_any_patient_name_candidate(packet_patient_name, [nama_pasien]):
+                raise build_selected_patient_name_error()
+        else:
+            should_run_validation = True
+            should_reuse_existing_validation = False
 
-    if source_scan_log is None or not can_reuse_scan_log_validation(source_scan_log, buffered_uploads):
+    if should_run_validation:
         validation_images: list[DocumentImageInput] = []
         for upload in buffered_uploads:
             processed_image = preprocess_document_image(
@@ -158,7 +195,17 @@ async def create_claim(
                 )
             )
 
-        await validation_processor.process(validation_images)
+        validation_result = await validation_processor.process(
+            validation_images,
+            expected_patient_name=nama_pasien,
+        )
+        if validation_result.patient_name_match_status == "mismatched":
+            raise build_selected_patient_name_error()
+
+    if source_scan_log is not None and should_reuse_existing_validation:
+        packet_patient_name, _ = get_validation_payload_patient_name(source_scan_log.validation_payload)
+        if packet_patient_name is not None and not matches_any_patient_name_candidate(packet_patient_name, [nama_pasien]):
+            raise build_selected_patient_name_error()
 
     claim_repository = ClaimRepository(db)
     claim = claim_repository.create(

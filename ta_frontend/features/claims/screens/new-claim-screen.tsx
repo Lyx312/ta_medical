@@ -377,6 +377,9 @@ export function NewClaimScreen() {
                 <ThemedText style={textStyles.sectionDescription}>
                   Upload or take photos of your medical documents
                 </ThemedText>
+                <ThemedText style={textStyles.uploadHint}>
+                  For the best scan result, upload one clear photo per document instead of a collage.
+                </ThemedText>
 
                 <View style={viewStyles.imageActions}>
                   <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={pickImages}>
@@ -731,6 +734,10 @@ const textStyles = StyleSheet.create({
   },
   sectionTitle: {
     ...Typography.sectionTitle,
+  },
+  uploadHint: {
+    fontSize: 13,
+    opacity: Opacity.muted,
   },
 });
 

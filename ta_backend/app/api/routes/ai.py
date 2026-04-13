@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -17,6 +17,8 @@ from app.schemas.ai import AIMedicalScanResponse, AIScanDocumentsResponse
 from app.schemas.auth import TokenData
 from app.services.ai_ensemble import MedicalExtractionOutcome, ProducerInferenceTrace
 from app.services.ai_service import (
+    build_validation_packet_hints,
+    build_patient_name_verification_error,
     DocumentImageInput,
     DocumentValidationProcessor,
     MedicalDocumentProcessor,
@@ -118,6 +120,27 @@ def normalize_extraction_outcome(
             "overall_confidence": None,
         },
     )
+
+
+def merge_review_reasons(*reason_groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    for reasons in reason_groups:
+        for reason in reasons:
+            normalized_reason = reason.strip()
+            if normalized_reason and normalized_reason not in merged:
+                merged.append(normalized_reason)
+    return merged
+
+
+def should_run_extraction_name_fallback(validation_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(validation_payload, dict):
+        return True
+
+    status_value = validation_payload.get("patient_name_match_status")
+    if not isinstance(status_value, str):
+        return True
+
+    return status_value in {"not_found", "uncertain", "not_checked"}
 
 
 def resolve_scan_failure_status(
@@ -236,21 +259,62 @@ async def scan_documents(
                 )
             )
 
-        validation_result = await validation_processor.process(images)
-        validation_payload = validation_result.model_dump()
-
         patient_name_candidates = build_patient_name_candidates(
             user_full_name=user.full_name,
             family_member_names=[family_member.name for family_member in family_members],
         )
+        validation_result = await validation_processor.process(
+            images,
+            patient_name_candidates=patient_name_candidates,
+        )
+        validation_payload = validation_result.model_dump()
+        validation_hints = build_validation_packet_hints(validation_result)
+        if validation_result.patient_name_match_status == "mismatched":
+            patient_name_error = build_patient_name_verification_error(
+                "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document."
+            )
+            scan_log = scan_log_repository.mark_failed(
+                scan_log,
+                status="patient_name_mismatch",
+                error_payload=build_scan_log_error_payload(patient_name_error),
+                validation_payload=validation_payload,
+                extraction_payload=extraction_payload,
+                ai_execution_mode=ai_execution_mode,
+                ai_runs=traces_to_ai_run_creates(ai_runs),
+                extraction_meta_payload=extraction_meta_payload,
+                primary_model_provider=primary_model_provider,
+                primary_model_name=primary_model_name,
+            )
+            raise patient_name_error
+
         fallback_model_spec = processor.get_primary_enabled_model_spec()
         primary_model_provider = fallback_model_spec.provider
         primary_model_name = fallback_model_spec.model
-        raw_extraction_result = await processor.process(images, patient_name_candidates=patient_name_candidates)
+        raw_extraction_result = await processor.process(
+            images,
+            patient_name_candidates=patient_name_candidates,
+            validation_hints=validation_hints,
+        )
         extraction_result = normalize_extraction_outcome(
             raw_extraction_result,
             fallback_provider=primary_model_provider,
             fallback_model=primary_model_name,
+        )
+        merged_review_reasons = merge_review_reasons(
+            validation_result.review_reasons,
+            extraction_result.review_reasons,
+        )
+        extraction_result = replace(
+            extraction_result,
+            review_required=bool(merged_review_reasons),
+            review_reasons=merged_review_reasons,
+            extraction_meta_payload={
+                **extraction_result.extraction_meta_payload,
+                "review_required": bool(merged_review_reasons),
+                "review_reasons": merged_review_reasons,
+                "validation_review_required": validation_result.review_required,
+                "validation_review_reasons": validation_result.review_reasons,
+            },
         )
         extraction_payload = cast(dict[str, Any], sanitize_json_compatible(extraction_result.result.model_dump()))
         extraction_result_payload = AIMedicalScanResponse.model_validate(extraction_payload)
@@ -261,21 +325,13 @@ async def scan_documents(
         ai_execution_mode = extraction_result.ai_execution_mode
 
         extracted_patient_name = extraction_result.result.patient_info.name
-        if isinstance(extracted_patient_name, str) and not matches_any_patient_name_candidate(
-            extracted_patient_name,
-            patient_name_candidates,
+        if (
+            should_run_extraction_name_fallback(validation_payload)
+            and isinstance(extracted_patient_name, str)
+            and not matches_any_patient_name_candidate(extracted_patient_name, patient_name_candidates)
         ):
-            patient_name_error = HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={
-                    "message": "Patient name verification failed.",
-                    "errors": [
-                        {
-                            "field": "non_field",
-                            "message": "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document.",
-                        }
-                    ],
-                },
+            patient_name_error = build_patient_name_verification_error(
+                "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document."
             )
             scan_log = scan_log_repository.mark_failed(
                 scan_log,
@@ -303,11 +359,6 @@ async def scan_documents(
         )
         return AIScanDocumentsResponse(
             scan_log_id=scan_log.id,
-            overall_confidence=extraction_result.overall_confidence,
-            field_confidence=extraction_result.field_confidence,
-            review_required=extraction_result.review_required,
-            review_reasons=extraction_result.review_reasons,
-            calibration_version=extraction_result.calibration_version,
             **extraction_result_payload.model_dump(),
         )
     except HTTPException as exc:

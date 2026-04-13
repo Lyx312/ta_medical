@@ -71,11 +71,6 @@ export type AIOtherCharge = {
 
 export type AIMedicalScanResult = {
   scan_log_id: number;
-  overall_confidence: number | null;
-  field_confidence: Record<string, unknown>;
-  review_required: boolean;
-  review_reasons: string[];
-  calibration_version: string | null;
   summary: {
     detected_documents: string[];
     medical_facility_name: string;

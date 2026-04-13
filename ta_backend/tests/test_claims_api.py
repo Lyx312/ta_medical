@@ -87,6 +87,11 @@ def register_and_login(client: TestClient, email: str, *, full_name: str = "Clai
 def build_valid_validation_response(filename: str) -> DocumentValidationResponse:
     return DocumentValidationResponse.model_validate(
         {
+            "packet_patient_name": "Claim User",
+            "patient_name_match_status": "matched",
+            "patient_name_match_reason": None,
+            "review_required": False,
+            "review_reasons": [],
             "images": [
                 {
                     "image_index": 0,
@@ -132,7 +137,7 @@ def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         assert images[0].filename == "receipt.jpg"
         return build_valid_validation_response(images[0].filename)
@@ -224,7 +229,7 @@ def test_create_claim_rejects_document_validation_failure(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         raise HTTPException(
             status_code=422,
@@ -266,6 +271,78 @@ def test_create_claim_rejects_document_validation_failure(
     assert get_all_claims() == []
 
 
+def test_create_claim_accepts_soft_review_validation_result(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-soft-review@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return DocumentValidationResponse.model_validate(
+            {
+                "packet_patient_name": None,
+                "patient_name_match_status": "not_found",
+                "patient_name_match_reason": "Patient name is not visible clearly enough in the uploaded documents.",
+                "review_required": True,
+                "review_reasons": [
+                    "Image 1: multiple documents were present but could not be validated clearly.",
+                ],
+                "images": [
+                    {
+                        "image_index": 0,
+                        "filename": images[0].filename,
+                        "document_count_detected": 2,
+                        "documents": [
+                            {
+                                "document_index": 0,
+                                "document_type": "receipt",
+                                "is_medical_document": True,
+                                "readability_ok": True,
+                                "facility_identity_visible": True,
+                                "stamp_detected": False,
+                                "signature_detected": False,
+                                "decision": "valid",
+                                "reasons": ["Facility identity is visible."],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert response.status_code == 201
+    claims = get_all_claims()
+    assert len(claims) == 1
+
+
 def test_create_claim_links_matching_scan_log(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,13 +358,319 @@ def test_create_claim_links_matching_scan_log(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         assert len(images) == 1
         return build_valid_validation_response(images[0].filename)
 
     async def fake_scan_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        **_: object,
+    ) -> AIMedicalScanResponse:
+        assert patient_name_candidates == ["Claim User"]
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(ai_processor, "process", fake_scan_process)
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    scan_response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert scan_response.status_code == 200
+    scan_log_id = scan_response.json()["scan_log_id"]
+
+    claim_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "source_scan_log_id": str(scan_log_id),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert claim_response.status_code == 201
+    claims = get_all_claims()
+    assert len(claims) == 1
+    assert claims[0].source_scan_log_id == scan_log_id
+
+
+def test_create_claim_reuses_successful_scan_validation_without_revalidating(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-reuse-validation@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return build_valid_validation_response(images[0].filename)
+
+    async def fake_scan_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        **_: object,
+    ) -> AIMedicalScanResponse:
+        assert patient_name_candidates == ["Claim User"]
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    async def fail_if_claim_revalidates(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        raise AssertionError("Claim submission should reuse prior validation and skip revalidation.")
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(ai_processor, "process", fake_scan_process)
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fail_if_claim_revalidates)
+
+    scan_response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert scan_response.status_code == 200
+    scan_log_id = scan_response.json()["scan_log_id"]
+
+    claim_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "source_scan_log_id": str(scan_log_id),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert claim_response.status_code == 201
+    claims = get_all_claims()
+    assert len(claims) == 1
+    assert claims[0].source_scan_log_id == scan_log_id
+
+
+def test_create_claim_rejects_documents_that_do_not_match_selected_patient(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-selected-mismatch@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], expected_patient_name: str | None = None, **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        assert expected_patient_name == "Budi Santoso"
+        return DocumentValidationResponse.model_validate(
+            {
+                "packet_patient_name": "Claim User",
+                "patient_name_match_status": "mismatched",
+                "patient_name_match_reason": "Document patient name 'Claim User' does not match the selected patient.",
+                "review_required": False,
+                "review_reasons": [],
+                "images": [
+                    {
+                        "image_index": 0,
+                        "filename": images[0].filename,
+                        "document_count_detected": 1,
+                        "documents": [
+                            {
+                                "document_index": 0,
+                                "document_type": "receipt",
+                                "is_medical_document": True,
+                                "readability_ok": True,
+                                "facility_identity_visible": True,
+                                "stamp_detected": True,
+                                "signature_detected": False,
+                                "decision": "valid",
+                                "reasons": ["Visible facility stamp detected."],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert response.status_code == 422
+    assert response.json()["message"] == "Patient name verification failed."
+    assert response.json()["errors"] == [
+        {
+            "field": "non_field",
+            "message": "Uploaded documents do not match the selected patient. Please choose the correct patient or upload the correct documents.",
+        }
+    ]
+
+
+def test_create_claim_reruns_validation_for_legacy_scan_log_without_patient_name_evidence(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-legacy-scan@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_scan_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return DocumentValidationResponse.model_validate(
+            {
+                "packet_patient_name": None,
+                "patient_name_match_status": "not_checked",
+                "patient_name_match_reason": None,
+                "review_required": False,
+                "review_reasons": [],
+                "images": [
+                    {
+                        "image_index": 0,
+                        "filename": images[0].filename,
+                        "document_count_detected": 1,
+                        "documents": [
+                            {
+                                "document_index": 0,
+                                "document_type": "receipt",
+                                "is_medical_document": True,
+                                "readability_ok": True,
+                                "facility_identity_visible": True,
+                                "stamp_detected": True,
+                                "signature_detected": False,
+                                "decision": "valid",
+                                "reasons": ["Visible facility stamp detected."],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    async def fake_claim_validation_process(
+        images: list[DocumentImageInput],
+        expected_patient_name: str | None = None,
+        **_: object,
+    ) -> DocumentValidationResponse:
+        assert len(images) == 1
+        assert expected_patient_name == "Claim User"
+        return build_valid_validation_response(images[0].filename)
+
+    async def fake_scan_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        **_: object,
+    ) -> AIMedicalScanResponse:
+        assert patient_name_candidates == ["Claim User"]
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_scan_validation_process)
+    monkeypatch.setattr(ai_processor, "process", fake_scan_process)
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_claim_validation_process)
+
+    scan_response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert scan_response.status_code == 200
+    scan_log_id = scan_response.json()["scan_log_id"]
+
+    claim_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "source_scan_log_id": str(scan_log_id),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert claim_response.status_code == 201
+
+
+def test_create_claim_rejects_linked_scan_log_when_selected_patient_conflicts_with_stored_scan_name(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-linked-name-mismatch@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return build_valid_validation_response(images[0].filename)
+
+    async def fake_scan_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        **_: object,
     ) -> AIMedicalScanResponse:
         assert patient_name_candidates == ["Claim User"]
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
@@ -323,76 +706,14 @@ def test_create_claim_links_matching_scan_log(
         files=[("files", ("receipt.png", b"fake-image", "image/png"))],
     )
 
-    assert claim_response.status_code == 201
-    claims = get_all_claims()
-    assert len(claims) == 1
-    assert claims[0].source_scan_log_id == scan_log_id
-
-
-def test_create_claim_reuses_successful_scan_validation_without_revalidating(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    token = register_and_login(client, "claims-reuse-validation@example.com")
-
-    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
-        assert filename == "receipt.png"
-        assert content == b"fake-image"
-        return ProcessedDocumentImage(
-            filename="receipt.jpg",
-            mime_type="image/jpeg",
-            content=b"processed-image",
-        )
-
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
-        assert len(images) == 1
-        return build_valid_validation_response(images[0].filename)
-
-    async def fake_scan_process(
-        images: list[DocumentImageInput],
-        patient_name_candidates: list[str] | None = None,
-    ) -> AIMedicalScanResponse:
-        assert patient_name_candidates == ["Claim User"]
-        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
-
-    async def fail_if_claim_revalidates(images: list[DocumentImageInput]) -> DocumentValidationResponse:
-        raise AssertionError("Claim submission should reuse prior validation and skip revalidation.")
-
-    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
-    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
-    monkeypatch.setattr(ai_processor, "process", fake_scan_process)
-    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
-    monkeypatch.setattr(claims_route.validation_processor, "process", fail_if_claim_revalidates)
-
-    scan_response = client.post(
-        "/api/ai/scan-documents",
-        headers={"Authorization": f"Bearer {token}"},
-        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
-    )
-
-    assert scan_response.status_code == 200
-    scan_log_id = scan_response.json()["scan_log_id"]
-
-    claim_response = client.post(
-        "/api/claims",
-        headers={"Authorization": f"Bearer {token}"},
-        data={
-            "nama_pasien": "Budi Santoso",
-            "tanggal_pelayanan": "31-03-2026",
-            "fasilitas_kesehatan": "RS Sehat Selalu",
-            "jenis_manfaat": "rawat_jalan",
-            "nominal_klaim": "150000",
-            "keterangan_penyakit": "Demam",
-            "kronologi": "Pemeriksaan rawat jalan",
-            "source_scan_log_id": str(scan_log_id),
-        },
-        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
-    )
-
-    assert claim_response.status_code == 201
-    claims = get_all_claims()
-    assert len(claims) == 1
-    assert claims[0].source_scan_log_id == scan_log_id
+    assert claim_response.status_code == 422
+    assert claim_response.json()["message"] == "Patient name verification failed."
+    assert claim_response.json()["errors"] == [
+        {
+            "field": "non_field",
+            "message": "Uploaded documents do not match the selected patient. Please choose the correct patient or upload the correct documents.",
+        }
+    ]
 
 
 def test_create_claim_rejects_mismatched_scan_log(
@@ -408,12 +729,13 @@ def test_create_claim_rejects_mismatched_scan_log(
             content=b"processed-image",
         )
 
-    async def fake_validation_process(images: list[DocumentImageInput]) -> DocumentValidationResponse:
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
         return build_valid_validation_response(images[0].filename)
 
     async def fake_scan_process(
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
+        **_: object,
     ) -> AIMedicalScanResponse:
         return AIMedicalScanResponse.model_validate(SCAN_RESULT)
 

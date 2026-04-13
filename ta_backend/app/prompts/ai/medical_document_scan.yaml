@@ -8,15 +8,29 @@ system_template: |
 user_template: |
   Analyze the {image_count} uploaded medical document image(s).
   Treat the full set of images as one claim packet and combine information across pages.
+  Validation-derived packet hints from the same upload are provided here and may help preserve packet inventory, per-image document order, and document types for collage images:
+  {validation_packet_hints_json}
+  Use these validation hints only as support for packet structure and document ordering. Do not invent extracted text or values that are not visible in the uploaded images.
   Extract the service date as the date the patient was examined, consulted, or received treatment from the doctor or medical facility.
   Prioritize the date shown on the medical consultation document, doctor note, medical form, or other primary clinical document over later pharmacy or medicine-purchase dates.
   If multiple dates appear across the packet, do not simply choose the latest receipt date.
   Use the consultation/treatment date for service_date whenever the documents support it.
+  Extract summary.total_amount as the grand total for the full uploaded claim packet, not just one receipt, unless the packet clearly contains only one billed document.
+  Keep summary.transaction_date null unless a distinct payment or billing date is explicitly visible in the documents.
   Known patient name candidates for this user: {patient_name_candidates_json}
   Use the candidate names only as hints to disambiguate patient names found in the documents.
   If the document shows a patient name that clearly matches one candidate, prefer that supported candidate spelling.
   If the document does not clearly support any candidate name, extract the visible name exactly as shown rather than forcing a candidate.
   Do not invent or force a candidate name if the documents do not support it.
+  Only extract patient_info.gender when the document explicitly marks or states it for the patient. Do not infer gender from the patient's name or from an unmarked preprinted option such as "Pria / Wanita".
+  Treat an exclusive preprinted choice as explicit gender evidence when one option is visibly checked, circled, crossed out, or struck through while the counterpart remains intact.
+  For binary form choices such as "Pria / Wanita", if one option is visibly crossed out and the other is not, treat the uncrossed option as the selected patient gender.
+  Normalize patient_info.gender to exactly MALE, FEMALE, or null.
+  Preserve distinct packet documents in summary.detected_documents when the images clearly show separate papers, including pharmacy receipts that may appear beside a prescription or another receipt in the same collage.
+  Prefer the packet document order suggested by the upload and validation hints over pure confidence ranking when the evidence is otherwise comparable.
+  Do not duplicate pharmacy or medicine spending across medicines and other_charges. If the same pharmacy spend appears both as medicine pricing and as a pharmacy receipt, represent it only once in the final packet totals.
+  For handwritten fields such as anamnesis, therapy notes, prescription names, and dosage instructions, keep the best-supported visible text exactly as seen, but do not invent missing words that are not readable.
+  If handwritten free-text is too ambiguous to support one clear reading, use null instead of guessing.
   If a value is missing or unreadable, use null, an empty string, an empty object, or an empty array as appropriate.
   Preserve the existing response structure exactly and keep number fields numeric.
   For every date field (including summary.service_date, summary.transaction_date when present, and patient_info.date_of_birth), use ISO format YYYY-MM-DD (example: 2025-08-28).
@@ -45,6 +59,7 @@ output_contract:
         - string
       medical_facility_name: string | null
       service_date: string | null
+      transaction_date: string | null
       currency: string | null
       total_amount: number | null
     patient_info:

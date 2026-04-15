@@ -11,6 +11,9 @@ export async function createClaim(payload: CreateClaimPayload): Promise<ClaimRes
   formData.append('nominal_klaim', payload.nominal_klaim.toString());
   formData.append('keterangan_penyakit', payload.keterangan_penyakit);
   formData.append('kronologi', payload.kronologi);
+  if (payload.medicines && payload.medicines.length > 0) {
+    formData.append('medicines_payload', JSON.stringify(payload.medicines));
+  }
   if (payload.source_scan_log_id !== undefined) {
     formData.append('source_scan_log_id', payload.source_scan_log_id.toString());
   }

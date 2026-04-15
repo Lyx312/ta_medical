@@ -13,6 +13,26 @@ def parse_claim_date(value: date | str) -> date:
     return datetime.strptime(value, CLAIM_DATE_FORMAT).date()
 
 
+class ClaimMedicineInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    quantity: float | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, max_length=50)
+    dosage_instruction: str | None = Field(default=None, max_length=255)
+    source: Literal["ai_extracted", "user_input"] = "user_input"
+
+
+class ClaimMedicineEvaluation(BaseModel):
+    relevance: Literal["relevant", "uncertain", "not_relevant"]
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1)
+    matched_diagnosis: bool
+    matched_anamnesis: bool
+
+
+class ClaimMedicine(ClaimMedicineInput):
+    evaluation: ClaimMedicineEvaluation | None = None
+
+
 class ClaimCreate(BaseModel):
     nama_pasien: str = Field(min_length=1, max_length=255)
     tanggal_pelayanan: date
@@ -21,6 +41,7 @@ class ClaimCreate(BaseModel):
     nominal_klaim: float = Field(ge=0)
     keterangan_penyakit: str = Field(min_length=1)
     kronologi: str = Field(min_length=1)
+    medicines: list[ClaimMedicineInput] = Field(default_factory=list)
 
     @field_validator("tanggal_pelayanan", mode="before")
     @classmethod
@@ -39,6 +60,9 @@ class ClaimResponse(BaseModel):
     nominal_klaim: float
     keterangan_penyakit: str
     kronologi: str
+    medicines: list[ClaimMedicine] = Field(default_factory=list)
+    requires_additional_review: bool = False
+    review_note: str | None = None
     file_count: int
     status: str
     source_scan_log_id: int | None = None

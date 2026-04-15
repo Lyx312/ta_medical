@@ -69,6 +69,30 @@ export type AIOtherCharge = {
   amount: number;
 };
 
+export type ClaimMedicineSource = 'ai_extracted' | 'user_input';
+
+export type ClaimMedicineInput = {
+  name: string;
+  quantity?: number;
+  unit?: string;
+  dosage_instruction?: string;
+  source: ClaimMedicineSource;
+};
+
+export type ClaimMedicineRelevance = 'relevant' | 'uncertain' | 'not_relevant';
+
+export type ClaimMedicineEvaluation = {
+  relevance: ClaimMedicineRelevance;
+  confidence: number;
+  reason: string;
+  matched_diagnosis: boolean;
+  matched_anamnesis: boolean;
+};
+
+export type ClaimMedicine = ClaimMedicineInput & {
+  evaluation: ClaimMedicineEvaluation | null;
+};
+
 export type AIMedicalScanResult = {
   scan_log_id: number;
   summary: {
@@ -111,6 +135,9 @@ export type ClaimResponse = {
   nominal_klaim: number;
   keterangan_penyakit: string;
   kronologi: string;
+  medicines: ClaimMedicine[];
+  requires_additional_review: boolean;
+  review_note: string | null;
   file_count: number;
   status: string;
   source_scan_log_id: number | null;
@@ -167,6 +194,7 @@ export type CreateClaimPayload = {
   nominal_klaim: number;
   keterangan_penyakit: string;
   kronologi: string;
+  medicines?: ClaimMedicineInput[];
   fileUris: string[];
   source_scan_log_id?: number;
 };

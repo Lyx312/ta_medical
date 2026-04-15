@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Any
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -22,6 +23,10 @@ class Claim(Base):
     nominal_klaim: Mapped[float] = mapped_column(Float, nullable=False)
     keterangan_penyakit: Mapped[str] = mapped_column(String, nullable=False)
     kronologi: Mapped[str] = mapped_column(String, nullable=False)
+    medicines: Mapped[str | None] = mapped_column(String, nullable=True)
+    medicines_payload: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    requires_additional_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    review_note: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
     source_scan_log_id: Mapped[int | None] = mapped_column(
         ForeignKey("scan_logs.id"),

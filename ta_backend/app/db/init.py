@@ -78,6 +78,7 @@ def initialize_database() -> None:
     Base.metadata.create_all(bind=get_engine())
     ensure_ai_model_schema()
     ensure_scan_log_schema()
+    ensure_claim_schema()
     seed_default_admin()
     seed_default_ai_models()
 
@@ -155,6 +156,50 @@ def ensure_scan_log_schema() -> None:
 
     _migrate_scan_logs_to_new_schema(engine)
     _ensure_scan_log_ai_runs_table(engine, inspector)
+
+
+def ensure_claim_schema() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    if "claims" not in tables:
+        return
+
+    column_names = {column["name"] for column in inspector.get_columns("claims")}
+    with engine.begin() as connection:
+        if "medicines" not in column_names:
+            connection.execute(text("ALTER TABLE claims ADD COLUMN medicines TEXT"))
+        if "medicines_payload" not in column_names:
+            connection.execute(text("ALTER TABLE claims ADD COLUMN medicines_payload JSON"))
+        if "requires_additional_review" not in column_names:
+            connection.execute(text("ALTER TABLE claims ADD COLUMN requires_additional_review BOOLEAN NOT NULL DEFAULT FALSE"))
+        if "review_note" not in column_names:
+            connection.execute(text("ALTER TABLE claims ADD COLUMN review_note TEXT"))
+
+        if "requires_manual_review" in column_names:
+            connection.execute(
+                text(
+                    """
+                    UPDATE claims
+                    SET requires_additional_review = TRUE
+                    WHERE COALESCE(requires_additional_review, FALSE) = FALSE
+                      AND COALESCE(requires_manual_review, FALSE) = TRUE
+                    """
+                )
+            )
+        if "manual_review_reason" in column_names:
+            connection.execute(
+                text(
+                    """
+                    UPDATE claims
+                    SET review_note = manual_review_reason
+                    WHERE (review_note IS NULL OR TRIM(review_note) = '')
+                      AND manual_review_reason IS NOT NULL
+                      AND TRIM(manual_review_reason) <> ''
+                    """
+                )
+            )
 
 
 def _ensure_scan_log_ai_runs_table(engine: Any, inspector: Any) -> None:

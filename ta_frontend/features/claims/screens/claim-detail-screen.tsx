@@ -32,6 +32,37 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+function formatMedicineItemValue(claimMedicine: ClaimResponse['medicines'][number]) {
+  const details: string[] = [];
+  if (claimMedicine.quantity !== undefined) {
+    details.push(`Qty ${claimMedicine.quantity}${claimMedicine.unit ? ` ${claimMedicine.unit}` : ''}`);
+  } else if (claimMedicine.unit) {
+    details.push(claimMedicine.unit);
+  }
+  if (claimMedicine.dosage_instruction) {
+    details.push(claimMedicine.dosage_instruction);
+  }
+
+  const evaluation = claimMedicine.evaluation;
+  if (!evaluation) {
+    return [claimMedicine.name, details.join(' | ')].filter((item) => item).join('\n');
+  }
+
+  const relevanceLabel =
+    evaluation.relevance === 'not_relevant'
+      ? 'Not Relevant'
+      : evaluation.relevance === 'uncertain'
+        ? 'Uncertain'
+        : 'Relevant';
+
+  const confidencePct = Math.round(evaluation.confidence * 100);
+  const evaluationLine = `Relevance: ${relevanceLabel} (${confidencePct}%)`;
+
+  return [claimMedicine.name, details.join(' | '), evaluationLine, evaluation.reason]
+    .filter((item) => item)
+    .join('\n');
+}
+
 export function ClaimDetailScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
@@ -125,6 +156,15 @@ export function ClaimDetailScreen() {
           <ThemedText style={styles.sectionTitle}>Claim Information</ThemedText>
           <DetailRow label="Benefit Type" value={formatBenefitTypeLabel(claim.jenis_manfaat)} />
           <DetailRow label="Diagnosis" value={claim.keterangan_penyakit} />
+          {claim.medicines.length > 0
+            ? claim.medicines.map((medicine, index) => (
+                <DetailRow
+                  key={`${medicine.name}-${index}`}
+                  label={`Medicine #${index + 1}`}
+                  value={formatMedicineItemValue(medicine)}
+                />
+              ))
+            : null}
           <DetailRow label="Chronology" value={claim.kronologi} />
         </SurfaceCard>
 
@@ -133,6 +173,8 @@ export function ClaimDetailScreen() {
           <DetailRow label="Submitted At" value={formatClaimTimestamp(claim.created_at)} />
           <DetailRow label="Files Uploaded" value={`${claim.file_count}`} />
           <DetailRow label="Source" value={formatClaimSourceLabel(claim.source_scan_log_id)} />
+          <DetailRow label="Additional Review" value={claim.requires_additional_review ? 'Required' : 'Not required'} />
+          {claim.review_note ? <DetailRow label="Review Note" value={claim.review_note} /> : null}
         </SurfaceCard>
       </ScrollView>
     );

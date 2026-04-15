@@ -1,10 +1,12 @@
 import base64
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user_dependency
@@ -13,14 +15,17 @@ from app.db.session import get_db_session
 from app.repositories.claim_repository import ClaimFileCreate, ClaimRepository
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.auth import TokenData
-from app.schemas.claim import ClaimResponse, parse_claim_date
+from app.schemas.claim import ClaimMedicine, ClaimMedicineInput, ClaimResponse, parse_claim_date
 from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
 from app.services.ai_service import build_patient_name_verification_error
 from app.services.ai_service import matches_any_patient_name_candidate
+from app.services.claim_medicine_relevance import evaluate_claim_medicines
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 validation_processor = DocumentValidationProcessor(settings=get_settings())
+claim_medicines_adapter = TypeAdapter(list[ClaimMedicine])
+claim_medicine_input_adapter = TypeAdapter(list[ClaimMedicineInput])
 
 
 @dataclass(frozen=True)
@@ -33,6 +38,12 @@ class BufferedUpload:
 
 
 def build_claim_response(claim: Any) -> ClaimResponse:
+    medicines_payload = claim.medicines_payload if isinstance(claim.medicines_payload, list) else []
+    try:
+        medicines = claim_medicines_adapter.validate_python(medicines_payload)
+    except ValidationError:
+        medicines = []
+
     return ClaimResponse(
         id=claim.id,
         user_id=claim.user_id,
@@ -44,6 +55,9 @@ def build_claim_response(claim: Any) -> ClaimResponse:
         nominal_klaim=claim.nominal_klaim,
         keterangan_penyakit=claim.keterangan_penyakit,
         kronologi=claim.kronologi,
+        medicines=medicines,
+        requires_additional_review=bool(claim.requires_additional_review),
+        review_note=claim.review_note,
         file_count=len(claim.files),
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,
@@ -130,6 +144,54 @@ def build_selected_patient_name_error() -> HTTPException:
     )
 
 
+def build_invalid_medicines_payload_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "message": "Input validation failed.",
+            "errors": [
+                {
+                    "field": "medicines_payload",
+                    "message": "Invalid medicines payload format.",
+                }
+            ],
+        },
+    )
+
+
+def parse_claim_medicines_payload(raw_payload: str | None) -> list[ClaimMedicineInput]:
+    if raw_payload is None or not raw_payload.strip():
+        return []
+
+    try:
+        parsed = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise build_invalid_medicines_payload_error() from exc
+
+    try:
+        medicines = claim_medicine_input_adapter.validate_python(parsed)
+    except ValidationError as exc:
+        raise build_invalid_medicines_payload_error() from exc
+
+    normalized: list[ClaimMedicineInput] = []
+    for item in medicines:
+        name = item.name.strip()
+        if not name:
+            continue
+
+        normalized.append(
+            ClaimMedicineInput(
+                name=name,
+                quantity=item.quantity,
+                unit=item.unit.strip() if item.unit else None,
+                dosage_instruction=item.dosage_instruction.strip() if item.dosage_instruction else None,
+                source=item.source,
+            )
+        )
+
+    return normalized
+
+
 @router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
 async def create_claim(
     token_data: TokenData = Depends(get_current_user_dependency),
@@ -141,6 +203,7 @@ async def create_claim(
     nominal_klaim: float = Form(...),
     keterangan_penyakit: str = Form(...),
     kronologi: str = Form(...),
+    medicines_payload: str | None = Form(default=None),
     source_scan_log_id: int | None = Form(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> ClaimResponse:
@@ -158,6 +221,13 @@ async def create_claim(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid tanggal_pelayanan. Expected format: dd-mm-yyyy",
         ) from exc
+
+    medicines_input = parse_claim_medicines_payload(medicines_payload)
+    evaluated_medicines, requires_additional_review, review_note = evaluate_claim_medicines(
+        medicines_input,
+        keterangan_penyakit,
+        kronologi,
+    )
 
     buffered_uploads = await read_uploaded_files(files)
     source_scan_log: Any | None = None
@@ -218,6 +288,10 @@ async def create_claim(
         nominal_klaim=nominal_klaim,
         keterangan_penyakit=keterangan_penyakit,
         kronologi=kronologi,
+        medicines="\n".join(item.name for item in evaluated_medicines) if evaluated_medicines else None,
+        medicines_payload=[item.model_dump(mode="json") for item in evaluated_medicines],
+        requires_additional_review=requires_additional_review,
+        review_note=review_note,
         status="pending",
         created_at=datetime.now(timezone.utc),
         source_scan_log_id=source_scan_log_id,

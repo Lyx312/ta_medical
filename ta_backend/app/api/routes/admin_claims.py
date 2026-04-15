@@ -4,6 +4,7 @@ from typing import Literal
 from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_admin_dependency
@@ -15,9 +16,11 @@ from app.schemas.admin_claim import (
     AdminClaimSummaryResponse,
 )
 from app.schemas.auth import TokenData
+from app.schemas.claim import ClaimMedicine
 from app.schemas.claim import ClaimResponse
 
 router = APIRouter(prefix="/admin/claims", tags=["admin-claims"])
+claim_medicines_adapter = TypeAdapter(list[ClaimMedicine])
 
 
 def build_data_url(mime_type: str, content: bytes) -> str:
@@ -25,6 +28,12 @@ def build_data_url(mime_type: str, content: bytes) -> str:
 
 
 def build_claim_response(claim: Any) -> ClaimResponse:
+    medicines_payload = claim.medicines_payload if isinstance(claim.medicines_payload, list) else []
+    try:
+        medicines = claim_medicines_adapter.validate_python(medicines_payload)
+    except ValidationError:
+        medicines = []
+
     return ClaimResponse(
         id=claim.id,
         user_id=claim.user_id,
@@ -36,6 +45,9 @@ def build_claim_response(claim: Any) -> ClaimResponse:
         nominal_klaim=claim.nominal_klaim,
         keterangan_penyakit=claim.keterangan_penyakit,
         kronologi=claim.kronologi,
+        medicines=medicines,
+        requires_additional_review=bool(claim.requires_additional_review),
+        review_note=claim.review_note,
         file_count=len(claim.files),
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,
@@ -105,6 +117,9 @@ async def get_admin_claim(
         nominal_klaim=claim.nominal_klaim,
         keterangan_penyakit=claim.keterangan_penyakit,
         kronologi=claim.kronologi,
+        medicines=build_claim_response(claim).medicines,
+        requires_additional_review=bool(claim.requires_additional_review),
+        review_note=claim.review_note,
         file_count=len(claim.files),
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,

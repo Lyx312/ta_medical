@@ -19,57 +19,39 @@ from app.schemas.ai import (
     AIScanSummary,
 )
 from app.services.ai_ensemble_config import (
+    AI_EXTRACTION_MAX_PRODUCERS,
+    AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
+    AI_EXTRACTION_RUNS_PER_MODEL,
+    AI_EXTRACTION_TEMPERATURE,
+    CALIBRATION_VERSION,
     CONSULTATION_KEYWORDS,
+    CRITICAL_FIELD_PATHS,
     CRITICAL_FIELD_THRESHOLD,
+    DATE_FIELD_SUFFIXES,
+    FINANCIAL_FIELD_PATHS,
+    FUSION_VERSION,
     GENERIC_MEDICINE_KEYWORDS,
+    GENDER_AMBIGUITY_MARGIN_THRESHOLD,
+    GENDER_NULL_SUPPORT_RATIO_THRESHOLD,
     HANDWRITTEN_DIVERGENCE_THRESHOLD,
     MEDICINE_PRIMARY_COUNT_BUFFER,
     MEDICINE_PRIMARY_COUNT_SOFT_CAP,
     MEDICINE_SPLIT_COMPONENT_MIN,
     NON_CRITICAL_FIELD_THRESHOLD,
+    NUMERIC_FIELD_PATHS,
+    OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
     OTHER_CHARGE_BUCKET_ORDER,
     PACKAGE_LEVEL_MEDICINE_KEYWORDS,
+    RECONCILIATION_HEAVY_DROP_COUNT_THRESHOLD,
+    RECONCILIATION_LARGE_OVERRIDE_RATIO_THRESHOLD,
+    RECONCILIATION_VERSION,
+    RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD,
+    SEMANTIC_FIELD_PATHS,
+    SEMANTIC_FIELD_SUFFIXES,
     SEMANTIC_FIELD_THRESHOLD,
     SERVICE_KEYWORDS,
     STRUCTURED_TERM_LEXICON,
 )
-
-FUSION_VERSION = "ensemble-fusion-v3"
-CALIBRATION_VERSION = "heuristic-v1"
-RECONCILIATION_VERSION = "financial-reconciliation-v2"
-AI_EXTRACTION_MAX_PRODUCERS = 3
-AI_EXTRACTION_RUNS_PER_MODEL = 2
-AI_EXTRACTION_MIN_SUCCESSFUL_RUNS = 2
-AI_EXTRACTION_TEMPERATURE = 0.2
-CRITICAL_FIELD_PATHS = {
-    "summary.medical_facility_name",
-    "summary.service_date",
-    "summary.total_amount",
-    "patient_info.name",
-    "financial_recap.total_medicines",
-    "financial_recap.total_other_charges",
-    "financial_recap.grand_total",
-}
-SEMANTIC_FIELD_PATHS = {"medical_context.anamnesis", "medical_context.therapy_note"}
-SEMANTIC_FIELD_SUFFIXES = (".dosage_instruction",)
-NUMERIC_FIELD_PATHS = {
-    "summary.total_amount",
-    "patient_info.age",
-    "financial_recap.total_medicines",
-    "financial_recap.total_other_charges",
-    "financial_recap.grand_total",
-    "medicines.quantity",
-    "medicines.unit_price",
-    "medicines.total_price",
-    "other_charges.amount",
-}
-DATE_FIELD_SUFFIXES = {"service_date", "transaction_date", "date_of_birth"}
-FINANCIAL_FIELD_PATHS = {
-    "summary.total_amount",
-    "financial_recap.total_medicines",
-    "financial_recap.total_other_charges",
-    "financial_recap.grand_total",
-}
 
 
 def contains_keyword(text: str, keywords: tuple[str, ...]) -> bool:
@@ -163,6 +145,43 @@ def classify_other_charge_kind(category: Any, description: Any) -> str:
     if has_consultation_keyword:
         return "consultation"
     return "other"
+
+
+def extract_other_charge_descriptor_signature(category: Any, description: Any) -> str:
+    raw_parts = [normalize_whitespace(str(description or "")).casefold(), normalize_whitespace(str(category or "")).casefold()]
+    tokens: list[str] = []
+    for part in raw_parts:
+        for token in re.split(r"[^a-z0-9]+", part):
+            normalized_token = normalize_comparison_text(token)
+            if (
+                not normalized_token
+                or normalized_token in OTHER_CHARGE_DESCRIPTOR_STOPWORDS
+                or is_generic_medicine_key(normalized_token)
+            ):
+                continue
+            if normalized_token not in tokens:
+                tokens.append(normalized_token)
+
+    if tokens:
+        return "".join(tokens)
+
+    description_key = normalize_candidate_key("other_charges.description", description)
+    if description_key != "__null__":
+        return description_key
+
+    category_key = normalize_candidate_key("other_charges.category", category)
+    return category_key if category_key != "__null__" else "other"
+
+
+def parse_other_charge_group_key(group_key: str) -> tuple[str, str | None, str]:
+    raw_kind, amount_text, descriptor_key = (group_key.split(":", 2) + ["", ""])[:3]
+    return raw_kind or "other", None if amount_text in {"", "__null__"} else amount_text, descriptor_key
+
+
+def other_charge_kinds_share_family(left_kind: str, right_kind: str) -> bool:
+    if left_kind == right_kind:
+        return True
+    return {left_kind, right_kind}.issubset({"consultation", "service"})
 
 
 def score_candidate_group(producer_ranks: dict[str, int], producer_ids: set[str], run_count: int) -> float:
@@ -1144,11 +1163,14 @@ class MedicalExtractionFusionEngine:
         ][:3]
 
     def _apply_financial_constraints(self, result: AIMedicalScanResponse, field_confidence: dict[str, Any]) -> dict[str, Any]:
-        medicines_sum = coerce_numeric_value(result.financial_recap.total_medicines)
-        if medicines_sum is None:
-            medicines_sum = self._sum_defined_numbers([medicine.total_price for medicine in result.medicines])
+        recap_medicines_total = coerce_numeric_value(result.financial_recap.total_medicines)
+        medicine_line_item_sum = self._sum_defined_numbers([medicine.total_price for medicine in result.medicines])
+        medicines_sum = medicine_line_item_sum if medicine_line_item_sum is not None else recap_medicines_total
         other_charges_sum = self._sum_defined_numbers([charge.amount for charge in result.other_charges])
-        recap_total = self._sum_defined_numbers([medicines_sum, other_charges_sum])
+        recap_total = self._sum_defined_numbers([
+            recap_medicines_total if recap_medicines_total is not None else medicine_line_item_sum,
+            other_charges_sum,
+        ])
         return {
             "line_item.total_medicines": self._apply_numeric_constraint(result, "financial_recap.total_medicines", medicines_sum, field_confidence),
             "line_item.total_other_charges": self._apply_numeric_constraint(result, "financial_recap.total_other_charges", other_charges_sum, field_confidence),
@@ -1186,7 +1208,16 @@ class MedicalExtractionFusionEngine:
 
     def _build_review_reasons(self, field_confidence: dict[str, Any], constraint_checks: dict[str, Any], unresolved_conflicts: list[str]) -> list[str]:
         reasons = [f"{field_path} confidence is below the review threshold." for field_path, meta in field_confidence.items() if isinstance(meta, dict) and float(meta.get("confidence", 0.0)) < self._threshold_for(field_path)]
-        reasons.extend(f"{name} did not match derived financial totals." for name, check in constraint_checks.items() if not bool(check.get("passed", False)))
+        reasons.extend(
+            f"{name} did not match derived financial totals."
+            for name, check in constraint_checks.items()
+            if not bool(check.get("passed", False)) and not bool(check.get("used_derived_value", False))
+        )
+        reasons.extend(
+            f"{name} was backfilled from derived financial totals because the extracted value was missing."
+            for name, check in constraint_checks.items()
+            if bool(check.get("used_derived_value", False))
+        )
         reasons.extend(unresolved_conflicts)
         return list(dict.fromkeys(reasons))
 
@@ -1427,7 +1458,23 @@ class MedicalExtractionFusionEngine:
             return winner, None
 
         null_candidate = next((candidate for candidate in ranked if candidate.get("raw_value") is None), None)
-        if null_candidate is None or len(ranked) <= 1:
+        non_null_candidates = [candidate for candidate in ranked if candidate.get("raw_value") is not None]
+        if null_candidate is None or len(non_null_candidates) < 2:
+            return winner, None
+
+        explicit_winner = non_null_candidates[0]
+        explicit_runner_up = non_null_candidates[1]
+        explicit_margin_ratio = 0.0
+        if float(explicit_winner.get("score", 0.0)) > 0:
+            explicit_margin_ratio = max(
+                (float(explicit_winner.get("score", 0.0)) - float(explicit_runner_up.get("score", 0.0))) / float(explicit_winner.get("score", 0.0)),
+                0.0,
+            )
+
+        total_gender_runs = sum(int(candidate.get("run_count", 0)) for candidate in ranked)
+        null_support_ratio = int(null_candidate.get("run_count", 0)) / max(total_gender_runs, 1)
+
+        if explicit_margin_ratio >= GENDER_AMBIGUITY_MARGIN_THRESHOLD or null_support_ratio < GENDER_NULL_SUPPORT_RATIO_THRESHOLD:
             return winner, None
 
         return null_candidate, "prefer null over inferred gender when model support is ambiguous"
@@ -1794,6 +1841,27 @@ class MedicalExtractionFusionEngine:
             supported_targets=supported_targets,
         )
 
+        if (
+            best_subset is not None
+            and best_subset.get("coherent", False)
+            and self._should_defer_coherent_financial_override(
+                result=result,
+                best_subset=best_subset,
+                supported_targets=supported_targets,
+            )
+        ):
+            best_subset = {
+                **best_subset,
+                "coherent": False,
+                "deferred_by_consensus_guard": True,
+            }
+            reconciliation_notes.append(
+                "Deferred coherent reconciliation override because it materially diverged from stronger consensus totals."
+            )
+            unresolved_conflicts.append(
+                "Financial reconciliation candidate was coherent but materially weaker than the existing consensus totals."
+            )
+
         if best_subset is not None and best_subset.get("coherent", False):
             dropped_indices = cast(list[int], best_subset["dropped_group_indices"])
             for dropped_index in dropped_indices:
@@ -1931,6 +1999,41 @@ class MedicalExtractionFusionEngine:
                 return True, float(candidate.get("support_count", 0)) + (0.2 * float(candidate.get("producer_count", 0)))
         return False, 0.0
 
+    def _should_defer_coherent_financial_override(
+        self,
+        *,
+        result: AIMedicalScanResponse,
+        best_subset: dict[str, Any],
+        supported_targets: dict[str, list[dict[str, Any]]],
+    ) -> bool:
+        current_grand_total = coerce_numeric_value(result.financial_recap.grand_total)
+        candidate_grand_total = coerce_numeric_value(best_subset.get("grand_total"))
+        if current_grand_total is None or candidate_grand_total is None:
+            return False
+
+        relative_delta = abs(float(candidate_grand_total) - float(current_grand_total)) / max(abs(float(current_grand_total)), 1.0)
+        if relative_delta < RECONCILIATION_LARGE_OVERRIDE_RATIO_THRESHOLD:
+            return False
+
+        target_candidates = [
+            *supported_targets.get("summary.total_amount", []),
+            *supported_targets.get("financial_recap.grand_total", []),
+        ]
+        _, current_support_score = self._score_numeric_match(current_grand_total, target_candidates)
+        _, candidate_support_score = self._score_numeric_match(candidate_grand_total, target_candidates)
+        if current_support_score <= 0.0:
+            return False
+
+        canonical_source = cast(dict[str, Any], best_subset.get("canonical_medicine_source") or {})
+        canonical_source_support = float(canonical_source.get("support_count", 0)) + (0.2 * float(canonical_source.get("producer_count", 0)))
+        dropped_count = len(cast(list[int], best_subset.get("dropped_group_indices", [])))
+
+        return (
+            candidate_support_score <= current_support_score
+            and canonical_source_support <= RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD
+            and dropped_count >= RECONCILIATION_HEAVY_DROP_COUNT_THRESHOLD
+        )
+
     def _choose_best_ledger_subset(
         self,
         selected_groups: list[dict[str, Any]],
@@ -1987,6 +2090,9 @@ class MedicalExtractionFusionEngine:
                     coherent = total_match or not require_grand_total_match
                     support_score = float(medicine_candidate.get("score", 0.0)) + sum(float(group.get("score", 0.0)) for group in subset_groups)
                     dropped_indices = [index for index in range(len(selected_groups)) if index not in subset_indices]
+                    canonical_source_support = float(medicine_candidate.get("support_count", 0)) + (0.2 * float(medicine_candidate.get("producer_count", 0)))
+                    weak_source_penalty = 0.4 if canonical_source_support < RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD else 0.0
+                    dropped_count_penalty = 0.5 * len(dropped_indices)
                     candidate_choice = {
                         "coherent": coherent,
                         "selected_group_indices": subset_indices,
@@ -2012,9 +2118,9 @@ class MedicalExtractionFusionEngine:
                             medicine_match_score,
                             1 if other_match else 0,
                             other_match_score,
-                            float(medicine_candidate.get("support_count", 0)) + (0.2 * float(medicine_candidate.get("producer_count", 0))),
-                            support_score,
-                            -len(dropped_indices),
+                            canonical_source_support,
+                            support_score - weak_source_penalty,
+                            -dropped_count_penalty,
                         ),
                     }
                     if best_choice is None or candidate_choice["score_tuple"] > best_choice["score_tuple"]:
@@ -2609,15 +2715,33 @@ class MedicalExtractionFusionEngine:
             return normalize_candidate_key("medicines.name", name)
 
         amount = coerce_numeric_value(getattr(item, "amount", None))
-        charge_kind = classify_other_charge_kind(getattr(item, "category", None), getattr(item, "description", None))
-        bucket = normalize_other_charge_bucket(charge_kind)
-        if amount is None:
-            description_key = normalize_candidate_key("other_charges.description", getattr(item, "description", None))
-            return f"{bucket}:{description_key}"
-
-        return f"{charge_kind}:{amount}"
+        category = getattr(item, "category", None)
+        description = getattr(item, "description", None)
+        charge_kind = classify_other_charge_kind(category, description)
+        descriptor_key = extract_other_charge_descriptor_signature(category, description)
+        amount_key = "__null__" if amount is None else str(amount)
+        return f"{charge_kind}:{amount_key}:{descriptor_key}"
 
     def _find_similar_group_key(self, list_name: str, candidate_key: str, existing_keys: list[str]) -> str | None:
+        if list_name == "other_charges":
+            candidate_kind, candidate_amount, candidate_descriptor = parse_other_charge_group_key(candidate_key)
+            for existing_key in existing_keys:
+                existing_kind, existing_amount, existing_descriptor = parse_other_charge_group_key(existing_key)
+                if candidate_amount != existing_amount:
+                    continue
+                if not other_charge_kinds_share_family(candidate_kind, existing_kind):
+                    continue
+                if not candidate_descriptor or not existing_descriptor:
+                    continue
+                if (
+                    candidate_descriptor == existing_descriptor
+                    or candidate_descriptor in existing_descriptor
+                    or existing_descriptor in candidate_descriptor
+                    or sequence_similarity(candidate_descriptor, existing_descriptor) >= 0.88
+                ):
+                    return existing_key
+            return None
+
         threshold = 0.9 if list_name == "diagnoses" else 0.86 if list_name == "medicines" else None
         if threshold is None:
             return None
@@ -2636,5 +2760,5 @@ class MedicalExtractionFusionEngine:
         if normalize_other_charge_bucket(self._extract_other_charge_raw_kind(group_key)) != "medicine":
             return False
 
-        _, amount_text = group_key.split(":", 1)
-        return amount_text in exclude_amount_keys
+        _, amount_text, _ = parse_other_charge_group_key(group_key)
+        return amount_text in exclude_amount_keys if amount_text is not None else False

@@ -15,13 +15,15 @@ from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse, ValidationPatientNameMatchStatus
-from app.services.ai_ensemble import (
+from app.services.ai_ensemble_config import (
     AI_EXTRACTION_MAX_PRODUCERS,
     AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
     AI_EXTRACTION_RUNS_PER_MODEL,
     AI_EXTRACTION_TEMPERATURE,
     CALIBRATION_VERSION,
     FUSION_VERSION,
+)
+from app.services.ai_ensemble import (
     MedicalExtractionFusionEngine,
     MedicalExtractionOutcome,
     ProducerInferenceTrace,

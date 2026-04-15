@@ -28,7 +28,7 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { scanDocuments } from '@/services/api/ai';
 import { createClaim } from '@/services/api/claims';
 import { getFamilyMembers } from '@/services/api/family-members';
-import type { AIMedicalScanResult, ApiError, FamilyMember } from '@/services/api/types';
+import type { AIMedicalScanResult, ApiError, ClaimMedicineInput, FamilyMember } from '@/services/api/types';
 
 const BENEFIT_TYPES = [
   { value: 'rawat_jalan', label: 'Rawat Jalan' },
@@ -41,6 +41,12 @@ type PatientOption = {
   key: string;
   name: string;
   relation: string;
+};
+
+type ClaimMedicineDraft = {
+  localId: string;
+  name: string;
+  source: ClaimMedicineInput['source'];
 };
 
 function normalizePatientName(name: string) {
@@ -57,6 +63,44 @@ function formatClaimAmountForDisplay(value: string) {
   }
 
   return new Intl.NumberFormat('id-ID').format(Number(value));
+}
+
+function createMedicineDraft(
+  source: ClaimMedicineInput['source'] = 'user_input',
+  overrides: Partial<ClaimMedicineDraft> = {},
+): ClaimMedicineDraft {
+  return {
+    localId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    name: '',
+    source,
+    ...overrides,
+  };
+}
+
+function mapAIMedicinesToDrafts(medicines: AIMedicalScanResult['medicines']): ClaimMedicineDraft[] {
+  return medicines.map((medicine) =>
+    createMedicineDraft('ai_extracted', {
+      name: typeof medicine.name === 'string' ? medicine.name.trim() : '',
+    }),
+  );
+}
+
+function toClaimMedicineInputList(medicines: ClaimMedicineDraft[]): ClaimMedicineInput[] {
+  const result: ClaimMedicineInput[] = [];
+
+  for (const medicine of medicines) {
+    const name = medicine.name.trim();
+    if (!name) {
+      continue;
+    }
+
+    result.push({
+      name,
+      source: medicine.source,
+    });
+  }
+
+  return result;
 }
 
 export function NewClaimScreen() {
@@ -76,6 +120,7 @@ export function NewClaimScreen() {
   const [showBenefitPicker, setShowBenefitPicker] = useState(false);
   const [claimAmount, setClaimAmount] = useState('');
   const [diseaseDescription, setDiseaseDescription] = useState('');
+  const [medicines, setMedicines] = useState<ClaimMedicineDraft[]>([]);
   const [chronology, setChronology] = useState('');
   const [sourceScanLogId, setSourceScanLogId] = useState<number | undefined>(undefined);
   const [isScanning, setIsScanning] = useState(false);
@@ -250,6 +295,33 @@ export function NewClaimScreen() {
     if (data.medical_context.anamnesis) {
       setChronology(data.medical_context.anamnesis);
     }
+
+    setMedicines(mapAIMedicinesToDrafts(data.medicines));
+  };
+
+  const updateMedicineDraft = (
+    localId: string,
+    field: keyof Omit<ClaimMedicineDraft, 'localId' | 'source'>,
+    value: string,
+  ) => {
+    setMedicines((prev) =>
+      prev.map((medicine) =>
+        medicine.localId === localId
+          ? {
+              ...medicine,
+              [field]: value,
+            }
+          : medicine,
+      ),
+    );
+  };
+
+  const addMedicineDraft = () => {
+    setMedicines((prev) => [...prev, createMedicineDraft('user_input')]);
+  };
+
+  const removeMedicineDraft = (localId: string) => {
+    setMedicines((prev) => prev.filter((medicine) => medicine.localId !== localId));
   };
 
   const handleAIScan = async () => {
@@ -319,6 +391,7 @@ export function NewClaimScreen() {
     setBenefitType('');
     setClaimAmount('');
     setDiseaseDescription('');
+    setMedicines([]);
     setChronology('');
     setSourceScanLogId(undefined);
     setErrors({});
@@ -338,6 +411,7 @@ export function NewClaimScreen() {
     setErrors({});
 
     try {
+      const medicinesInput = toClaimMedicineInputList(medicines);
       await createClaim({
         nama_pasien: selectedPatient.name,
         tanggal_pelayanan: formatDateForSubmission(serviceDate),
@@ -346,6 +420,7 @@ export function NewClaimScreen() {
         nominal_klaim: parseFloat(claimAmount),
         keterangan_penyakit: diseaseDescription.trim(),
         kronologi: chronology.trim(),
+        medicines: medicinesInput,
         fileUris: imageUris,
         source_scan_log_id: sourceScanLogId,
       });
@@ -532,6 +607,39 @@ export function NewClaimScreen() {
                   <FieldError message={errors.kronologi} />
                 </View>
 
+                <View style={viewStyles.fieldGroup}>
+                  <FieldLabel>Medicines (Optional)</FieldLabel>
+                  {medicines.length === 0 ? (
+                    <ThemedText style={textStyles.optionalHint}>No medicines added yet.</ThemedText>
+                  ) : null}
+
+                  {medicines.map((medicine, index) => (
+                    <View
+                      key={medicine.localId}
+                      style={[viewStyles.medicineCard, { borderColor: colors.divider, backgroundColor: colors.background }]}> 
+                      <View style={viewStyles.medicineHeaderRow}>
+                        <ThemedText style={textStyles.medicineTitle}>Medicine #{index + 1}</ThemedText>
+                        <Pressable onPress={() => removeMedicineDraft(medicine.localId)}>
+                          <Ionicons name="trash-outline" size={16} color={colors.error} />
+                        </Pressable>
+                      </View>
+
+                      <TextField
+                        value={medicine.name}
+                        onChangeText={(text) => updateMedicineDraft(medicine.localId, 'name', text)}
+                        placeholder="Medicine name"
+                      />
+                    </View>
+                  ))}
+
+                  <Pressable
+                    style={[viewStyles.addMedicineButton, { borderColor: colors.divider }]}
+                    onPress={addMedicineDraft}>
+                    <Ionicons name="add-circle-outline" size={18} color={colors.primary} />
+                    <ThemedText style={textStyles.addMedicineButtonText}>Add Medicine</ThemedText>
+                  </Pressable>
+                </View>
+
                 <AppButton
                   label="Submit Claim"
                   tone="cta"
@@ -629,6 +737,17 @@ export function NewClaimScreen() {
 }
 
 const viewStyles = StyleSheet.create({
+  addMedicineButton: {
+    alignItems: 'center',
+    borderRadius: Radii.md,
+    borderStyle: 'dashed',
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: Spacing.xs,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.md,
+    paddingVertical: 12,
+  },
   benefitOption: {
     alignItems: 'center',
     borderBottomWidth: 1,
@@ -695,6 +814,17 @@ const viewStyles = StyleSheet.create({
     flex: 1,
     justifyContent: 'flex-end',
   },
+  medicineCard: {
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    gap: Spacing.sm,
+    padding: Spacing.sm,
+  },
+  medicineHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
   patientOptionTextContainer: {
     flex: 1,
     gap: 2,
@@ -713,6 +843,10 @@ const viewStyles = StyleSheet.create({
 });
 
 const textStyles = StyleSheet.create({
+  addMedicineButtonText: {
+    ...Typography.button,
+    fontSize: 14,
+  },
   benefitOptionText: {
     fontSize: 16,
   },
@@ -720,9 +854,17 @@ const textStyles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
+  medicineTitle: {
+    ...Typography.bodyStrong,
+    fontSize: 14,
+  },
   modalTitle: {
     fontSize: 18,
     fontWeight: '600',
+  },
+  optionalHint: {
+    ...Typography.helper,
+    opacity: Opacity.subtle,
   },
   patientOptionMeta: {
     fontSize: 13,

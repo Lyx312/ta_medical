@@ -1143,7 +1143,7 @@ def test_process_keeps_transaction_date_null_when_not_explicitly_present(
     assert result.result.summary.transaction_date is None
 
 
-def test_process_prefers_null_gender_when_support_is_ambiguous(
+def test_process_keeps_supported_explicit_gender_when_only_null_alternative_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     medical_processor = MedicalDocumentProcessor(settings=build_settings())
@@ -1174,6 +1174,63 @@ def test_process_prefers_null_gender_when_support_is_ambiguous(
         lambda: [
             AIModelSpec(provider="google_genai", model="model-a"),
             AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.gender == "MALE"
+    assert "prefer null over inferred gender when model support is ambiguous" not in result.field_confidence["patient_info.gender"]["rule_hits"]
+
+
+def test_process_prefers_null_gender_when_competing_labels_are_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            if self.model_name == "model-a":
+                gender_value = "Pria"
+            elif self.model_name == "model-b":
+                gender_value = "Wanita"
+            else:
+                gender_value = None
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "gender": gender_value,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+            AIModelSpec(provider="google_genai", model="model-c"),
         ],
     )
 
@@ -1434,6 +1491,118 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
         if candidate["selected"]
     )
     assert selected_total_medicines_candidate["value"] == 78900
+
+
+def test_process_flags_line_item_total_medicines_mismatch_against_row_sum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "medicines": [
+                    {
+                        **SCAN_RESULT["medicines"][0],
+                        "total_price": 12000,
+                    }
+                ],
+                "financial_recap": {
+                    **SCAN_RESULT["financial_recap"],
+                    "total_medicines": 10000,
+                    "grand_total": 125000,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    line_item_check = result.extraction_meta_payload["constraint_checks"]["line_item.total_medicines"]
+    assert line_item_check["derived_value"] == 12000
+    assert line_item_check["original_value"] == 10000
+    assert line_item_check["final_value"] == 10000
+    assert line_item_check["passed"] is False
+    assert line_item_check["used_derived_value"] is False
+    assert "line_item.total_medicines did not match derived financial totals." in result.review_reasons
+
+
+def test_process_marks_backfilled_financial_totals_as_review_worthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "medicines": [
+                    {
+                        **SCAN_RESULT["medicines"][0],
+                        "unit_price": None,
+                        "total_price": None,
+                    }
+                ],
+                "financial_recap": {
+                    **SCAN_RESULT["financial_recap"],
+                    "grand_total": None,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    grand_total_check = result.extraction_meta_payload["constraint_checks"]["financial_recap.grand_total"]
+    assert grand_total_check["used_derived_value"] is True
+    assert result.result.financial_recap.grand_total == 125000
+    assert (
+        "financial_recap.grand_total was backfilled from derived financial totals because the extracted value was missing."
+        in result.review_reasons
+    )
 
 
 def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_prices(
@@ -1715,7 +1884,8 @@ def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_price
     assert result.result.financial_recap.total_medicines == 102900
     assert result.result.financial_recap.total_other_charges == 495000
     assert result.result.financial_recap.grand_total == 597900
-    assert {charge.amount for charge in result.result.other_charges} == {195000, 300000}
+    assert len(result.result.other_charges) == 2
+    assert sorted(charge.amount for charge in result.result.other_charges if charge.amount is not None) == [195000, 300000]
 
     ledger_source = result.extraction_meta_payload["derived_financials"]["canonical_medicine_ledger_source"]
     assert ledger_source["amount"] == 102900
@@ -1728,6 +1898,217 @@ def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_price
         suppression["amount"] == 900000
         for suppression in result.extraction_meta_payload["derived_financials"]["financial_outlier_suppressions"]
     )
+
+
+def test_process_preserves_strong_consensus_when_coherent_reconciliation_is_weaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi DR MAHE", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 597900,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngikil demam hng",
+                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
+                    "therapy_note": "Zibramax, puyer batuk, profen",
+                },
+                "medicines": [
+                    {"name": "Zibramax", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
+                    {"name": "Profen", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
+                    {"name": "Lasal", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
+                ],
+                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi DR MAHE", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
+                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
+                    "service_date": "2025-08-31",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 597900,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngikil demam hngs",
+                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
+                    "therapy_note": "Zibramax, puyer batuk, profen",
+                },
+                "medicines": [
+                    {"name": "Zibramax", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
+                    {"name": "Profen", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
+                    {"name": "Lasal", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
+                ],
+                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
+            },
+        ],
+        "model-weaker": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["receipt", "prescription", "medical_form"],
+                    "medical_facility_name": "DR MAHE",
+                    "service_date": "2025-08-01",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 1145000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": "Pria",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilili demam hanya",
+                    "diagnoses": [{"description": "perburukan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
+                    "therapy_note": "Abramax puyer bap d. prover",
+                },
+                "medicines": [
+                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
+                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Jasa dokter", "amount": 900000},
+                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 145000},
+                    {"category": "Pharmacy", "description": "Obat", "amount": 100000},
+                    {"category": "Medical Service", "description": "Dr. Mahendra Tri Arif, Sp.A (K), PhD", "amount": 100000},
+                    {"category": "Jasa Medis", "description": "Jasa Medis", "amount": 150000},
+                ],
+                "financial_recap": {"total_medicines": None, "total_other_charges": 1145000, "grand_total": 1145000},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["receipt", "prescription", "medical_form"],
+                    "medical_facility_name": "DR MAHE",
+                    "service_date": "2025-08-01",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 1145000,
+                },
+                "patient_info": {
+                    "name": "Nathan Benedict Kristian",
+                    "date_of_birth": None,
+                    "age": 6,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Batuk ngilili demam hanya",
+                    "diagnoses": [{"description": "perburukan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
+                    "therapy_note": "Abramax puyer bap d. prover",
+                },
+                "medicines": [
+                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
+                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
+                ],
+                "other_charges": [
+                    {"category": "Consultation", "description": "Jasa dokter", "amount": 900000},
+                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 145000},
+                    {"category": "Pharmacy", "description": "Obat", "amount": 100000},
+                    {"category": "Medical Service", "description": "Dr. Mahendra Tri Arif, Sp.A (K), PhD", "amount": 100000},
+                    {"category": "Jasa Medis", "description": "Jasa Medis", "amount": 150000},
+                ],
+                "financial_recap": {"total_medicines": 0, "total_other_charges": 1145000, "grand_total": 1145000},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="ollama", model="model-weaker"),
+        ],
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_field_conflict",
+        lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={
+                "ordered_documents": [
+                    {"image_index": 0, "document_index": 0, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 2, "document_type": "receipt", "decision": "valid"},
+                    {"image_index": 0, "document_index": 3, "document_type": "prescription", "decision": "valid"},
+                    {"image_index": 1, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
+                ]
+            },
+        )
+    )
+
+    assert result.result.summary.total_amount == 597900
+    assert result.result.financial_recap.total_medicines == 297900
+    assert result.result.financial_recap.total_other_charges == 300000
+    assert result.result.financial_recap.grand_total == 597900
+    assert any(
+        "materially weaker than the existing consensus totals" in reason
+        for reason in result.review_reasons
+    )
+    assert not any(
+        corrected.get("field_path") == "summary.total_amount" and corrected.get("corrected_value") == 1145000
+        for corrected in result.extraction_meta_payload["corrected_fields"]
+    )
+
 
 
 def test_process_uses_judge_for_low_confidence_dosage_conflict(

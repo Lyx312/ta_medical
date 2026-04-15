@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from typing import Any
 
 from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -34,6 +35,10 @@ class ClaimRepository:
         nominal_klaim: float,
         keterangan_penyakit: str,
         kronologi: str,
+        medicines: str | None = None,
+        medicines_payload: list[dict[str, Any]] | None = None,
+        requires_additional_review: bool = False,
+        review_note: str | None = None,
         status: str,
         created_at: datetime,
         files: list[ClaimFileCreate],
@@ -49,6 +54,10 @@ class ClaimRepository:
             nominal_klaim=nominal_klaim,
             keterangan_penyakit=keterangan_penyakit.strip(),
             kronologi=kronologi.strip(),
+            medicines=medicines.strip() if medicines and medicines.strip() else None,
+            medicines_payload=medicines_payload,
+            requires_additional_review=requires_additional_review,
+            review_note=review_note.strip() if review_note else None,
             status=status,
             created_at=created_at,
             source_scan_log_id=source_scan_log_id,

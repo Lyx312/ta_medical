@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from itertools import combinations
 import math
 import re
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, Collection, cast
 
 from app.schemas.ai import (
     AIMedicalScanResponse,
@@ -54,7 +55,18 @@ from app.services.ai_ensemble_config import (
 )
 
 
-def contains_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+COMPOUND_MEDICINE_SPLIT_PATTERN = re.compile(r",|\+|/|&|\bdan\b", re.IGNORECASE)
+ALPHANUMERIC_TOKEN_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
+LIST_ITEM_FIELD_PATH_PATTERN = re.compile(r"^(diagnoses|medicines|other_charges)\[([^\]]+)\]\.([a-z_]+)$")
+FINANCIAL_TOTAL_FIELD_SEQUENCE = (
+    "summary.total_amount",
+    "financial_recap.total_medicines",
+    "financial_recap.total_other_charges",
+    "financial_recap.grand_total",
+)
+
+
+def contains_keyword(text: str, keywords: Collection[str]) -> bool:
     lowered_text = text.casefold()
     return any(keyword in lowered_text for keyword in keywords)
 
@@ -109,7 +121,7 @@ def extract_compound_medicine_components(value: Any) -> list[str]:
     normalized_value = normalize_whitespace(value)
     if not normalized_value:
         return []
-    parts = re.split(r",|\+|/|&|\bdan\b", normalized_value, flags=re.IGNORECASE)
+    parts = COMPOUND_MEDICINE_SPLIT_PATTERN.split(normalized_value)
     components: list[str] = []
     seen: set[str] = set()
     for part in parts:
@@ -150,8 +162,9 @@ def classify_other_charge_kind(category: Any, description: Any) -> str:
 def extract_other_charge_descriptor_signature(category: Any, description: Any) -> str:
     raw_parts = [normalize_whitespace(str(description or "")).casefold(), normalize_whitespace(str(category or "")).casefold()]
     tokens: list[str] = []
+    seen_tokens: set[str] = set()
     for part in raw_parts:
-        for token in re.split(r"[^a-z0-9]+", part):
+        for token in ALPHANUMERIC_TOKEN_SPLIT_PATTERN.split(part):
             normalized_token = normalize_comparison_text(token)
             if (
                 not normalized_token
@@ -159,8 +172,10 @@ def extract_other_charge_descriptor_signature(category: Any, description: Any) -
                 or is_generic_medicine_key(normalized_token)
             ):
                 continue
-            if normalized_token not in tokens:
-                tokens.append(normalized_token)
+            if normalized_token in seen_tokens:
+                continue
+            seen_tokens.add(normalized_token)
+            tokens.append(normalized_token)
 
     if tokens:
         return "".join(tokens)
@@ -293,10 +308,12 @@ def clamp_confidence(value: float) -> float:
     return round(max(0.0, min(1.0, value)), 4)
 
 
+@lru_cache(maxsize=2048)
 def normalize_whitespace(value: str) -> str:
     return " ".join(value.strip().split())
 
 
+@lru_cache(maxsize=4096)
 def normalize_comparison_text(value: str) -> str:
     return re.sub(r"[\W_]+", "", normalize_whitespace(value).casefold())
 
@@ -688,6 +705,77 @@ class MedicalExtractionFusionEngine:
             "overall_confidence": overall_confidence,
         }
 
+    def _iter_summary_scalar_values(
+        self,
+        traces: list[SuccessfulProducerInferenceTrace],
+    ) -> list[tuple[str, list[tuple[SuccessfulProducerInferenceTrace, Any]]]]:
+        summary_field_getters: tuple[tuple[str, Callable[[Any], Any]], ...] = (
+            ("medical_facility_name", lambda payload: payload.summary.medical_facility_name),
+            ("service_date", lambda payload: payload.summary.service_date or payload.summary.transaction_date),
+            ("transaction_date", lambda payload: payload.summary.transaction_date),
+            ("currency", lambda payload: payload.summary.currency),
+            ("total_amount", lambda payload: payload.summary.total_amount),
+        )
+        return [
+            (
+                field_name,
+                [(trace, getter(trace.payload)) for trace in traces],
+            )
+            for field_name, getter in summary_field_getters
+        ]
+
+    def _list_items_for_trace(self, trace: SuccessfulProducerInferenceTrace, list_name: str) -> list[Any]:
+        if list_name == "diagnoses":
+            return trace.payload.medical_context.diagnoses
+        if list_name == "medicines":
+            return trace.payload.medicines
+        if list_name == "other_charges":
+            return trace.payload.other_charges
+        raise ValueError(f"Unsupported list name: {list_name}")
+
+    def _list_item_schema(self, list_name: str) -> tuple[Any, tuple[str, ...]]:
+        if list_name == "diagnoses":
+            return AIScanDiagnosis, ("description", "doctor_name")
+        if list_name == "medicines":
+            return AIScanMedicine, ("name", "quantity", "unit", "dosage_instruction", "unit_price", "total_price")
+        if list_name == "other_charges":
+            return AIScanOtherCharge, ("category", "description", "amount")
+        raise ValueError(f"Unsupported list name: {list_name}")
+
+    def _store_list_group_meta(
+        self,
+        *,
+        list_name: str,
+        list_group_meta: dict[str, Any] | None,
+        ranked_groups: list[dict[str, Any]],
+        selected_groups: list[dict[str, Any]],
+        target_count: int,
+        bucket_targets: dict[str, int] | None,
+        excluded_keys: dict[str, str],
+    ) -> None:
+        if list_group_meta is None:
+            return
+        list_group_meta[list_name] = self._serialize_list_group_meta(
+            list_name,
+            ranked_groups,
+            selected_groups,
+            target_count=target_count,
+            bucket_targets=bucket_targets,
+            excluded_keys=excluded_keys,
+        )
+
+    @staticmethod
+    def _build_constraint_review_reasons(constraint_checks: dict[str, Any]) -> list[str]:
+        reasons: list[str] = []
+        for name, check in constraint_checks.items():
+            if bool(check.get("used_derived_value", False)):
+                reasons.append(
+                    f"{name} was backfilled from derived financial totals because the extracted value was missing."
+                )
+            elif not bool(check.get("passed", False)):
+                reasons.append(f"{name} did not match derived financial totals.")
+        return reasons
+
     async def _fuse_summary(
         self,
         traces: list[SuccessfulProducerInferenceTrace],
@@ -706,12 +794,16 @@ class MedicalExtractionFusionEngine:
             inventory_conflicts=inventory_conflicts,
         )
         field_confidence["summary.detected_documents"] = detected_document_meta
-        medical_facility_name = await self._fuse_scalar("summary.medical_facility_name", [(trace, trace.payload.summary.medical_facility_name) for trace in traces], images, field_confidence, judge_invocations)
-        service_date = await self._fuse_scalar("summary.service_date", [(trace, trace.payload.summary.service_date or trace.payload.summary.transaction_date) for trace in traces], images, field_confidence, judge_invocations)
-        transaction_date = await self._fuse_scalar("summary.transaction_date", [(trace, trace.payload.summary.transaction_date) for trace in traces], images, field_confidence, judge_invocations)
-        currency = await self._fuse_scalar("summary.currency", [(trace, trace.payload.summary.currency) for trace in traces], images, field_confidence, judge_invocations)
-        total_amount = await self._fuse_scalar("summary.total_amount", [(trace, trace.payload.summary.total_amount) for trace in traces], images, field_confidence, judge_invocations)
-        return AIScanSummary(detected_documents=detected_documents, medical_facility_name=medical_facility_name, service_date=service_date, transaction_date=transaction_date, currency=currency, total_amount=total_amount)
+        fused_scalars: dict[str, Any] = {}
+        for field_name, values in self._iter_summary_scalar_values(traces):
+            fused_scalars[field_name] = await self._fuse_scalar(
+                f"summary.{field_name}",
+                values,
+                images,
+                field_confidence,
+                judge_invocations,
+            )
+        return AIScanSummary(detected_documents=detected_documents, **fused_scalars)
 
     async def _fuse_section_object(self, *, section_name: str, section_source: list[Any], fields: tuple[str, ...], section_model: Any, traces: list[SuccessfulProducerInferenceTrace], images: list[Any], field_confidence: dict[str, Any], judge_invocations: list[dict[str, Any]]) -> Any:
         fused: dict[str, Any] = {}
@@ -734,10 +826,25 @@ class MedicalExtractionFusionEngine:
         *,
         list_group_meta: dict[str, Any],
     ) -> AIScanMedicalContext:
-        anamnesis = await self._fuse_scalar("medical_context.anamnesis", [(trace, trace.payload.medical_context.anamnesis) for trace in traces], images, field_confidence, judge_invocations)
-        therapy_note = await self._fuse_scalar("medical_context.therapy_note", [(trace, trace.payload.medical_context.therapy_note) for trace in traces], images, field_confidence, judge_invocations)
+        scalar_values = {
+            "anamnesis": [(trace, trace.payload.medical_context.anamnesis) for trace in traces],
+            "therapy_note": [(trace, trace.payload.medical_context.therapy_note) for trace in traces],
+        }
+        fused_scalars: dict[str, Any] = {}
+        for field_name, values in scalar_values.items():
+            fused_scalars[field_name] = await self._fuse_scalar(
+                f"medical_context.{field_name}",
+                values,
+                images,
+                field_confidence,
+                judge_invocations,
+            )
         diagnoses = await self._fuse_list_items(traces, images, "diagnoses", field_confidence, judge_invocations, list_group_meta=list_group_meta)
-        return AIScanMedicalContext(anamnesis=anamnesis, diagnoses=diagnoses, therapy_note=therapy_note)
+        return AIScanMedicalContext(
+            anamnesis=fused_scalars["anamnesis"],
+            diagnoses=diagnoses,
+            therapy_note=fused_scalars["therapy_note"],
+        )
 
     def _collect_list_groups(
         self,
@@ -746,15 +853,10 @@ class MedicalExtractionFusionEngine:
     ) -> tuple[list[int], list[dict[str, Any]]]:
         item_groups: dict[str, dict[str, Any]] = {}
         primary_rank = min((trace.producer_rank for trace in traces), default=0)
-        source_getter = {
-            "diagnoses": lambda payload: payload.medical_context.diagnoses,
-            "medicines": lambda payload: payload.medicines,
-            "other_charges": lambda payload: payload.other_charges,
-        }[list_name]
-        item_counts = [len(source_getter(trace.payload)) for trace in traces]
+        item_counts = [len(self._list_items_for_trace(trace, list_name)) for trace in traces]
 
         for trace in traces:
-            for item in source_getter(trace.payload):
+            for item in self._list_items_for_trace(trace, list_name):
                 item_key = self._build_list_item_key(list_name, item)
                 if item_key == "__null__":
                     continue
@@ -876,12 +978,10 @@ class MedicalExtractionFusionEngine:
         judge_invocations: list[dict[str, Any]],
         list_group_meta: dict[str, Any] | None,
     ) -> list[Any]:
-        item_model = {"diagnoses": AIScanDiagnosis, "medicines": AIScanMedicine, "other_charges": AIScanOtherCharge}[list_name]
-        item_fields = {
-            "diagnoses": ("description", "doctor_name"),
-            "medicines": ("name", "quantity", "unit", "dosage_instruction", "unit_price", "total_price"),
-            "other_charges": ("category", "description", "amount"),
-        }[list_name]
+        item_model, item_fields = self._list_item_schema(list_name)
+        selected_group_meta: list[dict[str, Any]] | None = None
+        if list_group_meta is not None:
+            selected_group_meta = cast(list[dict[str, Any]], list_group_meta[list_name]["selected_groups"])
         fused_items: list[Any] = []
         for output_index, group in enumerate(selected_groups):
             item_key = group["key"]
@@ -898,8 +998,7 @@ class MedicalExtractionFusionEngine:
                     output_path=f"{path_prefix}.{field_name}",
                 )
             fused_items.append(item_model(**fused_fields))
-            if list_group_meta is not None:
-                selected_group_meta = cast(list[dict[str, Any]], list_group_meta[list_name]["selected_groups"])
+            if selected_group_meta is not None:
                 selected_group_meta[output_index]["path_prefix"] = path_prefix
         return fused_items
 
@@ -933,27 +1032,18 @@ class MedicalExtractionFusionEngine:
             exclude_amount_keys=exclude_amount_keys,
         )
 
-        if target_count <= 0 or not ranked_groups or not selected_groups:
-            if list_group_meta is not None:
-                list_group_meta[list_name] = self._serialize_list_group_meta(
-                    list_name,
-                    ranked_groups,
-                    selected_groups,
-                    target_count=target_count,
-                    bucket_targets=bucket_targets,
-                    excluded_keys=excluded_keys,
-                )
-            return []
+        self._store_list_group_meta(
+            list_name=list_name,
+            list_group_meta=list_group_meta,
+            ranked_groups=ranked_groups,
+            selected_groups=selected_groups,
+            target_count=target_count,
+            bucket_targets=bucket_targets,
+            excluded_keys=excluded_keys,
+        )
 
-        if list_group_meta is not None:
-            list_group_meta[list_name] = self._serialize_list_group_meta(
-                list_name,
-                ranked_groups,
-                selected_groups,
-                target_count=target_count,
-                bucket_targets=bucket_targets,
-                    excluded_keys=excluded_keys,
-                )
+        if target_count <= 0 or not ranked_groups or not selected_groups:
+            return []
 
         return await self._enrich_selected_list_groups(
             list_name,
@@ -1208,16 +1298,7 @@ class MedicalExtractionFusionEngine:
 
     def _build_review_reasons(self, field_confidence: dict[str, Any], constraint_checks: dict[str, Any], unresolved_conflicts: list[str]) -> list[str]:
         reasons = [f"{field_path} confidence is below the review threshold." for field_path, meta in field_confidence.items() if isinstance(meta, dict) and float(meta.get("confidence", 0.0)) < self._threshold_for(field_path)]
-        reasons.extend(
-            f"{name} did not match derived financial totals."
-            for name, check in constraint_checks.items()
-            if not bool(check.get("passed", False)) and not bool(check.get("used_derived_value", False))
-        )
-        reasons.extend(
-            f"{name} was backfilled from derived financial totals because the extracted value was missing."
-            for name, check in constraint_checks.items()
-            if bool(check.get("used_derived_value", False))
-        )
+        reasons.extend(self._build_constraint_review_reasons(constraint_checks))
         reasons.extend(unresolved_conflicts)
         return list(dict.fromkeys(reasons))
 
@@ -1246,29 +1327,13 @@ class MedicalExtractionFusionEngine:
         section_name, field_name = field_path.split(".", 1)
         setattr(getattr(result, section_name), field_name, value)
 
-    def _build_field_source_summary(self, field_confidence: dict[str, Any]) -> dict[str, Any]:
-        summary: dict[str, Any] = {}
-        for field_path, meta in field_confidence.items():
-            if not isinstance(meta, dict):
-                continue
-            summary[field_path] = {
-                "selected_value": meta.get("value"),
-                "support_count": meta.get("support_count"),
-                "producer_agreement": meta.get("producer_agreement"),
-                "judge_used": meta.get("judge_used"),
-                "judge_reason": meta.get("judge_reason"),
-                "review_flags": meta.get("review_flags", []),
-                "alternates": meta.get("alternates", []),
-            }
-        return summary
-
     def _resolve_list_item_reference(
         self,
         result: AIMedicalScanResponse,
         list_group_meta: dict[str, Any],
         field_path: str,
     ) -> tuple[Any, str] | None:
-        match = re.match(r"^(diagnoses|medicines|other_charges)\[([^\]]+)\]\.([a-z_]+)$", field_path)
+        match = LIST_ITEM_FIELD_PATH_PATTERN.match(field_path)
         if match is None:
             return None
         list_name, slug, field_name = match.groups()
@@ -1325,7 +1390,7 @@ class MedicalExtractionFusionEngine:
         field_path: str,
         value: Any,
     ) -> None:
-        match = re.match(r"^(diagnoses|medicines|other_charges)\[([^\]]+)\]\.([a-z_]+)$", field_path)
+        match = LIST_ITEM_FIELD_PATH_PATTERN.match(field_path)
         if match is None:
             return
         list_name, slug, field_name = match.groups()
@@ -1885,48 +1950,25 @@ class MedicalExtractionFusionEngine:
                 dropped_group_indices=dropped_indices,
                 selected_other_charge_groups=selected_groups,
             )
-
-            self._apply_reconciled_numeric_field(
-                result,
-                "financial_recap.total_medicines",
-                best_subset.get("medicine_total"),
-                field_confidence,
-                corrected_fields,
-                "reconciled from canonical packet ledger",
+            reconciled_field_values = (
+                ("financial_recap.total_medicines", best_subset.get("medicine_total")),
+                ("financial_recap.total_other_charges", best_subset.get("other_total")),
+                ("financial_recap.grand_total", best_subset.get("grand_total")),
+                ("summary.total_amount", best_subset.get("grand_total")),
             )
-            self._apply_reconciled_numeric_field(
-                result,
-                "financial_recap.total_other_charges",
-                best_subset.get("other_total"),
-                field_confidence,
-                corrected_fields,
-                "reconciled from canonical packet ledger",
-            )
-            self._apply_reconciled_numeric_field(
-                result,
-                "financial_recap.grand_total",
-                best_subset.get("grand_total"),
-                field_confidence,
-                corrected_fields,
-                "reconciled from canonical packet ledger",
-            )
-            self._apply_reconciled_numeric_field(
-                result,
-                "summary.total_amount",
-                best_subset.get("grand_total"),
-                field_confidence,
-                corrected_fields,
-                "reconciled from canonical packet ledger",
-            )
+            for field_path, reconciled_value in reconciled_field_values:
+                self._apply_reconciled_numeric_field(
+                    result,
+                    field_path,
+                    cast(float | int | None, reconciled_value),
+                    field_confidence,
+                    corrected_fields,
+                    "reconciled from canonical packet ledger",
+                )
         else:
             price_counted_in_ledger = []
             financial_outlier_suppressions = []
-            for field_path in (
-                "financial_recap.total_medicines",
-                "financial_recap.total_other_charges",
-                "financial_recap.grand_total",
-                "summary.total_amount",
-            ):
+            for field_path in FINANCIAL_TOTAL_FIELD_SEQUENCE[1:] + FINANCIAL_TOTAL_FIELD_SEQUENCE[:1]:
                 await self._maybe_rejudge_field_from_candidates(
                     result,
                     field_path=field_path,
@@ -1964,12 +2006,7 @@ class MedicalExtractionFusionEngine:
 
     def _extract_supported_numeric_targets(self, field_confidence: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         targets: dict[str, list[dict[str, Any]]] = {}
-        for field_path in (
-            "summary.total_amount",
-            "financial_recap.total_medicines",
-            "financial_recap.total_other_charges",
-            "financial_recap.grand_total",
-        ):
+        for field_path in FINANCIAL_TOTAL_FIELD_SEQUENCE:
             meta = field_confidence.get(field_path)
             if not isinstance(meta, dict):
                 continue
@@ -2141,20 +2178,12 @@ class MedicalExtractionFusionEngine:
             return
 
         original_value = self._get_field_value(result, field_path)
-        meta = field_confidence.get(field_path)
-        if original_value is not None and abs(float(original_value) - float(new_value)) < 0.01:
-            if isinstance(meta, dict):
-                self._set_meta_selected_value(
-                    meta,
-                    field_path,
-                    new_value,
-                    min_confidence=0.84,
-                    rule_hit=reason,
-                    review_flag="constraint_adjusted",
-                )
-            return
+        unchanged_within_tolerance = original_value is not None and abs(float(original_value) - float(new_value)) < 0.01
 
-        self._set_field_value(result, field_path, new_value)
+        if not unchanged_within_tolerance:
+            self._set_field_value(result, field_path, new_value)
+
+        meta = field_confidence.get(field_path)
         if isinstance(meta, dict):
             self._set_meta_selected_value(
                 meta,
@@ -2164,6 +2193,10 @@ class MedicalExtractionFusionEngine:
                 rule_hit=reason,
                 review_flag="constraint_adjusted",
             )
+
+        if unchanged_within_tolerance:
+            return
+
         corrected_fields.append(
             {
                 "field_path": field_path,

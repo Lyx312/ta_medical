@@ -22,6 +22,8 @@ from app.main import create_app
 from app.models.ai_model import AIModel
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
+from app.services import ai_service as ai_service_module
+from app.services.ai_ensemble import MedicalExtractionFusionEngine
 from app.services.ai_service import (
     AIModelSpec,
     DocumentImageInput,
@@ -1092,6 +1094,66 @@ def test_process_uses_judge_for_service_date_conflict(
     assert result.extraction_meta_payload["judge_invocations"][0]["field_path"] == "summary.service_date"
 
 
+def test_process_does_not_invoke_judge_for_equivalent_service_date_formats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "summary": {
+                    **SCAN_RESULT["summary"],
+                    "service_date": "2024-08-10" if self.model_name == "model-a" else "10/08/2024",
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def fail_if_called(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        raise AssertionError("Judge should not be used when service dates normalize to the same key.")
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", fail_if_called)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.summary.service_date == "2024-08-10"
+    assert result.field_confidence["summary.service_date"]["judge_used"] is False
+    assert result.extraction_meta_payload["judge_invocations"] == []
+
+
 def test_process_keeps_transaction_date_null_when_not_explicitly_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1248,6 +1310,204 @@ def test_process_prefers_null_gender_when_competing_labels_are_ambiguous(
 
     assert result.result.patient_info.gender is None
     assert "prefer null over inferred gender when model support is ambiguous" in result.field_confidence["patient_info.gender"]["rule_hits"]
+
+
+def test_process_keeps_explicit_gender_when_null_support_is_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    # Keep the test deterministic with one run per model and 5 producers:
+    # male=2, female=2, null=1 => null support ratio = 0.2 (< 0.25 threshold).
+    monkeypatch.setattr(ai_service_module, "AI_EXTRACTION_RUNS_PER_MODEL", 1)
+    monkeypatch.setattr(ai_service_module, "AI_EXTRACTION_MAX_PRODUCERS", 5)
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            if self.model_name in {"model-a", "model-c"}:
+                gender_value = "Pria"
+            elif self.model_name in {"model-b", "model-d"}:
+                gender_value = "Wanita"
+            else:
+                gender_value = None
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "gender": gender_value,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+            AIModelSpec(provider="google_genai", model="model-c"),
+            AIModelSpec(provider="google_genai", model="model-d"),
+            AIModelSpec(provider="google_genai", model="model-e"),
+        ],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.gender in {"MALE", "FEMALE"}
+    assert "prefer null over inferred gender when model support is ambiguous" not in result.field_confidence["patient_info.gender"]["rule_hits"]
+
+
+def test_reconciliation_deferral_guard_does_not_trigger_below_delta_threshold() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    supported_targets = {
+        "summary.total_amount": [
+            {"value": 125000, "support_count": 5, "producer_count": 0},
+            {"value": 168000, "support_count": 1, "producer_count": 0},
+            {"value": 200000, "support_count": 1, "producer_count": 0},
+        ],
+        "financial_recap.grand_total": [
+            {"value": 125000, "support_count": 4, "producer_count": 0},
+        ],
+    }
+
+    below_threshold_subset = {
+        "grand_total": 168000,  # relative delta = 0.344 < 0.35
+        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
+        "dropped_group_indices": [0],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=below_threshold_subset,
+        supported_targets=supported_targets,
+    ) is False
+
+    above_threshold_subset = {
+        "grand_total": 200000,  # relative delta = 0.6 > 0.35
+        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
+        "dropped_group_indices": [0],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=above_threshold_subset,
+        supported_targets=supported_targets,
+    ) is True
+
+
+def test_reconciliation_deferral_guard_support_threshold_boundary() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+    supported_targets = {
+        "summary.total_amount": [
+            {"value": 125000, "support_count": 5, "producer_count": 0},
+            {"value": 200000, "support_count": 1, "producer_count": 0},
+        ],
+        "financial_recap.grand_total": [
+            {"value": 125000, "support_count": 4, "producer_count": 0},
+        ],
+    }
+
+    at_threshold_subset = {
+        "grand_total": 200000,
+        "canonical_medicine_source": {"support_count": 2, "producer_count": 1},  # support score = 2.2
+        "dropped_group_indices": [0],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=at_threshold_subset,
+        supported_targets=supported_targets,
+    ) is True
+
+    above_threshold_subset = {
+        "grand_total": 200000,
+        "canonical_medicine_source": {"support_count": 2, "producer_count": 2},  # support score = 2.4
+        "dropped_group_indices": [0],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=above_threshold_subset,
+        supported_targets=supported_targets,
+    ) is False
+
+
+def test_reconciliation_deferral_guard_drop_count_threshold_boundary() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+    supported_targets = {
+        "summary.total_amount": [
+            {"value": 125000, "support_count": 5, "producer_count": 0},
+            {"value": 200000, "support_count": 1, "producer_count": 0},
+        ],
+        "financial_recap.grand_total": [
+            {"value": 125000, "support_count": 4, "producer_count": 0},
+        ],
+    }
+
+    below_drop_threshold_subset = {
+        "grand_total": 200000,
+        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
+        "dropped_group_indices": [],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=below_drop_threshold_subset,
+        supported_targets=supported_targets,
+    ) is False
+
+    at_drop_threshold_subset = {
+        "grand_total": 200000,
+        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
+        "dropped_group_indices": [0],
+    }
+    assert engine._should_defer_coherent_financial_override(
+        result=result,
+        best_subset=at_drop_threshold_subset,
+        supported_targets=supported_targets,
+    ) is True
 
 
 def test_process_normalizes_explicit_gender_labels_to_canonical_enum(

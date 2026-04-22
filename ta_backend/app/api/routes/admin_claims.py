@@ -106,6 +106,8 @@ async def get_admin_claim(
             detail="Claim not found.",
         )
 
+    source_scan_log = getattr(claim, "source_scan_log", None)
+
     return AdminClaimDetailResponse(
         id=claim.id,
         user_id=claim.user_id,
@@ -123,6 +125,9 @@ async def get_admin_claim(
         file_count=len(claim.files),
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,
+        source_scan_extraction_payload=(
+            source_scan_log.extraction_payload if source_scan_log is not None else None
+        ),
         created_at=claim.created_at,
         files=[
             AdminClaimFileResponse(

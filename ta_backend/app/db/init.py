@@ -79,6 +79,7 @@ def initialize_database() -> None:
     ensure_ai_model_schema()
     ensure_scan_log_schema()
     ensure_claim_schema()
+    ensure_claim_medicine_knowledge_schema()
     seed_default_admin()
     seed_default_ai_models()
 
@@ -200,6 +201,58 @@ def ensure_claim_schema() -> None:
                     """
                 )
             )
+
+
+def ensure_claim_medicine_knowledge_schema() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    if "claim_medicine_knowledge" in tables:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE claim_medicine_knowledge (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    context_signature VARCHAR(64) NOT NULL,
+                    medicine_name_normalized VARCHAR(255) NOT NULL,
+                    diagnosis_text_normalized TEXT NOT NULL,
+                    anamnesis_text_normalized TEXT NOT NULL,
+                    diagnosis_terms_json JSON NOT NULL,
+                    anamnesis_terms_json JSON NOT NULL,
+                    support_count INTEGER NOT NULL DEFAULT 0,
+                    relevant_count REAL NOT NULL DEFAULT 0,
+                    uncertain_count REAL NOT NULL DEFAULT 0,
+                    not_relevant_count REAL NOT NULL DEFAULT 0,
+                    avg_confidence REAL NOT NULL DEFAULT 0,
+                    last_reason TEXT,
+                    last_decision_source VARCHAR(32) NOT NULL DEFAULT 'heuristic_fallback',
+                    first_seen_claim_id INTEGER,
+                    last_seen_claim_id INTEGER,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at DATETIME,
+                    CONSTRAINT uq_claim_medicine_knowledge_context_medicine
+                        UNIQUE(context_signature, medicine_name_normalized)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_claim_medicine_knowledge_medicine_name_normalized "
+                "ON claim_medicine_knowledge(medicine_name_normalized)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_claim_medicine_knowledge_updated_at "
+                "ON claim_medicine_knowledge(updated_at)"
+            )
+        )
 
 
 def _ensure_scan_log_ai_runs_table(engine: Any, inspector: Any) -> None:

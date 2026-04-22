@@ -15,11 +15,11 @@ from app.db.session import get_db_session
 from app.repositories.claim_repository import ClaimFileCreate, ClaimRepository
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.auth import TokenData
-from app.schemas.claim import ClaimMedicine, ClaimMedicineInput, ClaimResponse, parse_claim_date
+from app.schemas.claim import ClaimDetailResponse, ClaimMedicine, ClaimMedicineInput, ClaimResponse, parse_claim_date
 from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
 from app.services.ai_service import build_patient_name_verification_error
 from app.services.ai_service import matches_any_patient_name_candidate
-from app.services.claim_medicine_relevance import evaluate_claim_medicines
+from app.services.claim_medicine_relevance import evaluate_claim_medicines, persist_claim_medicine_knowledge
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/claims", tags=["claims"])
@@ -62,6 +62,39 @@ def build_claim_response(claim: Any) -> ClaimResponse:
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,
         created_at=claim.created_at,
+    )
+
+
+def build_claim_detail_response(claim: Any) -> ClaimDetailResponse:
+    medicines_payload = claim.medicines_payload if isinstance(claim.medicines_payload, list) else []
+    try:
+        medicines = claim_medicines_adapter.validate_python(medicines_payload)
+    except ValidationError:
+        medicines = []
+
+    source_scan_log = getattr(claim, "source_scan_log", None)
+
+    return ClaimDetailResponse(
+        id=claim.id,
+        user_id=claim.user_id,
+        user_email=claim.user_email,
+        nama_pasien=claim.nama_pasien,
+        tanggal_pelayanan=claim.tanggal_pelayanan,
+        fasilitas_kesehatan=claim.fasilitas_kesehatan,
+        jenis_manfaat=claim.jenis_manfaat,
+        nominal_klaim=claim.nominal_klaim,
+        keterangan_penyakit=claim.keterangan_penyakit,
+        kronologi=claim.kronologi,
+        medicines=medicines,
+        requires_additional_review=bool(claim.requires_additional_review),
+        review_note=claim.review_note,
+        file_count=len(claim.files),
+        status=claim.status,
+        source_scan_log_id=claim.source_scan_log_id,
+        created_at=claim.created_at,
+        source_scan_extraction_payload=(
+            source_scan_log.extraction_payload if source_scan_log is not None else None
+        ),
     )
 
 
@@ -192,7 +225,7 @@ def parse_claim_medicines_payload(raw_payload: str | None) -> list[ClaimMedicine
     return normalized
 
 
-@router.post("", response_model=ClaimResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=ClaimDetailResponse, status_code=status.HTTP_201_CREATED)
 async def create_claim(
     token_data: TokenData = Depends(get_current_user_dependency),
     db: Session = Depends(get_db_session),
@@ -206,7 +239,7 @@ async def create_claim(
     medicines_payload: str | None = Form(default=None),
     source_scan_log_id: int | None = Form(default=None),
     files: list[UploadFile] = File(default=[]),
-) -> ClaimResponse:
+) -> ClaimDetailResponse:
     valid_types = ["rawat_jalan", "rawat_inap", "emergency", "maternity"]
     if jenis_manfaat not in valid_types:
         raise HTTPException(
@@ -223,10 +256,12 @@ async def create_claim(
         ) from exc
 
     medicines_input = parse_claim_medicines_payload(medicines_payload)
-    evaluated_medicines, requires_additional_review, review_note = evaluate_claim_medicines(
+    evaluated_medicines, requires_additional_review, review_note = await evaluate_claim_medicines(
+        db,
         medicines_input,
         keterangan_penyakit,
         kronologi,
+        persist=False,
     )
 
     buffered_uploads = await read_uploaded_files(files)
@@ -307,7 +342,17 @@ async def create_claim(
         ],
     )
 
-    return build_claim_response(claim)
+    if evaluated_medicines:
+        persist_claim_medicine_knowledge(
+            db,
+            evaluated_medicines,
+            keterangan_penyakit,
+            kronologi,
+            claim_id=claim.id,
+        )
+        db.commit()
+
+    return build_claim_detail_response(claim)
 
 
 @router.get("", response_model=list[ClaimResponse])
@@ -320,12 +365,12 @@ async def get_claims(
     return [build_claim_response(claim) for claim in claims]
 
 
-@router.get("/{claim_id}", response_model=ClaimResponse)
+@router.get("/{claim_id}", response_model=ClaimDetailResponse)
 async def get_claim(
     claim_id: int,
     token_data: TokenData = Depends(get_current_user_dependency),
     db: Session = Depends(get_db_session),
-) -> ClaimResponse:
+) -> ClaimDetailResponse:
     claim_repository = ClaimRepository(db)
     claim = claim_repository.get_by_id(claim_id)
     if claim is None:
@@ -339,4 +384,4 @@ async def get_claim(
             detail="You do not have permission to view this claim.",
         )
 
-    return build_claim_response(claim)
+    return build_claim_detail_response(claim)

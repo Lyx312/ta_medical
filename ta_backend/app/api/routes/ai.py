@@ -24,11 +24,20 @@ from app.services.ai_service import (
     MedicalDocumentProcessor,
     matches_any_patient_name_candidate,
 )
+from app.services.scan_medicine_prioritization import prioritize_scan_medicines
 from app.services.image_preprocessing import preprocess_document_image
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 processor = MedicalDocumentProcessor(settings=get_settings())
 validation_processor = DocumentValidationProcessor(settings=get_settings())
+
+
+def resolve_medicine_interpretation_mode(*, token_data: TokenData) -> str:
+    settings = get_settings()
+    app_env = (settings.app_env or "").strip().casefold()
+    if app_env in {"dev", "test"}:
+        return "auto_correct_guarded"
+    return "suggest_only"
 
 
 @dataclass(frozen=True)
@@ -319,6 +328,27 @@ async def scan_documents(
         extraction_payload = cast(dict[str, Any], sanitize_json_compatible(extraction_result.result.model_dump()))
         extraction_result_payload = AIMedicalScanResponse.model_validate(extraction_payload)
         extraction_meta_payload = extraction_result.extraction_meta_payload
+        try:
+            prioritized_result, prioritization_log = await prioritize_scan_medicines(
+                db,
+                extraction_result_payload,
+                extraction_meta_payload,
+                images=images,
+                interpretation_mode=resolve_medicine_interpretation_mode(token_data=token_data),
+            )
+            extraction_result_payload = prioritized_result
+            extraction_payload = cast(dict[str, Any], sanitize_json_compatible(prioritized_result.model_dump()))
+            if extraction_meta_payload is None:
+                extraction_meta_payload = {}
+            extraction_meta_payload["medicine_postprocess"] = prioritization_log
+        except Exception as prioritization_exc:  # noqa: BLE001
+            if extraction_meta_payload is None:
+                extraction_meta_payload = {}
+            extraction_meta_payload["medicine_postprocess"] = {
+                "enabled": True,
+                "applied": False,
+                "error": str(prioritization_exc) or prioritization_exc.__class__.__name__,
+            }
         ai_runs = extraction_result.ai_runs
         primary_model_provider = extraction_result.primary_model_provider
         primary_model_name = extraction_result.primary_model_name

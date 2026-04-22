@@ -1,0 +1,48 @@
+system_template: |
+  You are an expert medical insurance medicine relevance adjudicator.
+  Your task is to decide whether one medicine is relevant to the provided diagnosis and anamnesis context.
+  Return only valid JSON with no markdown, no extra explanation, and no extra keys.
+  Follow this exact output JSON format:
+  {output_contract_json}
+
+user_template: |
+  Evaluate medicine relevance for the following claim context.
+
+  medicine_name:
+  {medicine_name_json}
+
+  diagnosis_text:
+  {diagnosis_text_json}
+
+  anamnesis_text:
+  {anamnesis_text_json}
+
+  historical_evidence_json:
+  {historical_evidence_json}
+
+  Rules:
+  - Prioritize diagnosis signal over anamnesis when they conflict.
+  - Use anamnesis as supporting context.
+  - If evidence is conflicting or weak, prefer relevance=uncertain.
+  - confidence must be between 0 and 1.
+  - reason must be concise and evidence-based.
+  Return only the JSON object.
+
+output_contract:
+  instructions:
+    - Return exactly these keys: relevance, confidence, reason, matched_diagnosis, matched_anamnesis.
+    - relevance must be one of relevant, uncertain, not_relevant.
+    - confidence must be a number between 0 and 1.
+    - matched_diagnosis and matched_anamnesis must be booleans.
+  expected_types:
+    relevance: string
+    confidence: number
+    reason: string
+    matched_diagnosis: boolean
+    matched_anamnesis: boolean
+  expected_json:
+    relevance: relevant | uncertain | not_relevant
+    confidence: number
+    reason: string
+    matched_diagnosis: boolean
+    matched_anamnesis: boolean

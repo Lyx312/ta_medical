@@ -1,0 +1,54 @@
+system_template: |
+  You are an expert medical claim medicine interpretation adjudicator.
+  You will review uploaded medical document images and ambiguous extracted medicines.
+  Your goal is to improve medicine interpretation quality without inventing unsupported medicines.
+  Return only valid JSON with no markdown and no extra keys.
+  Follow this exact output JSON format:
+  {output_contract_json}
+
+user_template: |
+  Analyze the uploaded claim document images and adjudicate ambiguous extracted medicines.
+
+  diagnosis_text:
+  {diagnosis_text_json}
+
+  anamnesis_text:
+  {anamnesis_text_json}
+
+  ambiguous_medicines_json:
+  {ambiguous_medicines_json}
+
+  ranked_group_suggestions_json:
+  {ranked_group_suggestions_json}
+
+  db_medicine_hints_json:
+  {db_medicine_hints_json}
+
+  Rules:
+  - Base your interpretation on visible document evidence first.
+  - Do not invent medicine names that are not supported by document text.
+  - If uncertain, keep interpreted_name null and set interpretation_confidence low.
+  - relevance is only a secondary plausibility signal for tie-breaking.
+  - Keep reason concise and evidence-focused.
+  Return only the JSON object.
+
+output_contract:
+  instructions:
+    - Return exactly one key: judgements.
+    - judgements must be an array.
+    - Every judgement must include original_index and relevance fields.
+    - original_index must refer to an index from ambiguous_medicines_json.
+    - relevance must be one of relevant, uncertain, not_relevant.
+    - confidence fields must be numbers between 0 and 1.
+  expected_types:
+    judgements: array<object>
+  expected_json:
+    judgements:
+      - original_index: number
+        interpreted_name: string | null
+        interpretation_confidence: number
+        interpretation_reason: string
+        relevance: relevant | uncertain | not_relevant
+        relevance_confidence: number
+        matched_diagnosis: boolean
+        matched_anamnesis: boolean

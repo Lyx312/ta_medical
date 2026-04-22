@@ -2,6 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app.schemas.claim import ClaimDetailResponse
 from app.schemas.claim import ClaimResponse
 
 
@@ -14,7 +15,7 @@ class AdminClaimFileResponse(BaseModel):
     file_data_url: str
 
 
-class AdminClaimDetailResponse(ClaimResponse):
+class AdminClaimDetailResponse(ClaimDetailResponse):
     files: list[AdminClaimFileResponse]
     metadata: dict[str, Any] | None = None
 

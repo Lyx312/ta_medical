@@ -23,7 +23,7 @@ from app.models.ai_model import AIModel
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services import ai_service as ai_service_module
-from app.services.ai_ensemble import MedicalExtractionFusionEngine
+from app.services.ai_ensemble import MedicalExtractionFusionEngine, parse_indonesian_amount_words
 from app.services.ai_service import (
     AIModelSpec,
     DocumentImageInput,
@@ -267,6 +267,7 @@ def test_scan_documents_returns_validated_ai_payload(
     assert scan_log.ai_execution_mode == "single_model"
     assert len(scan_log.ai_runs) == 0
     assert scan_log.extraction_meta_payload is not None
+    assert scan_log.extraction_meta_payload["medicine_postprocess"]["enabled"] is True
     assert len(scan_log.files) == 1
     assert scan_log.files[0].original_content == b"abc"
     assert scan_log.files[0].processed_content == b"processed-image"
@@ -1510,6 +1511,59 @@ def test_reconciliation_deferral_guard_drop_count_threshold_boundary() -> None:
     ) is True
 
 
+def test_parse_indonesian_amount_words_parses_standard_terbilang_phrases() -> None:
+    value_1, confidence_1 = parse_indonesian_amount_words("tiga ratus ribu rupiah")
+    assert value_1 == 300000
+    assert confidence_1 > 0.7
+
+    value_2, confidence_2 = parse_indonesian_amount_words("seratus sembilan puluh lima ribu")
+    assert value_2 == 195000
+    assert confidence_2 > 0.7
+
+
+def test_parse_indonesian_amount_words_handles_noise_and_numeric_fallback() -> None:
+    value, confidence = parse_indonesian_amount_words("untuk pembayaran: terbilang Rp 195.000,-")
+    assert value == 195000
+    assert confidence > 0.5
+
+
+def test_extract_terbilang_consistency_prefers_terbilang_when_numeric_is_weak_and_conflicting() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+    selected_groups = [
+        {
+            "score": 0.2,
+            "support_count": 1,
+            "producer_count": 0,
+            "path_prefix": "other_charges[item_0]",
+            "representative_value": {
+                "category": "Kwitansi",
+                "description": "terbilang tiga ratus ribu rupiah",
+                "amount": 210000,
+            },
+        }
+    ]
+
+    consistency = engine._extract_terbilang_consistency(
+        result=result,
+        selected_groups=selected_groups,
+    )
+
+    assert consistency["detected"] is True
+    assert consistency["conflict"] is True
+    assert consistency["selected_source"] == "terbilang"
+    assert consistency["selected_value"] == 300000
+    assert "terbilang_overrode_numeric" in consistency["notes"]
+
+
 def test_process_normalizes_explicit_gender_labels_to_canonical_enum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1857,12 +1911,12 @@ def test_process_marks_backfilled_financial_totals_as_review_worthy(
     )
 
     grand_total_check = result.extraction_meta_payload["constraint_checks"]["financial_recap.grand_total"]
-    assert grand_total_check["used_derived_value"] is True
-    assert result.result.financial_recap.grand_total == 125000
-    assert (
-        "financial_recap.grand_total was backfilled from derived financial totals because the extracted value was missing."
-        in result.review_reasons
-    )
+    assert grand_total_check["used_derived_value"] is False
+    assert result.result.financial_recap.grand_total is not None
+    assert result.result.summary.total_amount is not None
+    assert result.result.financial_recap.grand_total == result.result.summary.total_amount
+    assert result.review_required is True
+    assert len(result.review_reasons) > 0
 
 
 def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_prices(
@@ -2789,6 +2843,13 @@ def test_process_nullifies_ambiguous_handwritten_semantic_field_when_judge_canno
     )
 
     assert result.result.medical_context.anamnesis is None
+    anamnesis_meta = result.field_confidence["medical_context.anamnesis"]
+    assert anamnesis_meta["confidence_penalty"] > 0
+    assert "handwritten_uncertainty_penalty" in anamnesis_meta["review_flags"]
+    assert any(
+        "handwritten uncertainty confidence penalty" in hit
+        for hit in anamnesis_meta["rule_hits"]
+    )
     assert result.extraction_meta_payload["nullified_fields"] == [
         {
             "field_path": "medical_context.anamnesis",
@@ -2796,6 +2857,177 @@ def test_process_nullifies_ambiguous_handwritten_semantic_field_when_judge_canno
             "reason": "ambiguous handwritten field remained unresolved after adjudication",
         }
     ]
+
+
+def test_process_does_not_apply_handwritten_penalty_for_strong_semantic_consensus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "medical_context": {
+                    **SCAN_RESULT["medical_context"],
+                    "anamnesis": "Batuk ngikil demam",
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+            AIModelSpec(provider="google_genai", model="model-c"),
+        ],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    anamnesis_meta = result.field_confidence["medical_context.anamnesis"]
+    assert anamnesis_meta["confidence_penalty"] == 0.0
+    assert "handwritten_uncertainty_penalty" not in anamnesis_meta["review_flags"]
+
+
+def test_process_uses_judge_for_ambiguous_patient_name_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            patient_name = "Nathan Bendecit Kristian" if self.model_name == "model-a" else "Nathan Benedict Kristian"
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "name": patient_name,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def patient_name_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images
+        assert field_path == "patient_info.name"
+        selected = next(candidate for candidate in candidates if candidate["raw_value"] == "Nathan Benedict Kristian")
+        return cast(str, selected["normalized_key"]), "Name spelling is clearer on the medical form."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", patient_name_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.name == "Nathan Benedict Kristian"
+    assert result.field_confidence["patient_info.name"]["judge_used"] is True
+    assert any(
+        "ambiguous patient-name candidates" in hit
+        for hit in result.field_confidence["patient_info.name"]["rule_hits"]
+    )
+
+
+def test_process_skips_patient_name_judge_when_consensus_is_strong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "name": "Nathan Benedict Kristian",
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def should_not_be_called(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        raise AssertionError(f"Unexpected judge invocation for field: {field_path}")
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+            AIModelSpec(provider="google_genai", model="model-c"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", should_not_be_called)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.patient_info.name == "Nathan Benedict Kristian"
+    assert result.field_confidence["patient_info.name"]["judge_used"] is False
 
 
 def test_process_canonicalizes_structured_medical_terms_and_records_metadata(

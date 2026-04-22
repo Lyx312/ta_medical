@@ -1,7 +1,7 @@
 import { getJson, postFormData } from './client';
-import type { ClaimResponse, CreateClaimPayload } from './types';
+import type { ClaimDetailResponse, ClaimResponse, CreateClaimPayload } from './types';
 
-export async function createClaim(payload: CreateClaimPayload): Promise<ClaimResponse> {
+export async function createClaim(payload: CreateClaimPayload): Promise<ClaimDetailResponse> {
   const formData = new FormData();
 
   formData.append('nama_pasien', payload.nama_pasien);
@@ -29,13 +29,13 @@ export async function createClaim(payload: CreateClaimPayload): Promise<ClaimRes
     } as never);
   }
 
-  return postFormData<ClaimResponse>('/claims', formData, true);
+  return postFormData<ClaimDetailResponse>('/claims', formData, true);
 }
 
 export function getClaims(): Promise<ClaimResponse[]> {
   return getJson<ClaimResponse[]>('/claims', true);
 }
 
-export function getClaim(claimId: number): Promise<ClaimResponse> {
-  return getJson<ClaimResponse>(`/claims/${claimId}`, true);
+export function getClaim(claimId: number): Promise<ClaimDetailResponse> {
+  return getJson<ClaimDetailResponse>(`/claims/${claimId}`, true);
 }

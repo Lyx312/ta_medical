@@ -87,6 +87,7 @@ export type ClaimMedicineEvaluation = {
   reason: string;
   matched_diagnosis: boolean;
   matched_anamnesis: boolean;
+  decision_source?: 'history_strong' | 'llm_judge' | 'heuristic_fallback' | null;
 };
 
 export type ClaimMedicine = ClaimMedicineInput & {
@@ -144,6 +145,10 @@ export type ClaimResponse = {
   created_at: string;
 };
 
+export type ClaimDetailResponse = ClaimResponse & {
+  source_scan_extraction_payload?: Record<string, unknown> | null;
+};
+
 export type AdminClaimFile = {
   id: number;
   filename: string;
@@ -153,7 +158,7 @@ export type AdminClaimFile = {
   file_data_url: string;
 };
 
-export type AdminClaimDetail = ClaimResponse & {
+export type AdminClaimDetail = ClaimDetailResponse & {
   files: AdminClaimFile[];
   metadata?: Record<string, unknown> | null;
 };

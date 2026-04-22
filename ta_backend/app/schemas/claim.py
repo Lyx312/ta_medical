@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
@@ -27,6 +28,7 @@ class ClaimMedicineEvaluation(BaseModel):
     reason: str = Field(min_length=1)
     matched_diagnosis: bool
     matched_anamnesis: bool
+    decision_source: Literal["history_strong", "llm_judge", "heuristic_fallback"] | None = None
 
 
 class ClaimMedicine(ClaimMedicineInput):
@@ -71,3 +73,7 @@ class ClaimResponse(BaseModel):
     @field_serializer("tanggal_pelayanan")
     def serialize_tanggal_pelayanan(self, value: date) -> str:
         return value.strftime(CLAIM_DATE_FORMAT)
+
+
+class ClaimDetailResponse(ClaimResponse):
+    source_scan_extraction_payload: dict[str, Any] | None = None

@@ -139,6 +139,7 @@ def test_admin_can_list_and_view_claims_with_documents(
     assert len(list_payload) == 1
     assert list_payload[0]["id"] == claim_id
     assert list_payload[0]["file_count"] == 1
+    assert "source_scan_extraction_payload" not in list_payload[0]
 
     detail_response = client.get(
         f"/api/admin/claims/{claim_id}",
@@ -150,6 +151,7 @@ def test_admin_can_list_and_view_claims_with_documents(
     assert detail_payload["files"][0]["filename"] == "receipt.png"
     assert detail_payload["files"][0]["mime_type"] == "image/png"
     assert detail_payload["files"][0]["file_data_url"].startswith("data:image/png;base64,")
+    assert detail_payload["source_scan_extraction_payload"] is None
 
 
 def test_non_admin_cannot_access_admin_claim_routes(
@@ -317,6 +319,16 @@ def test_admin_claim_filters_and_summary(
     linked_payload = linked_list_response.json()
     assert len(linked_payload) == 1
     assert linked_payload[0]["source_scan_log_id"] == scan_log_id
+    assert "source_scan_extraction_payload" not in linked_payload[0]
+
+    linked_detail_response = client.get(
+        f"/api/admin/claims/{linked_payload[0]['id']}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert linked_detail_response.status_code == 200
+    linked_detail = linked_detail_response.json()
+    assert linked_detail["source_scan_extraction_payload"] is not None
+    assert linked_detail["source_scan_extraction_payload"]["summary"]["medical_facility_name"] == "RS Sehat Sentosa"
 
     manual_search_response = client.get(
         "/api/admin/claims?linked=false&q=Budi",

@@ -16,6 +16,10 @@ user_template: |
   If multiple dates appear across the packet, do not simply choose the latest receipt date.
   Use the consultation/treatment date for service_date whenever the documents support it.
   Extract summary.total_amount as the grand total for the full uploaded claim packet, not just one receipt, unless the packet clearly contains only one billed document.
+  When amount-in-words text (e.g., "terbilang") appears, use it as a consistency aid for numeric totals.
+  Cross-check terbilang wording with visible numeric amount boxes (e.g., "Jumlah Rp", "Total", "Grand Total").
+  If terbilang and numeric cues conflict, keep both clues in consideration and avoid inventing a new number.
+  Prefer explicit numeric totals that are clearly printed or boxed, unless terbilang wording is clearly more reliable.
   Keep summary.transaction_date null unless a distinct payment or billing date is explicitly visible in the documents.
   Known patient name candidates for this user: {patient_name_candidates_json}
   Use the candidate names only as hints to disambiguate patient names found in the documents.

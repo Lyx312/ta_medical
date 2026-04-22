@@ -20,10 +20,6 @@ from app.schemas.ai import (
     AIScanSummary,
 )
 from app.services.ai_ensemble_config import (
-    AI_EXTRACTION_MAX_PRODUCERS,
-    AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
-    AI_EXTRACTION_RUNS_PER_MODEL,
-    AI_EXTRACTION_TEMPERATURE,
     CALIBRATION_VERSION,
     CONSULTATION_KEYWORDS,
     CRITICAL_FIELD_PATHS,
@@ -35,9 +31,15 @@ from app.services.ai_ensemble_config import (
     GENDER_AMBIGUITY_MARGIN_THRESHOLD,
     GENDER_NULL_SUPPORT_RATIO_THRESHOLD,
     HANDWRITTEN_DIVERGENCE_THRESHOLD,
+    HANDWRITTEN_UNCERTAINTY_CONFIDENCE_PENALTY,
+    HANDWRITTEN_UNCERTAINTY_MARGIN_THRESHOLD,
+    HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD,
     MEDICINE_PRIMARY_COUNT_BUFFER,
     MEDICINE_PRIMARY_COUNT_SOFT_CAP,
     MEDICINE_SPLIT_COMPONENT_MIN,
+    PATIENT_NAME_JUDGE_MARGIN_THRESHOLD,
+    PATIENT_NAME_JUDGE_MAX_WINNER_PRODUCER_COUNT,
+    PATIENT_NAME_JUDGE_MAX_WINNER_SUPPORT_COUNT,
     NON_CRITICAL_FIELD_THRESHOLD,
     NUMERIC_FIELD_PATHS,
     OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
@@ -58,12 +60,39 @@ from app.services.ai_ensemble_config import (
 COMPOUND_MEDICINE_SPLIT_PATTERN = re.compile(r",|\+|/|&|\bdan\b", re.IGNORECASE)
 ALPHANUMERIC_TOKEN_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
 LIST_ITEM_FIELD_PATH_PATTERN = re.compile(r"^(diagnoses|medicines|other_charges)\[([^\]]+)\]\.([a-z_]+)$")
+TERBILANG_MATCH_PATTERN = re.compile(r"\b(?:terbilang|rupiah)\b", re.IGNORECASE)
 FINANCIAL_TOTAL_FIELD_SEQUENCE = (
     "summary.total_amount",
     "financial_recap.total_medicines",
     "financial_recap.total_other_charges",
     "financial_recap.grand_total",
 )
+TERBILANG_CONFLICT_TOLERANCE_RATIO = 0.01
+TERBILANG_CONFLICT_TOLERANCE_ABSOLUTE = 5000.0
+TERBILANG_OVERRIDE_MARGIN = 0.15
+
+INDONESIAN_NUMBER_WORDS: dict[str, int] = {
+    "nol": 0,
+    "satu": 1,
+    "dua": 2,
+    "tiga": 3,
+    "empat": 4,
+    "lima": 5,
+    "enam": 6,
+    "tujuh": 7,
+    "delapan": 8,
+    "sembilan": 9,
+    "sepuluh": 10,
+    "sebelas": 11,
+}
+INDONESIAN_SCALE_WORDS = {"belas", "puluh", "ratus", "ribu", "juta"}
+INDONESIAN_IGNORED_AMOUNT_WORDS = {"rupiah", "rp", "terbilang", "dan"}
+INDONESIAN_ALIAS_WORD_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "seratus": ("satu", "ratus"),
+    "seribu": ("satu", "ribu"),
+    "sejuta": ("satu", "juta"),
+}
+INDONESIAN_WORD_TOKEN_PATTERN = re.compile(r"[a-z]+", re.IGNORECASE)
 
 
 def contains_keyword(text: str, keywords: Collection[str]) -> bool:
@@ -188,6 +217,183 @@ def extract_other_charge_descriptor_signature(category: Any, description: Any) -
     return category_key if category_key != "__null__" else "other"
 
 
+def _tokenize_indonesian_amount_text(text: str) -> list[str]:
+    raw_tokens = INDONESIAN_WORD_TOKEN_PATTERN.findall(normalize_whitespace(text).casefold())
+    normalized_tokens: list[str] = []
+    for token in raw_tokens:
+        expansion = INDONESIAN_ALIAS_WORD_EXPANSIONS.get(token)
+        if expansion is not None:
+            normalized_tokens.extend(expansion)
+            continue
+        normalized_tokens.append(token)
+    return normalized_tokens
+
+
+def _extract_indonesian_number_sequences(tokens: list[str]) -> list[list[str]]:
+    number_words = set(INDONESIAN_NUMBER_WORDS) | INDONESIAN_SCALE_WORDS
+    sequences: list[list[str]] = []
+    current_sequence: list[str] = []
+
+    for token in tokens:
+        if token in number_words:
+            current_sequence.append(token)
+            continue
+        if token in INDONESIAN_IGNORED_AMOUNT_WORDS:
+            continue
+        if current_sequence:
+            sequences.append(current_sequence)
+            current_sequence = []
+
+    if current_sequence:
+        sequences.append(current_sequence)
+
+    return sequences
+
+
+def _parse_indonesian_sub_thousand(tokens: list[str]) -> tuple[int | None, int]:
+    if not tokens:
+        return 0, 0
+
+    units_0_to_9 = {
+        token: value
+        for token, value in INDONESIAN_NUMBER_WORDS.items()
+        if 0 <= value <= 9
+    }
+    units_1_to_9 = {
+        token: value
+        for token, value in INDONESIAN_NUMBER_WORDS.items()
+        if 1 <= value <= 9
+    }
+
+    index = 0
+    value = 0
+    consumed = 0
+
+    if tokens[index:index + 1] == ["ratus"]:
+        value += 100
+        index += 1
+        consumed += 1
+    elif index + 1 < len(tokens) and tokens[index] in units_1_to_9 and tokens[index + 1] == "ratus":
+        value += units_1_to_9[tokens[index]] * 100
+        index += 2
+        consumed += 2
+
+    if index < len(tokens):
+        token = tokens[index]
+        if token == "sepuluh":
+            value += 10
+            index += 1
+            consumed += 1
+        elif token == "sebelas":
+            value += 11
+            index += 1
+            consumed += 1
+        elif index + 1 < len(tokens) and token in units_1_to_9 and tokens[index + 1] == "belas":
+            value += units_1_to_9[token] + 10
+            index += 2
+            consumed += 2
+        elif index + 1 < len(tokens) and token in units_1_to_9 and tokens[index + 1] == "puluh":
+            value += units_1_to_9[token] * 10
+            index += 2
+            consumed += 2
+            if index < len(tokens) and tokens[index] in units_0_to_9:
+                value += units_0_to_9[tokens[index]]
+                index += 1
+                consumed += 1
+        elif token in units_0_to_9:
+            value += units_0_to_9[token]
+            index += 1
+            consumed += 1
+
+    if index != len(tokens):
+        return None, 0
+
+    return value, consumed
+
+
+def _parse_indonesian_number_sequence(tokens: list[str]) -> tuple[int | None, int]:
+    if not tokens:
+        return None, 0
+
+    scale_values = {
+        "juta": 1_000_000,
+        "ribu": 1_000,
+    }
+    total = 0
+    consumed = 0
+    previous_scale = 10_000_000
+    chunk_tokens: list[str] = []
+
+    for token in tokens:
+        if token not in scale_values:
+            chunk_tokens.append(token)
+            continue
+
+        scale = scale_values[token]
+        if scale >= previous_scale:
+            return None, 0
+
+        chunk_value, chunk_consumed = _parse_indonesian_sub_thousand(chunk_tokens)
+        if chunk_tokens and chunk_value is None:
+            return None, 0
+
+        if chunk_consumed > 0:
+            if chunk_value is None:
+                return None, 0
+            multiplier = chunk_value
+        else:
+            multiplier = 1
+        total += multiplier * scale
+        consumed += chunk_consumed + 1
+        previous_scale = scale
+        chunk_tokens = []
+
+    chunk_value, chunk_consumed = _parse_indonesian_sub_thousand(chunk_tokens)
+    if chunk_tokens and chunk_value is None:
+        return None, 0
+
+    total += int(chunk_value or 0)
+    consumed += chunk_consumed
+    if consumed == 0 or total <= 0:
+        return None, 0
+
+    return total, consumed
+
+
+def parse_indonesian_amount_words(text: str) -> tuple[float | int | None, float]:
+    normalized_text = normalize_whitespace(text).casefold()
+    if not normalized_text:
+        return None, 0.0
+
+    tokens = _tokenize_indonesian_amount_text(normalized_text)
+    sequences = _extract_indonesian_number_sequences(tokens)
+
+    best_value: int | None = None
+    best_consumed = 0
+    for sequence in sequences:
+        value, consumed = _parse_indonesian_number_sequence(sequence)
+        if value is None or consumed <= 0:
+            continue
+        if consumed > best_consumed or (consumed == best_consumed and (best_value is None or value > best_value)):
+            best_value = value
+            best_consumed = consumed
+
+    if best_value is not None:
+        confidence = min(1.0, 0.45 + (0.12 * best_consumed))
+        return best_value, round(confidence, 4)
+
+    for matched_number in re.findall(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+|\d+)(?!\d)", normalized_text):
+        normalized_number = matched_number
+        if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", matched_number):
+            normalized_number = re.sub(r"[.,]", "", matched_number)
+        parsed_numeric = coerce_numeric_value(normalized_number)
+        if parsed_numeric is None or float(parsed_numeric) <= 0:
+            continue
+        return parsed_numeric, 0.57
+
+    return None, 0.0
+
+
 def parse_other_charge_group_key(group_key: str) -> tuple[str, str | None, str]:
     raw_kind, amount_text, descriptor_key = (group_key.split(":", 2) + ["", ""])[:3]
     return raw_kind or "other", None if amount_text in {"", "__null__"} else amount_text, descriptor_key
@@ -299,6 +505,7 @@ class ReconciliationArtifacts:
     derived_financials: dict[str, Any]
     corrected_fields: list[dict[str, Any]]
     unresolved_conflicts: list[str]
+    terbilang_consistency: dict[str, Any]
 
 
 JudgeFieldFn = Callable[[str, list[Any], list[dict[str, Any]]], Awaitable[tuple[str | None, str | None]]]
@@ -647,6 +854,7 @@ class MedicalExtractionFusionEngine:
             derived_financials=cast(dict[str, Any], reconciliation_meta.get("derived_financials", {})),
             corrected_fields=cast(list[dict[str, Any]], reconciliation_meta.get("corrected_fields", [])),
             unresolved_conflicts=cast(list[str], reconciliation_meta.get("unresolved_conflicts", [])),
+            terbilang_consistency=cast(dict[str, Any], reconciliation_meta.get("terbilang_consistency", {})),
         )
 
     def _apply_safe_output_policies(
@@ -695,6 +903,7 @@ class MedicalExtractionFusionEngine:
             "packet_inventory_hints": validation_hints,
             "inventory_conflicts": state.inventory_conflicts,
             "derived_financials": reconciliation.derived_financials,
+            "terbilang_consistency": reconciliation.terbilang_consistency,
             "corrected_fields": reconciliation.corrected_fields,
             "normalized_terms": state.normalized_terms,
             "nullified_fields": state.nullified_fields,
@@ -930,7 +1139,6 @@ class MedicalExtractionFusionEngine:
         self,
         list_name: str,
         *,
-        traces: list[SuccessfulProducerInferenceTrace],
         ranked_groups: list[dict[str, Any]],
         target_count: int,
         bucket_targets: dict[str, int] | None,
@@ -1025,7 +1233,6 @@ class MedicalExtractionFusionEngine:
 
         selected_groups, excluded_keys = self._select_list_groups(
             list_name,
-            traces=traces,
             ranked_groups=ranked_groups,
             target_count=target_count,
             bucket_targets=bucket_targets,
@@ -1116,6 +1323,49 @@ class MedicalExtractionFusionEngine:
             raw_confidence = max(raw_confidence, 0.72 if is_critical_field_path(field_path) else 0.68)
         return raw_confidence, clamp_confidence(producer_support_ratio)
 
+    def _handwritten_uncertainty_penalty(
+        self,
+        field_path: str,
+        *,
+        ranked: list[dict[str, Any]],
+        winner: dict[str, Any],
+        runner_up: dict[str, Any] | None,
+        producer_agreement: float,
+        total_runs: int,
+    ) -> tuple[float, str | None]:
+        if not is_semantic_field_path(field_path):
+            return 0.0, None
+        if runner_up is None:
+            return 0.0, None
+        if winner.get("raw_value") in {None, ""} or runner_up.get("raw_value") in {None, ""}:
+            return 0.0, None
+
+        winner_score = float(winner.get("score", 0.0))
+        if winner_score <= 0.0:
+            return 0.0, None
+
+        margin_ratio = max(
+            (winner_score - float(runner_up.get("score", 0.0))) / winner_score,
+            0.0,
+        )
+        if margin_ratio > HANDWRITTEN_UNCERTAINTY_MARGIN_THRESHOLD:
+            return 0.0, None
+
+        run_support_ratio = int(winner.get("run_count", 0)) / max(total_runs, 1)
+        if (
+            producer_agreement >= HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD
+            and run_support_ratio >= HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD
+        ):
+            return 0.0, None
+
+        if not self._materially_divergent_candidates(ranked):
+            return 0.0, None
+
+        return (
+            HANDWRITTEN_UNCERTAINTY_CONFIDENCE_PENALTY,
+            "applied handwritten uncertainty confidence penalty for divergent low-support semantic candidates",
+        )
+
     async def _fuse_scalar(self, field_path: str, values: list[tuple[SuccessfulProducerInferenceTrace, Any]], images: list[Any], field_confidence: dict[str, Any], judge_invocations: list[dict[str, Any]], *, output_path: str | None = None) -> Any:
         total_runs = len(values)
         total_producers = len({trace.producer_id for trace, _ in values})
@@ -1167,10 +1417,25 @@ class MedicalExtractionFusionEngine:
             total_producers=total_producers,
             judge_used=judge_used,
         )
+        penalty_value = 0.0
+        if not judge_used:
+            penalty_value, penalty_rule_hit = self._handwritten_uncertainty_penalty(
+                output_field_path,
+                ranked=ranked,
+                winner=winner,
+                runner_up=runner_up,
+                producer_agreement=producer_agreement,
+                total_runs=total_runs,
+            )
+            if penalty_rule_hit is not None:
+                rule_hits.append(penalty_rule_hit)
+        raw_confidence = clamp_confidence(raw_confidence - penalty_value)
         confidence = self._calibrate_confidence(field_path, raw_confidence)
         review_flags = ["low_confidence"] if confidence < self._threshold_for(field_path) else []
         if judge_used:
             review_flags.append("judge_resolved")
+        if penalty_value > 0:
+            review_flags.append("handwritten_uncertainty_penalty")
 
         alternate_candidates = [
             candidate for candidate in ranked if candidate["normalized_key"] != winner["normalized_key"]
@@ -1197,6 +1462,7 @@ class MedicalExtractionFusionEngine:
             "calibration_version": CALIBRATION_VERSION,
             "support_count": winner["run_count"],
             "producer_agreement": producer_agreement,
+            "confidence_penalty": penalty_value,
         }
         return winner["raw_value"]
 
@@ -1327,6 +1593,14 @@ class MedicalExtractionFusionEngine:
         section_name, field_name = field_path.split(".", 1)
         setattr(getattr(result, section_name), field_name, value)
 
+    def _selected_list_groups_meta(
+        self,
+        list_group_meta: dict[str, Any],
+        list_name: str,
+    ) -> list[dict[str, Any]]:
+        section_meta = cast(dict[str, Any], list_group_meta.get(list_name, {}))
+        return cast(list[dict[str, Any]], section_meta.get("selected_groups", []))
+
     def _resolve_list_item_reference(
         self,
         result: AIMedicalScanResponse,
@@ -1337,7 +1611,7 @@ class MedicalExtractionFusionEngine:
         if match is None:
             return None
         list_name, slug, field_name = match.groups()
-        selected_groups = cast(list[dict[str, Any]], cast(dict[str, Any], list_group_meta.get(list_name, {})).get("selected_groups", []))
+        selected_groups = self._selected_list_groups_meta(list_group_meta, list_name)
         path_prefix = f"{list_name}[{slug}]"
         selected_group = next((group for group in selected_groups if group.get("path_prefix") == path_prefix), None)
         if selected_group is None:
@@ -1394,7 +1668,7 @@ class MedicalExtractionFusionEngine:
         if match is None:
             return
         list_name, slug, field_name = match.groups()
-        selected_groups = cast(list[dict[str, Any]], cast(dict[str, Any], list_group_meta.get(list_name, {})).get("selected_groups", []))
+        selected_groups = self._selected_list_groups_meta(list_group_meta, list_name)
         path_prefix = f"{list_name}[{slug}]"
         for group in selected_groups:
             if group.get("path_prefix") != path_prefix:
@@ -1570,9 +1844,36 @@ class MedicalExtractionFusionEngine:
             return "judge used for divergent handwritten semantic field"
         if output_field_path.startswith("diagnoses[") and output_field_path.endswith(".description") and self._materially_divergent_candidates(ranked):
             return "judge used for divergent diagnosis candidates"
+        if self._should_judge_patient_name(field_path, winner, runner_up):
+            return "judge used for ambiguous patient-name candidates"
         if close_runner_up and is_critical_field_path(field_path):
             return "judge used for close critical-field conflict"
         return None
+
+    def _should_judge_patient_name(
+        self,
+        field_path: str,
+        winner: dict[str, Any],
+        runner_up: dict[str, Any] | None,
+    ) -> bool:
+        if field_path != "patient_info.name" or runner_up is None:
+            return False
+        if winner.get("raw_value") in {None, ""} or runner_up.get("raw_value") in {None, ""}:
+            return False
+
+        winner_score = float(winner.get("score", 0.0))
+        if winner_score <= 0.0:
+            return False
+
+        margin_ratio = max(
+            (winner_score - float(runner_up.get("score", 0.0))) / winner_score,
+            0.0,
+        )
+        weak_winner_support = (
+            int(winner.get("run_count", 0)) <= PATIENT_NAME_JUDGE_MAX_WINNER_SUPPORT_COUNT
+            or int(winner.get("producer_count", 0)) <= PATIENT_NAME_JUDGE_MAX_WINNER_PRODUCER_COUNT
+        )
+        return margin_ratio <= PATIENT_NAME_JUDGE_MARGIN_THRESHOLD and weak_winner_support
 
     def _materially_divergent_candidates(self, ranked: list[dict[str, Any]]) -> bool:
         comparable_candidates = [candidate for candidate in ranked if candidate.get("raw_value") not in {None, ""}]
@@ -1669,8 +1970,7 @@ class MedicalExtractionFusionEngine:
         field_confidence: dict[str, Any],
         list_group_meta: dict[str, Any],
     ) -> list[str]:
-        medicine_meta = cast(dict[str, Any], list_group_meta.get("medicines", {}))
-        selected_groups = cast(list[dict[str, Any]], medicine_meta.get("selected_groups", []))
+        selected_groups = self._selected_list_groups_meta(list_group_meta, "medicines")
         removed_indices: list[int] = []
         notes: list[str] = []
 
@@ -1720,19 +2020,29 @@ class MedicalExtractionFusionEngine:
             amount = coerce_numeric_value(group.get("amount"))
             if amount is None:
                 continue
+            representative_value_raw = group.get("representative_value")
+            representative_value = cast(dict[str, Any], representative_value_raw) if isinstance(representative_value_raw, dict) else {}
+            raw_kind = classify_other_charge_kind(
+                representative_value.get("category"),
+                representative_value.get("description"),
+            )
             add_candidate(
                 {
                     "amount": amount,
                     "source_type": "other_charge",
                     "source_key": group.get("key"),
                     "path_prefix": group.get("path_prefix"),
-                    "score": float(group.get("score", 0.0)) + (0.15 * float(group.get("support_count", 0))),
+                    "score": (
+                        float(group.get("score", 0.0))
+                        + (0.15 * float(group.get("support_count", 0)))
+                        - (0.18 if raw_kind == "mixed" else 0.0)
+                    ),
                     "support_count": int(group.get("support_count", 0)),
                     "producer_count": int(group.get("producer_count", 0)),
                 }
             )
 
-        selected_medicine_groups = cast(list[dict[str, Any]], cast(dict[str, Any], list_group_meta.get("medicines", {})).get("selected_groups", []))
+        selected_medicine_groups = self._selected_list_groups_meta(list_group_meta, "medicines")
         priced_medicine_totals: list[float | int] = []
         priced_medicine_paths: list[str] = []
         for group in selected_medicine_groups:
@@ -1788,7 +2098,7 @@ class MedicalExtractionFusionEngine:
         financial_outlier_suppressions: list[dict[str, Any]] = []
         selected_canonical_path = canonical_source.get("path_prefix") if isinstance(canonical_source, dict) else None
 
-        selected_medicine_groups = cast(list[dict[str, Any]], cast(dict[str, Any], list_group_meta.get("medicines", {})).get("selected_groups", []))
+        selected_medicine_groups = self._selected_list_groups_meta(list_group_meta, "medicines")
         for group in selected_medicine_groups:
             path_prefix = group.get("path_prefix")
             if not isinstance(path_prefix, str):
@@ -1892,6 +2202,8 @@ class MedicalExtractionFusionEngine:
             selected_other_charge_groups=selected_groups,
             list_group_meta=list_group_meta,
         )
+        priced_medicine_count = sum(1 for medicine in result.medicines if coerce_numeric_value(medicine.total_price) is not None)
+        medicine_line_items_null_dominant = len(result.medicines) > 0 and priced_medicine_count <= max(1, len(result.medicines) // 2)
         medicine_total_from_items = self._sum_defined_numbers([medicine.total_price for medicine in result.medicines])
         pre_reconciliation = {
             "medicine_total_from_items": medicine_total_from_items,
@@ -1904,6 +2216,7 @@ class MedicalExtractionFusionEngine:
             selected_groups,
             medicine_candidates=medicine_ledger_candidates,
             supported_targets=supported_targets,
+            medicine_line_items_null_dominant=medicine_line_items_null_dominant,
         )
 
         if (
@@ -1978,9 +2291,28 @@ class MedicalExtractionFusionEngine:
                 )
             unresolved_conflicts.append("Financial totals could not be reconciled into a coherent packet ledger.")
 
+        terbilang_consistency = self._extract_terbilang_consistency(
+            result=result,
+            selected_groups=selected_groups,
+        )
+        if terbilang_consistency.get("conflict"):
+            unresolved_conflicts.append("Terbilang wording conflicts with numeric amount cues; adaptive priority selected the strongest source.")
+
+        forced_non_null_fields = self._enforce_non_null_financial_totals(
+            result=result,
+            field_confidence=field_confidence,
+            supported_targets=supported_targets,
+            best_subset=best_subset,
+            terbilang_consistency=terbilang_consistency,
+            corrected_fields=corrected_fields,
+        )
+        if forced_non_null_fields:
+            reconciliation_notes.append("Financial totals were backfilled with strongest available candidates to avoid null outputs.")
+
         selected_group_meta["reconciliation"] = {
             "supported_targets": supported_targets,
             "selected_subset": best_subset,
+            "terbilang_consistency": terbilang_consistency,
             "notes": reconciliation_notes,
         }
 
@@ -1993,6 +2325,8 @@ class MedicalExtractionFusionEngine:
                 "price_counted_in_ledger": price_counted_in_ledger,
                 "financial_outlier_suppressions": financial_outlier_suppressions,
                 "selected_subset": best_subset,
+                "terbilang_consistency": terbilang_consistency,
+                "forced_non_null_fields": forced_non_null_fields,
                 "notes": reconciliation_notes,
                 "post_reconciliation": {
                     "summary_total_amount": result.summary.total_amount,
@@ -2002,6 +2336,7 @@ class MedicalExtractionFusionEngine:
             },
             "corrected_fields": corrected_fields,
             "unresolved_conflicts": list(dict.fromkeys(unresolved_conflicts)),
+            "terbilang_consistency": terbilang_consistency,
         }
 
     def _extract_supported_numeric_targets(self, field_confidence: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -2035,6 +2370,222 @@ class MedicalExtractionFusionEngine:
             if candidate_value is not None and abs(float(candidate_value) - float(numeric_value)) < 0.01:
                 return True, float(candidate.get("support_count", 0)) + (0.2 * float(candidate.get("producer_count", 0)))
         return False, 0.0
+
+    def _extract_terbilang_consistency(
+        self,
+        *,
+        result: AIMedicalScanResponse,
+        selected_groups: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        numeric_candidates: list[dict[str, Any]] = []
+        terbilang_candidates: list[dict[str, Any]] = []
+
+        for group in selected_groups:
+            representative_value_raw = group.get("representative_value")
+            representative_value = cast(dict[str, Any], representative_value_raw) if isinstance(representative_value_raw, dict) else {}
+            amount = coerce_numeric_value(representative_value.get("amount"))
+            description = str(representative_value.get("description") or "")
+            category = str(representative_value.get("category") or "")
+            if amount is not None:
+                numeric_candidates.append(
+                    {
+                        "value": amount,
+                        "score": float(group.get("score", 0.0)),
+                        "support_count": int(group.get("support_count", 0)),
+                        "producer_count": int(group.get("producer_count", 0)),
+                        "path_prefix": group.get("path_prefix"),
+                        "description": description,
+                    }
+                )
+
+            combined_text = f"{category} {description}".strip()
+            if not combined_text or not TERBILANG_MATCH_PATTERN.search(combined_text):
+                continue
+
+            parse_inputs = [combined_text]
+            terbilang_match = re.search(r"terbilang\s*[:\-]?\s*(.+)$", combined_text, flags=re.IGNORECASE)
+            if terbilang_match is not None:
+                tail_segment = normalize_whitespace(terbilang_match.group(1))
+                if tail_segment:
+                    parse_inputs.insert(0, tail_segment)
+
+            best_parsed_value: float | int | None = None
+            best_parse_confidence = 0.0
+            for parse_input in parse_inputs:
+                parsed_value, parse_confidence = parse_indonesian_amount_words(parse_input)
+                if parsed_value is None:
+                    continue
+                if parse_confidence > best_parse_confidence:
+                    best_parsed_value = parsed_value
+                    best_parse_confidence = parse_confidence
+
+            if best_parsed_value is None:
+                continue
+            terbilang_candidates.append(
+                {
+                    "value": best_parsed_value,
+                    "parse_confidence": best_parse_confidence,
+                    "score": float(group.get("score", 0.0)),
+                    "support_count": int(group.get("support_count", 0)),
+                    "producer_count": int(group.get("producer_count", 0)),
+                    "path_prefix": group.get("path_prefix"),
+                    "description": description,
+                }
+            )
+
+        if not numeric_candidates and not terbilang_candidates:
+            return {
+                "detected": False,
+                "applied": False,
+            }
+
+        best_numeric = max(
+            numeric_candidates,
+            key=lambda item: (item.get("support_count", 0), item.get("producer_count", 0), item.get("score", 0.0), item.get("value", 0)),
+            default=None,
+        )
+        best_terbilang = max(
+            terbilang_candidates,
+            key=lambda item: (item.get("parse_confidence", 0.0), item.get("support_count", 0), item.get("score", 0.0)),
+            default=None,
+        )
+
+        if best_numeric is None and best_terbilang is None:
+            return {
+                "detected": False,
+                "applied": False,
+            }
+
+        selected_source = "numeric"
+        selected_value = coerce_numeric_value(result.summary.total_amount)
+        consistency_passed = True
+        conflict = False
+        notes: list[str] = []
+
+        numeric_value = coerce_numeric_value(best_numeric.get("value") if best_numeric else None)
+        terbilang_value = coerce_numeric_value(best_terbilang.get("value") if best_terbilang else None)
+
+        if numeric_value is not None and terbilang_value is not None:
+            assert best_numeric is not None
+            assert best_terbilang is not None
+            tolerance = max(TERBILANG_CONFLICT_TOLERANCE_ABSOLUTE, abs(float(numeric_value)) * TERBILANG_CONFLICT_TOLERANCE_RATIO)
+            difference = abs(float(numeric_value) - float(terbilang_value))
+            consistency_passed = difference <= tolerance
+            conflict = not consistency_passed
+
+            numeric_score = (
+                (float(best_numeric.get("support_count", 0)) * 0.2)
+                + (float(best_numeric.get("producer_count", 0)) * 0.1)
+                + float(best_numeric.get("score", 0.0))
+                + 0.2
+            )
+            terbilang_score = (
+                float(best_terbilang.get("parse_confidence", 0.0))
+                + (float(best_terbilang.get("support_count", 0)) * 0.15)
+                + (float(best_terbilang.get("producer_count", 0)) * 0.1)
+                + float(best_terbilang.get("score", 0.0))
+            )
+
+            if conflict and (terbilang_score - numeric_score) >= TERBILANG_OVERRIDE_MARGIN:
+                selected_source = "terbilang"
+                selected_value = terbilang_value
+                notes.append("terbilang_overrode_numeric")
+            else:
+                selected_source = "numeric"
+                selected_value = numeric_value
+                if conflict:
+                    notes.append("numeric_preferred_over_terbilang")
+        elif terbilang_value is not None:
+            selected_source = "terbilang"
+            selected_value = terbilang_value
+            notes.append("terbilang_only_candidate")
+        elif numeric_value is not None:
+            selected_source = "numeric"
+            selected_value = numeric_value
+
+        return {
+            "detected": True,
+            "applied": selected_value is not None,
+            "selected_source": selected_source,
+            "selected_value": selected_value,
+            "consistency_passed": consistency_passed,
+            "conflict": conflict,
+            "numeric_candidate": best_numeric,
+            "terbilang_candidate": best_terbilang,
+            "notes": notes,
+        }
+
+    def _enforce_non_null_financial_totals(
+        self,
+        *,
+        result: AIMedicalScanResponse,
+        field_confidence: dict[str, Any],
+        supported_targets: dict[str, list[dict[str, Any]]],
+        best_subset: dict[str, Any] | None,
+        terbilang_consistency: dict[str, Any],
+        corrected_fields: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        forced_fields: list[dict[str, Any]] = []
+
+        preferred_grand_total = coerce_numeric_value(terbilang_consistency.get("selected_value"))
+        if preferred_grand_total is None and best_subset is not None:
+            preferred_grand_total = coerce_numeric_value(best_subset.get("grand_total"))
+        if preferred_grand_total is None:
+            best_supported = supported_targets.get("summary.total_amount", []) or supported_targets.get("financial_recap.grand_total", [])
+            if best_supported:
+                preferred_grand_total = coerce_numeric_value(best_supported[0].get("value"))
+
+        if preferred_grand_total is not None:
+            for field_path in ("summary.total_amount", "financial_recap.grand_total"):
+                current_value = coerce_numeric_value(self._get_field_value(result, field_path))
+                if current_value is None:
+                    self._apply_reconciled_numeric_field(
+                        result,
+                        field_path,
+                        preferred_grand_total,
+                        field_confidence,
+                        corrected_fields,
+                        "enforced non-null financial total from adaptive priority",
+                    )
+                    forced_fields.append({"field_path": field_path, "value": preferred_grand_total})
+
+        for field_path in ("financial_recap.total_medicines", "financial_recap.total_other_charges"):
+            current_value = coerce_numeric_value(self._get_field_value(result, field_path))
+            if current_value is not None:
+                continue
+            candidates = supported_targets.get(field_path, [])
+            fallback_value = coerce_numeric_value(candidates[0].get("value")) if candidates else None
+            if fallback_value is None and best_subset is not None:
+                if field_path.endswith("total_medicines"):
+                    fallback_value = coerce_numeric_value(best_subset.get("medicine_total"))
+                else:
+                    fallback_value = coerce_numeric_value(best_subset.get("other_total"))
+            if fallback_value is None:
+                fallback_value = 0
+            self._apply_reconciled_numeric_field(
+                result,
+                field_path,
+                fallback_value,
+                field_confidence,
+                corrected_fields,
+                "enforced non-null financial total from strongest available candidate",
+            )
+            forced_fields.append({"field_path": field_path, "value": fallback_value})
+
+        summary_total = coerce_numeric_value(result.summary.total_amount)
+        recap_grand_total = coerce_numeric_value(result.financial_recap.grand_total)
+        if summary_total is not None and recap_grand_total is not None and abs(float(summary_total) - float(recap_grand_total)) >= 0.01:
+            self._apply_reconciled_numeric_field(
+                result,
+                "summary.total_amount",
+                recap_grand_total,
+                field_confidence,
+                corrected_fields,
+                "aligned summary total amount with reconciled grand total",
+            )
+            forced_fields.append({"field_path": "summary.total_amount", "value": recap_grand_total, "aligned_with": "financial_recap.grand_total"})
+
+        return forced_fields
 
     def _should_defer_coherent_financial_override(
         self,
@@ -2077,6 +2628,7 @@ class MedicalExtractionFusionEngine:
         *,
         medicine_candidates: list[dict[str, Any]],
         supported_targets: dict[str, list[dict[str, Any]]],
+        medicine_line_items_null_dominant: bool,
     ) -> dict[str, Any] | None:
         if not selected_groups and not medicine_candidates:
             return None
@@ -2129,6 +2681,11 @@ class MedicalExtractionFusionEngine:
                     dropped_indices = [index for index in range(len(selected_groups)) if index not in subset_indices]
                     canonical_source_support = float(medicine_candidate.get("support_count", 0)) + (0.2 * float(medicine_candidate.get("producer_count", 0)))
                     weak_source_penalty = 0.4 if canonical_source_support < RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD else 0.0
+                    canonical_source_type = str(medicine_candidate.get("source_type", ""))
+                    weak_packet_source_penalty = 0.0
+                    if medicine_line_items_null_dominant and canonical_source_type == "other_charge":
+                        if canonical_source_support < (RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD + 0.6):
+                            weak_packet_source_penalty = 0.6
                     dropped_count_penalty = 0.5 * len(dropped_indices)
                     candidate_choice = {
                         "coherent": coherent,
@@ -2156,7 +2713,7 @@ class MedicalExtractionFusionEngine:
                             1 if other_match else 0,
                             other_match_score,
                             canonical_source_support,
-                            support_score - weak_source_penalty,
+                            support_score - weak_source_penalty - weak_packet_source_penalty,
                             -dropped_count_penalty,
                         ),
                     }

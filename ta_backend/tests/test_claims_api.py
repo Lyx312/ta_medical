@@ -14,8 +14,10 @@ from app.core.config import get_settings
 from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
 from app.models.claim import Claim
+from app.models.claim_medicine_knowledge import ClaimMedicineKnowledge
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services.ai_service import DocumentImageInput
+from app.services import claim_medicine_relevance as medicine_relevance_service
 from app.services.image_preprocessing import ProcessedDocumentImage
 
 SCAN_RESULT = {
@@ -123,6 +125,16 @@ def get_all_claims() -> list[Claim]:
         return list(db.execute(select(Claim).order_by(Claim.id.asc())).scalars())
 
 
+def get_all_knowledge_rows() -> list[ClaimMedicineKnowledge]:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        return list(
+            db.execute(
+                select(ClaimMedicineKnowledge).order_by(ClaimMedicineKnowledge.id.asc())
+            ).scalars()
+        )
+
+
 def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -176,6 +188,7 @@ def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
     assert len(claims) == 1
     assert claims[0]["nama_pasien"] == "Budi Santoso"
     assert claims[0]["tanggal_pelayanan"] == "31-03-2026"
+    assert "source_scan_extraction_payload" not in claims[0]
 
     restarted_app = create_app()
     with TestClient(restarted_app) as restarted_client:
@@ -269,6 +282,255 @@ def test_create_claim_allows_submit_but_flags_manual_review_for_non_relevant_med
     assert payload["review_note"]
     assert len(payload["medicines"]) == 1
     assert payload["medicines"][0]["evaluation"]["relevance"] == "not_relevant"
+    knowledge_rows = get_all_knowledge_rows()
+    assert knowledge_rows == []
+
+
+def test_create_claim_exposes_linked_scan_extraction_payload(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-extraction-payload@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content in {b"fake-image", b"processed-image"}
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return build_valid_validation_response(images[0].filename)
+
+    async def fake_scan_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        **_: object,
+    ) -> AIMedicalScanResponse:
+        assert patient_name_candidates == ["Claim User"]
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(ai_processor, "process", fake_scan_process)
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    scan_response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+    assert scan_response.status_code == 200
+    scan_log_id = scan_response.json()["scan_log_id"]
+
+    claim_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "source_scan_log_id": str(scan_log_id),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+    assert claim_response.status_code == 201
+    payload = claim_response.json()
+    assert payload["source_scan_log_id"] == scan_log_id
+    assert payload["source_scan_extraction_payload"] == SCAN_RESULT
+
+    list_response = client.get(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert len(listed) == 1
+    assert "source_scan_extraction_payload" not in listed[0]
+
+    detail_response = client.get(
+        f"/api/claims/{payload['id']}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert detail_response.status_code == 200
+    assert detail_response.json()["source_scan_extraction_payload"] == SCAN_RESULT
+
+
+def test_create_claim_uses_balanced_history_threshold_before_llm(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-history-threshold@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return build_valid_validation_response(images[0].filename)
+
+    llm_call_count = {"count": 0}
+
+    async def fake_llm_judge(*args: object, **kwargs: object):
+        llm_call_count["count"] += 1
+        raise RuntimeError("Simulated LLM unavailable during seeding.")
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(medicine_relevance_service.MedicineRelevanceLLMJudge, "judge", fake_llm_judge)
+
+    first_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam influenza",
+            "kronologi": "Batuk pilek demam 2 hari",
+            "medicines_payload": json.dumps(
+                [
+                    {
+                        "name": "Paracetamol",
+                        "source": "user_input",
+                    }
+                ]
+            ),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+    assert first_response.status_code == 201
+
+    second_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "01-04-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam influenza",
+            "kronologi": "Batuk pilek demam sejak kemarin",
+            "medicines_payload": json.dumps(
+                [
+                    {
+                        "name": "Paracetamol",
+                        "source": "user_input",
+                    }
+                ]
+            ),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert second_response.status_code == 201
+    third_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "02-04-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam influenza",
+            "kronologi": "Demam batuk pilek berlanjut",
+            "medicines_payload": json.dumps(
+                [
+                    {
+                        "name": "Paracetamol",
+                        "source": "user_input",
+                    }
+                ]
+            ),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert third_response.status_code == 201
+    payload = third_response.json()
+    assert payload["medicines"][0]["evaluation"]["decision_source"] == "history_strong"
+    assert llm_call_count["count"] == 2
+
+    knowledge_rows = get_all_knowledge_rows()
+    assert len(knowledge_rows) == 3
+    assert all(row.medicine_name_normalized == "paracetamol" for row in knowledge_rows)
+    assert sum(row.support_count for row in knowledge_rows) == 3
+
+
+def test_create_claim_falls_back_to_heuristic_when_llm_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "claims-llm-fallback@example.com")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        assert filename == "receipt.png"
+        assert content == b"fake-image"
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        assert len(images) == 1
+        return build_valid_validation_response(images[0].filename)
+
+    async def fake_llm_judge(*args: object, **kwargs: object):
+        raise RuntimeError("Simulated LLM failure")
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(medicine_relevance_service.MedicineRelevanceLLMJudge, "judge", fake_llm_judge)
+
+    response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Budi Santoso",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "medicines_payload": json.dumps(
+                [
+                    {
+                        "name": "Paracetamol",
+                        "source": "user_input",
+                    }
+                ]
+            ),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["medicines"][0]["evaluation"]["decision_source"] == "heuristic_fallback"
+
+    knowledge_rows = get_all_knowledge_rows()
+    assert len(knowledge_rows) == 1
+    assert knowledge_rows[0].support_count == 1
 
 
 def test_create_claim_rejects_document_validation_failure(

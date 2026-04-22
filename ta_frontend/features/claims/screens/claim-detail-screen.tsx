@@ -21,7 +21,7 @@ import {
   getClaimStatusPresentation,
 } from '@/features/claims/utils/claim-display';
 import { getClaim } from '@/services/api/claims';
-import type { ApiError, ClaimResponse } from '@/services/api/types';
+import type { ApiError, ClaimDetailResponse } from '@/services/api/types';
 
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
@@ -32,7 +32,7 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function formatMedicineItemValue(claimMedicine: ClaimResponse['medicines'][number]) {
+function formatMedicineItemValue(claimMedicine: ClaimDetailResponse['medicines'][number]) {
   const details: string[] = [];
   if (claimMedicine.quantity !== undefined) {
     details.push(`Qty ${claimMedicine.quantity}${claimMedicine.unit ? ` ${claimMedicine.unit}` : ''}`);
@@ -67,7 +67,7 @@ export function ClaimDetailScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const params = useLocalSearchParams<{ claimId?: string }>();
-  const [claim, setClaim] = useState<ClaimResponse | null>(null);
+  const [claim, setClaim] = useState<ClaimDetailResponse | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
 

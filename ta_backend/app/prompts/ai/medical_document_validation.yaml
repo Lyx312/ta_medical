@@ -31,6 +31,12 @@ user_template: |
   - include concise reasons explaining the decision
   Do not infer hidden, occluded, cropped, or ambiguous stamps/signatures.
   A receipt may still be valid without a visible stamp or doctor signature if the receipt is otherwise readable and the medical facility identity is clearly visible.
+
+  ANTI-INFERENCE RULES FOR STAMP AND SIGNATURE DETECTION:
+  - A stamp must be clearly recognizable as an official ink stamp (not merely a faint logo, watermark, letterhead, or decorative border). If the mark is barely visible, smudged, or could be a logo or letterhead element, set stamp_detected to false.
+  - A signature must show visible pen strokes in a signature-sized area. Do not mistake a printed name, title, or small initials for a signature. If only typed text or a printed label is visible in the signature area, set signature_detected to false.
+  - Faint circular or rectangular marks that might be stamps or might be background watermarks should be treated as watermark/logo, not as stamps. When in doubt, prefer false over true for stamp_detected.
+  - A doctor signature area on a prescription or medical form that shows only a printed name and credentials (not pen strokes) should have signature_detected set to false.
   In collage images, a prescription sheet such as "Resep" or "Salinan Resep" must be classified as prescription, not receipt, even when it appears beside receipts or payment slips.
   For medical_form, doctor_note, and prescription, only mark stamp_detected or signature_detected true when the mark is clearly visible.
   If multiple papers are present but cannot be separated clearly, mark the affected document entries as uncertain and explain that separation is unclear.

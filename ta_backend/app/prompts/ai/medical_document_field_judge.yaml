@@ -16,6 +16,14 @@ user_template: |
   - Prefer the candidate that is most directly supported by the visible documents.
   - If none of the candidates are clearly supported, return null.
   - Keep the reason short and evidence-focused.
+  Rules for ambiguous cases:
+  - If all candidates are weak (no candidate has strong visual support), prefer returning null over forcing a choice.
+  - When candidates are tied in apparent support, prefer the candidate that is most consistent with surrounding context (e.g., other fields in the same document, document type norms).
+  - For patient name fields: prefer the candidate most consistent with Indonesian naming conventions and nearby contextual clues (gender marks, address proximity). Do not prefer a candidate merely because it appears more frequently across the packet.
+  - For date fields: prefer the candidate that aligns with document chronology and service date. Do not prefer a candidate merely because it appears in more document images.
+  - For amount fields: prefer the candidate most consistent with the visible numeral and numeral-in-words consistency check. Do not prefer a candidate merely because it appears on more receipt lines.
+  - For medical context fields (anamnesis, therapy_note, diagnoses): prefer the candidate most consistent with the visible handwriting strokes and letter forms. Do not prefer a candidate merely because it was read from more document images.
+  - Return null rather than selecting a weak candidate when evidence does not clearly favor one option over the others.
   Return only the JSON object.
 
 output_contract:

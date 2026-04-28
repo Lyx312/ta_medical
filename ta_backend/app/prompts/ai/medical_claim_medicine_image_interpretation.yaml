@@ -25,11 +25,15 @@ user_template: |
   {db_medicine_hints_json}
 
   Rules:
-  - Base your interpretation on visible document evidence first.
-  - Do not invent medicine names that are not supported by document text.
-  - If uncertain, keep interpreted_name null and set interpretation_confidence low.
-  - relevance is only a secondary plausibility signal for tie-breaking.
-  - Keep reason concise and evidence-focused.
+  EVIDENCE HIERARCHY (apply in this order):
+  1. Document image evidence is the primary authority. Interpreted names must be traceable to visible text in the uploaded images. Do not override clear image evidence with suggestions or DB hints.
+  2. Ranked group suggestions are a secondary fallback for medicines that appear ambiguous in image evidence alone. Use suggestions only when image evidence is weak or absent for that medicine entry.
+  3. DB medicine hints are a tertiary fallback. Use DB hints only when both image evidence and group suggestions are unavailable or weak for that medicine entry.
+  4. relevance score is a tie-breaking signal only, and only after image evidence has been considered. Do not use relevance to override image evidence.
+  5. When image evidence clearly shows a medicine name, set interpretation_confidence high regardless of whether suggestions or DB hints support a different name.
+  6. When image evidence is absent or too blurry to read, fall back to suggestions or DB hints with appropriately lower interpretation_confidence.
+  7. If uncertain, keep interpreted_name null and set interpretation_confidence low.
+  8. Keep reason concise and evidence-focused.
   Return only the JSON object.
 
 output_contract:

@@ -204,7 +204,6 @@ async def read_uploaded_files(files: list[UploadFile]) -> list[BufferedUpload]:
         )
     return buffered_uploads
 
-
 @router.post("/scan-documents", response_model=AIScanDocumentsResponse)
 async def scan_documents(
     token_data: TokenData = Depends(get_current_user_dependency),

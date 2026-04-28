@@ -64,3 +64,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# dataset
+eval/dataset
+eval/tmp

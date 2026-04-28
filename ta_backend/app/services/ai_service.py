@@ -563,6 +563,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         try:
             return AIMedicalScanResponse.model_validate(payload)
         except ValidationError as exc:
+            print(f"AI response validation error: {exc}")
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="AI model returned invalid response shape.",

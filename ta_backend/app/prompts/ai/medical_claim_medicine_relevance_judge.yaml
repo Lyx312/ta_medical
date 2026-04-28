@@ -23,6 +23,7 @@ user_template: |
   Rules:
   - Prioritize diagnosis signal over anamnesis when they conflict.
   - Use anamnesis as supporting context.
+  - Historical evidence (prior co-occurrence patterns) is advisory only. Current clinical context — the diagnosis and anamnesis from this specific claim — always takes precedence. Do not weight prior co-occurrence over current clinical evidence.
   - If evidence is conflicting or weak, prefer relevance=uncertain.
   - confidence must be between 0 and 1.
   - reason must be concise and evidence-based.

@@ -11,6 +11,18 @@ user_template: |
   Validation-derived packet hints from the same upload are provided here and may help preserve packet inventory, per-image document order, and document types for collage images:
   {validation_packet_hints_json}
   Use these validation hints only as support for packet structure and document ordering. Do not invent extracted text or values that are not visible in the uploaded images.
+
+  FIELD-TO-DOCUMENT-TYPE AUTHORITY RULES:
+  Only extract a field from a document when that document type legitimately contains that field. Use the detected or inferred document type as the authority gate:
+  - medical_facility_name: extract from receipt, medical_form, doctor_note, lab_result, radiology_result only. Do not extract from prescription unless the prescription itself bears the facility name.
+  - service_date: extract from the primary clinical document (receipt, medical_form, doctor_note). For prescription-only packets, use the prescription date if present. Do not extract service_date from lab_result or radiology_result unless no other clinical document is available.
+  - patient_info fields (name, date_of_birth, age, gender, address): extract from receipt, medical_form, doctor_note. Lab/radiology results may contain patient info but prefer earlier clinical documents when both are present.
+  - medical_context fields (anamnesis, diagnoses, therapy_note): extract from doctor_note, medical_form, or prescription only. receipts do not contain anamnesis or therapy notes.
+  - medicines: extract from prescription, receipt, medical_form. Lab/radiology results do not contain medicine lists unless explicitly included.
+  - other_charges: extract from receipt or medical_form only.
+  - financial_recap fields: extract from receipt or the document showing the grand total. Other document types rarely contain reconciled totals.
+
+  When a field appears in multiple document types, prefer the document type most authoritative for that field category and use the most clearly legible instance.
   Extract the service date as the date the patient was examined, consulted, or received treatment from the doctor or medical facility.
   Prioritize the date shown on the medical consultation document, doctor note, medical form, or other primary clinical document over later pharmacy or medicine-purchase dates.
   If multiple dates appear across the packet, do not simply choose the latest receipt date.
@@ -40,6 +52,23 @@ user_template: |
   For every date field (including summary.service_date, summary.transaction_date when present, and patient_info.date_of_birth), use ISO format YYYY-MM-DD (example: 2025-08-28).
   Do not translate or rewrite wording across languages.
   Preserve the original language used in the source image text for extracted textual fields.
+
+  STANDARD VOCABULARY - Use these exact category values for other_charges:
+  - CONSULTATION: for doctor consultation fees, "jasa dokter", "konsultasi"
+  - ADMINISTRATION: for administrative fees, "administrasi", "admin"
+  - SERVICE: for medical procedures, treatments, "pelayanan", "tindakan"
+  - LABORATORY: for lab tests, "lab", "laboratorium"
+  - ROOM: for room/bed charges, "kamar", "ruangan"
+  - OTHER: for miscellaneous fees
+
+  For summary.detected_documents, use standard document type names:
+  - "Kwitansi" for receipts/payment documents
+  - "Resep" or "Salinan Resep" for prescriptions
+  - "Nota Penjualan" for sales notes
+  - "Tanda Penerimaan Pembayaran" for payment receipts
+  - "Formulir Rawat Jalan" for medical forms
+
+  For summary.medical_facility_name, use the full facility type (e.g., "Rumah Sakit", "Klinik") instead of abbreviations when possible.
   Return only the JSON object.
 
 output_contract:

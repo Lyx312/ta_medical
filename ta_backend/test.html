@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html><head><meta charset='utf-8'><title>Claim Diff Report</title>
+<style>
+body{font-family:Consolas,monospace;margin:20px;background:#1e1e1e;color:#d4d4d4}
+table{border-collapse:collapse;width:100%;margin:10px 0;table-layout:fixed}
+th,td{padding:8px;border:1px solid #444;text-align:left;word-wrap:break-word}
+th{background:#2d2d2d}
+td:nth-child(1){width:20%}
+td:nth-child(2){width:35%}
+td:nth-child(3){width:35%}
+td:nth-child(4){width:10%}
+.g{color:#4ec9b0}.r{color:#f14c4c}.y{color:#dcdcaa}.b{color:#569cd6}
+.section{margin:20px 0 5px;font-weight:bold;font-size:18px;color:#569cd6}
+.field{color:#9cdcfe}
+pre{margin:0;white-space:pre-wrap;word-wrap:break-word}
+</style></head><body>
+<h2>Claim Diff: 458</h2>
+<p>Overall F1: <span class='b'>0.9096</span></p>
+<div class='section'>SECTION: summary</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td class='field'>summary.currency</td><td>IDR</td><td>IDR</td><td class='g'>✓</td></tr>
+<tr><td class='field'>summary.detected_documents</td><td>['Kwitansi', 'Nota Penjualan Resep Tunai', 'Tanda Penerimaan Pembayaran']</td><td>['Kwitansi RS Semen Gresik', 'Kwitansi Apotik Semen Gresik II', 'Nota Penjualan Resep Tunai Apotik Semen Gresik II']</td><td class='g'>✓</td></tr>
+<tr><td class='field'>summary.medical_facility_name</td><td>RUMAH SAKIT SEMEN GRESIK</td><td>RS Semen Gresik</td><td class='g'>✓</td></tr>
+<tr><td class='field'>summary.service_date</td><td>2023-12-11</td><td>2023-12-11</td><td class='g'>✓</td></tr>
+<tr><td class='field'>summary.total_amount</td><td>272550.0</td><td>272550</td><td class='g'>✓</td></tr>
+<tr><td class='field'>summary.transaction_date</td><td>2023-12-11</td><td>2023-12-11</td><td class='g'>✓</td></tr>
+</table>
+<div class='section'>SECTION: patient_info</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td class='field'>patient_info.address</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+<tr><td class='field'>patient_info.age</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+<tr><td class='field'>patient_info.date_of_birth</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+<tr><td class='field'>patient_info.gender</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+<tr><td class='field'>patient_info.name</td><td>Anita Lia</td><td>ANITA LIA</td><td class='g'>✓</td></tr>
+</table>
+<div class='section'>SECTION: medical_context</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td class='field'>medical_context.anamnesis</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+<tr><td class='field'>medical_context.diagnoses</td><td>[{'description': 'ISPA + myalgia', 'doctor_name': 'Ageng Indah Afiarahma, dr.'}]</td><td>[{'description': 'ISPA + myalgia', 'doctor_name': 'Ageng Indah A.'}]</td><td class='g'>✓</td></tr>
+<tr><td class='field'>medical_context.therapy_note</td><td>-</td><td>-</td><td class='g'>✓</td></tr>
+</table>
+<div class='section'>SECTION: medicines</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td>[0]</td><td>Cen. Cenfresh 0.6ml MD 5's</td><td>Cen. Centresh 0.6ml MD</td><td class='y'>~ (sim=0.58)</td></tr>
+<tr><td>[1]</td><td>Epexol 30mg 100's - Sanbe</td><td>Epexol 30mg 100's - Sanbe</td><td class='g'>✓ (sim=1.00)</td></tr>
+<tr><td>[2]</td><td>Lameson 4mg tab 100's - La</td><td>Lameson 4mg tab</td><td class='y'>~ (sim=0.58)</td></tr>
+<tr><td>[3]</td><td>-</td><td>Epexol 30mg</td><td class='r'>extra</td></tr>
+<tr><td>[4]</td><td>OBH Nelco Special -Nellco</td><td>-</td><td class='r'>missing</td></tr>
+</table>
+<div class='section'>SECTION: other_charges</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td>[0]</td><td>CONSULTATION</td><td>Jasa Medik Dokter</td><td class='g'>✓ (sim=1.00)</td></tr>
+<tr><td>[1]</td><td>ADMINISTRATION</td><td>Administrasi</td><td class='g'>✓ (sim=1.00)</td></tr>
+</table>
+<div class='section'>SECTION: financial_recap</div>
+<table><tr><th>Field</th><th>Ground Truth</th><th>Predicted</th><th>Status</th></tr>
+<tr><td class='field'>financial_recap.grand_total</td><td>272550.0</td><td>272550</td><td class='g'>✓</td></tr>
+<tr><td class='field'>financial_recap.total_medicines</td><td>212550.0</td><td>212550</td><td class='g'>✓</td></tr>
+<tr><td class='field'>financial_recap.total_other_charges</td><td>60000.0</td><td>60000</td><td class='g'>✓</td></tr>
+</table>
+</body></html>

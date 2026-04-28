@@ -37,14 +37,14 @@ from app.services.ai_ensemble_config import (
     MEDICINE_PRIMARY_COUNT_BUFFER,
     MEDICINE_PRIMARY_COUNT_SOFT_CAP,
     MEDICINE_SPLIT_COMPONENT_MIN,
+    NON_CRITICAL_FIELD_THRESHOLD,
+    NUMERIC_FIELD_PATHS,
+    OTHER_CHARGE_BUCKET_ORDER,
+    OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
+    PACKAGE_LEVEL_MEDICINE_KEYWORDS,
     PATIENT_NAME_JUDGE_MARGIN_THRESHOLD,
     PATIENT_NAME_JUDGE_MAX_WINNER_PRODUCER_COUNT,
     PATIENT_NAME_JUDGE_MAX_WINNER_SUPPORT_COUNT,
-    NON_CRITICAL_FIELD_THRESHOLD,
-    NUMERIC_FIELD_PATHS,
-    OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
-    OTHER_CHARGE_BUCKET_ORDER,
-    PACKAGE_LEVEL_MEDICINE_KEYWORDS,
     RECONCILIATION_HEAVY_DROP_COUNT_THRESHOLD,
     RECONCILIATION_LARGE_OVERRIDE_RATIO_THRESHOLD,
     RECONCILIATION_VERSION,
@@ -54,6 +54,11 @@ from app.services.ai_ensemble_config import (
     SEMANTIC_FIELD_THRESHOLD,
     SERVICE_KEYWORDS,
     STRUCTURED_TERM_LEXICON,
+)
+from app.services.standard_vocabulary import (
+    map_category_to_standard,
+    normalize_facility_name,
+    normalize_to_standard_document_type,
 )
 
 
@@ -173,19 +178,23 @@ def classify_other_charge_kind(category: Any, description: Any) -> str:
     description_text = normalize_whitespace(str(description or "")).casefold()
     combined_text = f"{category_text} {description_text}".strip()
 
+    standard_cat = map_category_to_standard(combined_text)
+    if standard_cat and standard_cat != "OTHER":
+        return standard_cat
+
     has_medicine_keyword = contains_keyword(combined_text, GENERIC_MEDICINE_KEYWORDS)
     has_consultation_keyword = contains_keyword(combined_text, CONSULTATION_KEYWORDS)
     has_service_keyword = contains_keyword(combined_text, SERVICE_KEYWORDS)
 
     if has_medicine_keyword and (has_consultation_keyword or has_service_keyword):
-        return "mixed"
+        return "OTHER"
     if has_medicine_keyword:
-        return "medicine"
+        return "OTHER"
     if has_service_keyword:
-        return "service"
+        return "SERVICE"
     if has_consultation_keyword:
-        return "consultation"
-    return "other"
+        return "CONSULTATION"
+    return "OTHER"
 
 
 def extract_other_charge_descriptor_signature(category: Any, description: Any) -> str:
@@ -629,6 +638,13 @@ def normalize_candidate_key(field_path: str, value: Any) -> str:
         return normalize_whitespace(str(value)).upper()
     if field_path.endswith("gender"):
         return normalize_gender_value(value) or "__null__"
+    if field_path == "summary.medical_facility_name":
+        return normalize_facility_name(value) or "__null__"
+    if field_path == "summary.detected_documents" or leaf_name == "detected_documents":
+        return normalize_to_standard_document_type(value) or "__null__"
+    if field_path.endswith(".category") and "other_charges" in field_path:
+        mapped = map_category_to_standard(value)
+        return mapped or "__null__"
     if is_semantic_field_path(field_path):
         return normalize_whitespace(str(value)).casefold()
     return normalize_comparison_text(str(value))
@@ -646,6 +662,8 @@ def format_output_value(field_path: str, value: Any) -> Any:
         return normalize_whitespace(str(value)).upper()
     if field_path.endswith("gender"):
         return normalize_gender_value(value)
+    if field_path == "summary.medical_facility_name":
+        return normalize_facility_name(value)
     return normalize_whitespace(value) if isinstance(value, str) else value
 
 

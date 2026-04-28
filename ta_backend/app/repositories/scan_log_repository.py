@@ -172,6 +172,26 @@ class ScanLogRepository:
             )
         ).scalar_one_or_none()
 
+    def get_by_id_for_eval_export(self, scan_log_id: int) -> ScanLog | None:
+        return self._db.execute(
+            select(ScanLog)
+            .where(ScanLog.id == scan_log_id)
+            .options(
+                selectinload(ScanLog.ai_runs),
+            )
+        ).scalar_one_or_none()
+
+    def get_latest_for_user_for_eval_export(self, user_id: int) -> ScanLog | None:
+        return self._db.execute(
+            select(ScanLog)
+            .where(ScanLog.user_id == user_id)
+            .order_by(ScanLog.created_at.desc(), ScanLog.id.desc())
+            .limit(1)
+            .options(
+                selectinload(ScanLog.ai_runs),
+            )
+        ).scalar_one_or_none()
+
     def get_by_id_and_user_id(self, scan_log_id: int, user_id: int) -> ScanLog | None:
         return self._db.execute(
             select(ScanLog)

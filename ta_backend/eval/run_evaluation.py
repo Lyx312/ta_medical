@@ -106,6 +106,8 @@ def _extract_list_item_name(val: Any, section: str) -> str:
 
 def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: dict[str, Any], score: dict[str, Any], medicine_matches: list, other_charges_matches: list) -> list[str]:
     per_field = score.get("per_field", {})
+    critical_fail_reasons = score.get("critical_fail_reasons", [])
+    critical_fail_text = "\n".join(critical_fail_reasons) if critical_fail_reasons else "None"
     html = [
         "<!DOCTYPE html>",
         "<html><head><meta charset='utf-8'><title>Claim Diff Report</title>",
@@ -119,12 +121,21 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
         "td:nth-child(3){width:35%}",
         "td:nth-child(4){width:10%}",
         ".g{color:#4ec9b0}.r{color:#f14c4c}.y{color:#dcdcaa}.b{color:#569cd6}",
+        ".muted{color:#808080}",
         ".section{margin:20px 0 5px;font-weight:bold;font-size:18px;color:#569cd6}",
         ".field{color:#9cdcfe}",
+        ".summary-card{background:#252526;border:1px solid #444;padding:12px;margin:12px 0}",
         "pre{margin:0;white-space:pre-wrap;word-wrap:break-word}",
         "</style></head><body>",
         f"<h2>Claim Diff: {claim_id}</h2>",
-        f"<p>Overall F1: <span class='b'>{score.get('overall_f1', 0):.4f}</span></p>",
+        "<div class='summary-card'>",
+        f"<div>Soft F1: <span class='b'>{score.get('soft_f1', score.get('overall_f1', 0)):.4f}</span></div>",
+        f"<div>Strict F1: <span class='b'>{score.get('strict_f1', 0):.4f}</span></div>",
+        f"<div>Edit Burden Score: <span class='b'>{score.get('edit_burden_score', 0):.4f}</span></div>",
+        f"<div>Pass Verify Only: <span class='{'g' if score.get('pass_verify_only', False) else 'r'}'>{score.get('pass_verify_only', False)}</span></div>",
+        "<div>Critical Fail Reasons:</div>",
+        f"<pre>{critical_fail_text}</pre>",
+        "</div>",
     ]
 
     sections = ["summary", "patient_info", "medical_context", "medicines", "other_charges", "financial_recap"]
@@ -140,6 +151,7 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                 fp = f"{section}.{field}"
                 m = per_field.get(fp, {})
                 f1, cer = m.get("f1", 0), m.get("cer")
+                strict_f1 = m.get("strict_f1")
 
                 if gv is None and pv is None:
                     stat, cls = "✓", "g"
@@ -156,6 +168,9 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                 else:
                     stat, cls = "✗", "r"
 
+                if isinstance(strict_f1, (int, float)):
+                    stat = f"{stat} / strict={strict_f1:.2f}"
+
                 html.append(f"<tr><td class='field'>{fp}</td><td>{_format_html_cell(gv)}</td><td>{_format_html_cell(pv)}</td><td class='{cls}'>{stat}</td></tr>")
 
         elif isinstance(pred_s, list) and pred_s:
@@ -166,17 +181,19 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                 unmatched_gt = med_details.get("unmatched_ground_truth", [])
 
                 idx = 0
+                strict_matches = per_field.get("medicines", {}).get("strict_matches", [])
                 for m in matches:
                     gt_name = m.get("ground_truth", {}).get("name", "?")
                     pred_name = m.get("predicted", {}).get("name", "?")
                     sim = m.get("similarity", 0.0)
+                    strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
                         stat, cls = "✓", "g"
                     elif sim >= 0.5:
                         stat, cls = "~", "y"
                     else:
                         stat, cls = "✗", "r"
-                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_name)}</td><td>{_format_html_cell(pred_name)}</td><td class='{cls}'>{stat} (sim={sim:.2f})</td></tr>")
+                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_name)}</td><td>{_format_html_cell(pred_name)}</td><td class='{cls}'>{stat} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})</td></tr>")
                     idx += 1
                 for m in unmatched_pred:
                     html.append(f"<tr><td>[{idx}]</td><td>-</td><td>{_format_html_cell(m.get('name', '?'))}</td><td class='r'>extra</td></tr>")
@@ -190,19 +207,21 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                 matches = oc_details.get("matches", [])
                 unmatched_pred = oc_details.get("unmatched_predicted", [])
                 unmatched_gt = oc_details.get("unmatched_ground_truth", [])
+                strict_matches = per_field.get("other_charges", {}).get("strict_matches", [])
 
                 idx = 0
                 for m in matches:
                     gt_cat = m.get("ground_truth", {}).get("category", "?")
                     pred_cat = m.get("predicted", {}).get("category", "?")
                     sim = m.get("similarity", 0.0)
+                    strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
                         stat, cls = "✓", "g"
                     elif sim >= 0.5:
                         stat, cls = "~", "y"
                     else:
                         stat, cls = "✗", "r"
-                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_cat)}</td><td>{_format_html_cell(pred_cat)}</td><td class='{cls}'>{stat} (sim={sim:.2f})</td></tr>")
+                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_cat)}</td><td>{_format_html_cell(pred_cat)}</td><td class='{cls}'>{stat} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})</td></tr>")
                     idx += 1
                 for m in unmatched_pred:
                     html.append(f"<tr><td>[{idx}]</td><td>-</td><td>{_format_html_cell(m.get('category', '?'))}</td><td class='r'>extra</td></tr>")
@@ -799,27 +818,45 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
     per_section = score.get("per_section", {})
     per_field = score.get("per_field", {})
 
+    print(f"\n{C_BOLD}CLAIM SUMMARY:{C_RESET}")
+    print(f"  soft_f1: {score.get('soft_f1', score.get('overall_f1', 0.0)):.4f}")
+    print(f"  strict_f1: {score.get('strict_f1', 0.0):.4f}")
+    print(f"  edit_burden_score: {score.get('edit_burden_score', 0.0):.4f}")
+    print(f"  pass_verify_only: {score.get('pass_verify_only', False)}")
+    critical_fail_reasons = score.get("critical_fail_reasons", [])
+    if critical_fail_reasons:
+        print("  critical_fail_reasons:")
+        for reason in critical_fail_reasons:
+            print(f"    - {reason}")
+
     print(f"\n{C_BOLD}SECTION BREAKDOWN:{C_RESET}")
-    print(f"{'SECTION':<20} {'F1':>8} {'PREC':>8} {'REC':>8} {'TP':>6} {'FP':>6} {'FN':>6}")
-    print("-" * 74)
+    print(f"{'SECTION':<20} {'SOFT':>8} {'STRICT':>8} {'SIM':>8} {'S_TP':>8} {'X_FP':>6} {'X_FN':>6}")
+    print("-" * 80)
     for section in sorted(per_section.keys()):
         s = per_section[section]
-        f1 = s.get("f1", 0.0)
-        p = s.get("precision", 0.0)
-        r = s.get("recall", 0.0)
-        tp = s.get("tp", 0)
-        fp = s.get("fp", 0)
-        fn = s.get("fn", 0)
-        print(f"{section:<20} {f1:>8.4f} {p:>8.4f} {r:>8.4f} {tp:>6} {fp:>6} {fn:>6}")
+        soft_f1 = s.get("soft_f1", s.get("f1", 0.0))
+        strict_f1 = s.get("strict_f1", s.get("f1", 0.0))
+        avg_similarity = s.get("avg_similarity")
+        sim_str = f"{avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else "-"
+        strict_tp = s.get("strict_tp", s.get("tp", 0))
+        strict_fp = s.get("strict_fp", s.get("fp", 0))
+        strict_fn = s.get("strict_fn", s.get("fn", 0))
+        print(f"{section:<20} {soft_f1:>8.4f} {strict_f1:>8.4f} {sim_str:>8} {strict_tp:>8} {strict_fp:>6} {strict_fn:>6}")
 
     print(f"\n{C_BOLD}PER-FIELD BREAKDOWN:{C_RESET}")
     for field, metrics in sorted(per_field.items()):
         f1 = metrics.get("f1", 0.0)
+        strict_f1 = metrics.get("strict_f1")
         cer = metrics.get("cer")
+        avg_similarity = metrics.get("avg_similarity") or metrics.get("similarity")
         if cer is not None:
-            print(f"  {field:<40} F1={f1:.4f}  CER={cer:.4f}")
+            extra = f"  strict={strict_f1:.4f}" if isinstance(strict_f1, (int, float)) else ""
+            sim_extra = f"  sim={avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else ""
+            print(f"  {field:<40} soft={f1:.4f}{extra}{sim_extra}  CER={cer:.4f}")
         else:
-            print(f"  {field:<40} F1={f1:.4f}")
+            extra = f"  strict={strict_f1:.4f}" if isinstance(strict_f1, (int, float)) else ""
+            sim_extra = f"  sim={avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else ""
+            print(f"  {field:<40} soft={f1:.4f}{extra}{sim_extra}")
 
     med_details = score.get("medicine_details", {})
     if med_details:
@@ -827,6 +864,7 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
         unmatched_pred = med_details.get("unmatched_predicted", [])
         unmatched_gt = med_details.get("unmatched_ground_truth", [])
         avg_similarity = per_field.get("medicines", {}).get("avg_similarity")
+        strict_matches = per_field.get("medicines", {}).get("strict_matches", [])
         print(f"\n{C_BOLD}MEDICINE MATCHES:{C_RESET}")
         if avg_similarity is not None:
             print(f"  Avg similarity: {avg_similarity:.4f}")
@@ -835,7 +873,9 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
             pred_name = m.get("predicted", {}).get("name", "?")
             sim = m.get("similarity", 0.0)
             status = f"{C_GREEN}✓{C_RESET}" if sim >= 0.8 else f"{C_YELLOW}~{C_RESET}"
-            print(f"  {status} GT: {gt_name} → PRED: {pred_name} (sim={sim:.2f})")
+            strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
+            strict_tag = " strict=pass" if strict_pass else " strict=fail"
+            print(f"  {status} GT: {gt_name} → PRED: {pred_name} (sim={sim:.2f},{strict_tag})")
         for m in unmatched_pred:
             print(f"  {C_RED}[EXTRA]{C_RESET} PRED: {m.get('name', '?')}")
         for m in unmatched_gt:
@@ -851,8 +891,10 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
             gt_desc = m.get("ground_truth", {}).get("description", "?")
             pred_desc = m.get("predicted", {}).get("description", "?")
             sim = m.get("similarity", 0.0)
+            doc_sim = m.get("doctor_similarity")
             status = f"{C_GREEN}✓{C_RESET}" if sim >= 0.8 else f"{C_YELLOW}~{C_RESET}"
-            print(f"  {status} GT: {gt_desc} → PRED: {pred_desc} (sim={sim:.2f})")
+            doc_extra = f", doc={doc_sim:.2f}" if isinstance(doc_sim, (int, float)) else ""
+            print(f"  {status} GT: {gt_desc} → PRED: {pred_desc} (sim={sim:.2f}{doc_extra})")
 
     oc_details = score.get("other_charges_details", {})
     oc_matches = oc_details.get("matches", []) if isinstance(oc_details, dict) else []
@@ -864,8 +906,10 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
             gt_cat = m.get("ground_truth", {}).get("category", "?")
             pred_cat = m.get("predicted", {}).get("category", "?")
             sim = m.get("similarity", 0.0)
+            desc_sim = m.get("description_similarity")
             status = f"{C_GREEN}✓{C_RESET}" if sim >= 0.8 else f"{C_YELLOW}~{C_RESET}"
-            print(f"  {status} GT: {gt_cat} → PRED: {pred_cat} (sim={sim:.2f})")
+            desc_extra = f", desc={desc_sim:.2f}" if isinstance(desc_sim, (int, float)) else ""
+            print(f"  {status} GT: {gt_cat} → PRED: {pred_cat} (sim={sim:.2f}{desc_extra})")
 
 
 def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], score: dict[str, Any], html_file: Path | None = None, claim_id: str | None = None) -> None:
@@ -896,6 +940,7 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
 
                 metrics = per_field.get(field_path, {})
                 f1 = metrics.get("f1", 0.0)
+                strict_f1 = metrics.get("strict_f1")
                 cer = metrics.get("cer")
 
                 if gt_val is None and pred_val is None:
@@ -906,6 +951,8 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                     status = f"{C_RED}missing{C_RESET}"
                 elif cer is not None:
                     status = f"{C_YELLOW}CER={cer:.2f}{C_RESET}"
+                elif isinstance(strict_f1, (int, float)) and strict_f1 < 1.0:
+                    status = f"{C_YELLOW}soft={f1:.2f} strict={strict_f1:.2f}{C_RESET}"
                 elif f1 >= 1.0:
                     status = f"{C_GREEN}✓{C_RESET}"
                 elif f1 >= 0.5:
@@ -927,18 +974,20 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                 matches = med_details.get("matches", [])
                 unmatched_pred = med_details.get("unmatched_predicted", [])
                 unmatched_gt = med_details.get("unmatched_ground_truth", [])
+                strict_matches = per_field.get("medicines", {}).get("strict_matches", [])
 
                 for m in matches:
                     gt_name = m.get("ground_truth", {}).get("name", "?")
                     pred_name = m.get("predicted", {}).get("name", "?")
                     sim = m.get("similarity", 0.0)
+                    strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
                         status = f"{C_GREEN}✓{C_RESET}"
                     elif sim >= 0.5:
                         status = f"{C_YELLOW}~{C_RESET}"
                     else:
                         status = f"{C_RED}✗{C_RESET}"
-                    print(f"  [{status}] GT: {gt_name:<25} PRED: {pred_name:<25} (sim={sim:.2f})")
+                    print(f"  [{status}] GT: {gt_name:<25} PRED: {pred_name:<25} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})")
                 for m in unmatched_pred:
                     print(f"  [{C_RED}EXTRA{C_RESET}] PRED: {m.get('name', '?')}")
                 for m in unmatched_gt:
@@ -949,18 +998,20 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                 matches = oc_details.get("matches", [])
                 unmatched_pred = oc_details.get("unmatched_predicted", [])
                 unmatched_gt = oc_details.get("unmatched_ground_truth", [])
+                strict_matches = per_field.get("other_charges", {}).get("strict_matches", [])
 
                 for m in matches:
                     gt_cat = m.get("ground_truth", {}).get("category", "?")
                     pred_cat = m.get("predicted", {}).get("category", "?")
                     sim = m.get("similarity", 0.0)
+                    strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
                         status = f"{C_GREEN}✓{C_RESET}"
                     elif sim >= 0.5:
                         status = f"{C_YELLOW}~{C_RESET}"
                     else:
                         status = f"{C_RED}✗{C_RESET}"
-                    print(f"  [{status}] GT: {gt_cat:<15} PRED: {pred_cat:<15} (sim={sim:.2f})")
+                    print(f"  [{status}] GT: {gt_cat:<15} PRED: {pred_cat:<15} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})")
                 for m in unmatched_pred:
                     print(f"  [{C_RED}EXTRA{C_RESET}] PRED: {m.get('category', '?')}")
                 for m in unmatched_gt:

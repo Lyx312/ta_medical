@@ -80,6 +80,7 @@ class ScanMedicineImageInterpretationJudge(BaseDocumentAIProcessor):
         ambiguous_medicines: list[dict[str, Any]],
         ranked_group_suggestions: list[dict[str, Any]],
         db_medicine_hints: list[dict[str, Any]],
+        ai_call_context: dict[str, Any] | None = None,
     ) -> BatchMedicineInterpretationResponse:
         if not ambiguous_medicines:
             return BatchMedicineInterpretationResponse(judgements=[])
@@ -100,11 +101,25 @@ class ScanMedicineImageInterpretationJudge(BaseDocumentAIProcessor):
         system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
         user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
 
-        response = await model.ainvoke(
+        response, _tracking_payload = await self._ainvoke_with_tracking(
+            model,
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=self._build_image_messages(user_prompt, images)),
-            ]
+            ],
+            provider=model_spec.provider,
+            model_name=model_spec.model,
+            call_kind="medicine_prioritization",
+            success_context={
+                **(ai_call_context or {}),
+                "temperature": model_spec.temperature,
+                "request_context_payload": {
+                    "image_count": len(images),
+                    "ambiguous_medicine_count": len(ambiguous_medicines),
+                    "group_suggestion_count": len(ranked_group_suggestions),
+                    "db_hint_count": len(db_medicine_hints),
+                },
+            },
         )
         payload = self._parse_ai_response_to_json(response.content)
         try:
@@ -370,6 +385,8 @@ async def prioritize_scan_medicines(
     *,
     images: list[DocumentImageInput],
     interpretation_mode: str = "suggest_only",
+    scan_log_id: int | None = None,
+    user_id: int | None = None,
 ) -> tuple[AIMedicalScanResponse, dict[str, Any]]:
     medicines = list(scan_result.medicines)
     if len(medicines) <= 1:
@@ -470,6 +487,10 @@ async def prioritize_scan_medicines(
                 ambiguous_medicines=ambiguous_payload,
                 ranked_group_suggestions=ranked_group_suggestions,
                 db_medicine_hints=db_medicine_hints,
+                ai_call_context={
+                    "scan_log_id": scan_log_id,
+                    "user_id": user_id,
+                },
             )
             judgement_map = {judgement.original_index: judgement for judgement in batch_response.judgements}
             updated_records = records[:]

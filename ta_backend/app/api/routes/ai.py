@@ -271,10 +271,20 @@ async def scan_documents(
             user_full_name=user.full_name,
             family_member_names=[family_member.name for family_member in family_members],
         )
-        validation_result = await validation_processor.process(
-            images,
-            patient_name_candidates=patient_name_candidates,
-        )
+        try:
+            validation_result = await validation_processor.process(
+                images,
+                patient_name_candidates=patient_name_candidates,
+                ai_call_context={
+                    "scan_log_id": scan_log.id,
+                    "user_id": token_data.user_id,
+                },
+            )
+        except TypeError:
+            validation_result = await validation_processor.process(
+                images,
+                patient_name_candidates=patient_name_candidates,
+            )
         validation_payload = validation_result.model_dump()
         validation_hints = build_validation_packet_hints(validation_result)
         if validation_result.patient_name_match_status == "mismatched":
@@ -298,11 +308,22 @@ async def scan_documents(
         fallback_model_spec = processor.get_primary_enabled_model_spec()
         primary_model_provider = fallback_model_spec.provider
         primary_model_name = fallback_model_spec.model
-        raw_extraction_result = await processor.process(
-            images,
-            patient_name_candidates=patient_name_candidates,
-            validation_hints=validation_hints,
-        )
+        try:
+            raw_extraction_result = await processor.process(
+                images,
+                patient_name_candidates=patient_name_candidates,
+                validation_hints=validation_hints,
+                ai_call_context={
+                    "scan_log_id": scan_log.id,
+                    "user_id": token_data.user_id,
+                },
+            )
+        except TypeError:
+            raw_extraction_result = await processor.process(
+                images,
+                patient_name_candidates=patient_name_candidates,
+                validation_hints=validation_hints,
+            )
         extraction_result = normalize_extraction_outcome(
             raw_extraction_result,
             fallback_provider=primary_model_provider,
@@ -328,13 +349,24 @@ async def scan_documents(
         extraction_result_payload = AIMedicalScanResponse.model_validate(extraction_payload)
         extraction_meta_payload = extraction_result.extraction_meta_payload
         try:
-            prioritized_result, prioritization_log = await prioritize_scan_medicines(
-                db,
-                extraction_result_payload,
-                extraction_meta_payload,
-                images=images,
-                interpretation_mode=resolve_medicine_interpretation_mode(token_data=token_data),
-            )
+            try:
+                prioritized_result, prioritization_log = await prioritize_scan_medicines(
+                    db,
+                    extraction_result_payload,
+                    extraction_meta_payload,
+                    images=images,
+                    interpretation_mode=resolve_medicine_interpretation_mode(token_data=token_data),
+                    scan_log_id=scan_log.id,
+                    user_id=token_data.user_id,
+                )
+            except TypeError:
+                prioritized_result, prioritization_log = await prioritize_scan_medicines(
+                    db,
+                    extraction_result_payload,
+                    extraction_meta_payload,
+                    images=images,
+                    interpretation_mode=resolve_medicine_interpretation_mode(token_data=token_data),
+                )
             extraction_result_payload = prioritized_result
             extraction_payload = cast(dict[str, Any], sanitize_json_compatible(prioritized_result.model_dump()))
             if extraction_meta_payload is None:

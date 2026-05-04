@@ -189,6 +189,7 @@ class MedicineRelevanceLLMJudge(BaseDocumentAIProcessor):
         diagnosis_text: str,
         anamnesis_text: str,
         evidence_rows: list[KnowledgeCandidate],
+        ai_call_context: dict[str, Any] | None = None,
     ) -> LLMMedicineJudgement:
         model_spec = self.get_primary_enabled_model_spec()
         model = self._create_chat_model(model_spec)
@@ -219,11 +220,23 @@ class MedicineRelevanceLLMJudge(BaseDocumentAIProcessor):
         }
         system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
         user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
-        response = await model.ainvoke(
+        response, _tracking_payload = await self._ainvoke_with_tracking(
+            model,
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt),
-            ]
+            ],
+            provider=model_spec.provider,
+            model_name=model_spec.model,
+            call_kind="medicine_relevance",
+            success_context={
+                **(ai_call_context or {}),
+                "temperature": model_spec.temperature,
+                "request_context_payload": {
+                    "medicine_name": medicine_name,
+                    "evidence_count": len(evidence_rows),
+                },
+            },
         )
         payload = self._parse_ai_response_to_json(response.content)
         try:
@@ -465,6 +478,8 @@ async def evaluate_claim_medicines(
     anamnesis_text: str,
     *,
     claim_id: int | None = None,
+    user_id: int | None = None,
+    scan_log_id: int | None = None,
     persist: bool = True,
 ) -> tuple[list[ClaimMedicine], bool, str | None]:
     knowledge_repository = ClaimMedicineKnowledgeRepository(db)
@@ -539,6 +554,14 @@ async def evaluate_claim_medicines(
                 diagnosis_text=diagnosis_text,
                 anamnesis_text=anamnesis_text,
                 evidence_rows=ranked_candidates[:DEFAULT_EVIDENCE_LIMIT],
+                ai_call_context={
+                    "user_id": user_id,
+                    "scan_log_id": scan_log_id,
+                    "request_context_payload": {
+                        "claim_id": claim_id,
+                        "medicine_name": medicine.name,
+                    },
+                },
             )
             medicine_result = _build_medicine_result(
                 medicine,

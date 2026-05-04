@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from langchain_core.language_models._utils import _normalize_messages
 from langchain_core.messages import AIMessage
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.routes import ai as ai_route
@@ -20,6 +20,7 @@ from app.db.base import Base
 from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
 from app.models.ai_model import AIModel
+from app.models.scan_log import AIApiCallLog
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services import ai_service as ai_service_module
@@ -1032,6 +1033,83 @@ def test_process_uses_first_active_database_model(
 
     assert result.result.model_dump() == SCAN_RESULT
     assert selected_models == ["model-b", "model-b", "model-a", "model-a"]
+
+
+def test_ainvoke_with_tracking_persists_usage_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.content = json.dumps(SCAN_RESULT)
+            self.usage_metadata = {
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "total_tokens": 168,
+            }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> FakeResponse:
+            assert len(messages) == 2
+            return FakeResponse()
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+
+    response, tracking_payload = asyncio.run(
+        medical_processor._ainvoke_with_tracking(
+            FakeModel(),
+            [object(), object()],
+            provider="google_genai",
+            model_name="gemini-test",
+            call_kind="scan_extraction",
+            success_context={"request_context_payload": {"image_count": 1}},
+        )
+    )
+
+    assert response.content == json.dumps(SCAN_RESULT)
+    assert tracking_payload["prompt_tokens"] == 123
+    assert tracking_payload["completion_tokens"] == 45
+    assert tracking_payload["total_tokens"] == 168
+
+    with session_factory() as db:
+        rows = db.execute(select(AIApiCallLog)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].provider == "google_genai"
+        assert rows[0].call_kind == "scan_extraction"
+        assert rows[0].prompt_tokens == 123
+        assert rows[0].completion_tokens == 45
+        assert rows[0].total_tokens == 168
+
+
+def test_ainvoke_with_tracking_persists_failure_without_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 1
+            raise RuntimeError("provider boom")
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+
+    with pytest.raises(RuntimeError, match="provider boom"):
+        asyncio.run(
+            medical_processor._ainvoke_with_tracking(
+            FakeModel(),
+            [object()],
+            provider="google_genai",
+            model_name="gemini-test",
+            call_kind="field_judge",
+            success_context={},
+        )
+        )
+
+    with session_factory() as db:
+        rows = db.execute(select(AIApiCallLog)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].success is False
+        assert rows[0].error_message == "provider boom"
+        assert rows[0].prompt_tokens is None
 
 
 def test_process_uses_judge_for_service_date_conflict(

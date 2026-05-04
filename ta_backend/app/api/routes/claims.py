@@ -261,6 +261,8 @@ async def create_claim(
         medicines_input,
         keterangan_penyakit,
         kronologi,
+        user_id=token_data.user_id,
+        scan_log_id=source_scan_log_id,
         persist=False,
     )
 

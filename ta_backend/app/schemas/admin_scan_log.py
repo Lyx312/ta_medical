@@ -44,11 +44,31 @@ class AdminScanLogAIRunResponse(BaseModel):
     payload: dict[str, Any] | None
 
 
+class AdminAIApiCallLogResponse(BaseModel):
+    provider: str
+    model_name: str
+    call_kind: str
+    producer_id: str | None
+    producer_rank: int | None
+    run_index: int | None
+    temperature: float | None
+    success: bool
+    error_message: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int | None
+    usage_payload: dict[str, Any] | None
+    request_context_payload: dict[str, Any] | None
+    created_at: datetime
+
+
 class AdminScanLogDetailResponse(AdminScanLogListItemResponse):
     ai_execution_mode: str | None = None
     validation_payload: dict[str, Any] | None
     extraction_payload: dict[str, Any] | None
     ai_model_runs: list[AdminScanLogAIRunResponse] = []
+    ai_api_calls: list[AdminAIApiCallLogResponse] = []
     extraction_meta_payload: dict[str, Any] | None = None
     error_payload: dict[str, Any] | None
     files: list[AdminScanLogFileResponse]

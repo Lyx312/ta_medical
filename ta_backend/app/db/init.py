@@ -4,6 +4,7 @@ from sqlalchemy import inspect, select, text
 
 from app.db.base import Base
 from app.db.session import get_engine, get_session_factory
+from app.models.scan_log import AIApiCallLog  # noqa: F401
 from app.models.user import User, hash_password
 from app.repositories.ai_model_repository import AIModelRepository, SeedAIModelRecord
 
@@ -78,6 +79,7 @@ def initialize_database() -> None:
     Base.metadata.create_all(bind=get_engine())
     ensure_ai_model_schema()
     ensure_scan_log_schema()
+    ensure_ai_api_call_log_schema()
     ensure_claim_schema()
     ensure_claim_medicine_knowledge_schema()
     seed_default_admin()
@@ -283,6 +285,50 @@ def _ensure_scan_log_ai_runs_table(engine: Any, inspector: Any) -> None:
             )
         )
         connection.execute(text("CREATE INDEX ix_scan_log_ai_runs_scan_log_id ON scan_log_ai_runs(scan_log_id)"))
+
+
+def ensure_ai_api_call_log_schema() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    _ensure_ai_api_call_logs_table(engine, inspector)
+
+
+def _ensure_ai_api_call_logs_table(engine: Any, inspector: Any) -> None:
+    tables = set(inspector.get_table_names())
+    if "ai_api_call_logs" in tables:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE ai_api_call_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_log_id INTEGER REFERENCES scan_logs(id),
+                    user_id INTEGER REFERENCES users(id),
+                    provider VARCHAR(50) NOT NULL,
+                    model_name VARCHAR(150) NOT NULL,
+                    call_kind VARCHAR(80) NOT NULL,
+                    producer_id VARCHAR(200),
+                    producer_rank INTEGER,
+                    run_index INTEGER,
+                    temperature REAL,
+                    success BOOLEAN NOT NULL,
+                    error_message TEXT,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    latency_ms INTEGER,
+                    usage_payload JSON,
+                    request_context_payload JSON,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        connection.execute(text("CREATE INDEX ix_ai_api_call_logs_scan_log_id ON ai_api_call_logs(scan_log_id)"))
+        connection.execute(text("CREATE INDEX ix_ai_api_call_logs_user_id ON ai_api_call_logs(user_id)"))
+        connection.execute(text("CREATE INDEX ix_ai_api_call_logs_call_kind ON ai_api_call_logs(call_kind)"))
 
 
 def _migrate_scan_logs_to_new_schema(engine: Any) -> None:

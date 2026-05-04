@@ -49,6 +49,11 @@ class ScanLog(Base):
         cascade="all, delete-orphan",
         order_by="ScanLogAIRun.id.asc()",
     )
+    ai_api_call_logs: Mapped[list["AIApiCallLog"]] = relationship(
+        back_populates="scan_log",
+        cascade="all, delete-orphan",
+        order_by="AIApiCallLog.id.asc()",
+    )
     linked_claims: Mapped[list[Claim]] = relationship(
         "Claim",
         back_populates="source_scan_log",
@@ -97,3 +102,34 @@ class ScanLogAIRun(Base):
     )
 
     scan_log: Mapped[ScanLog] = relationship(back_populates="ai_runs")
+
+
+class AIApiCallLog(Base):
+    __tablename__ = "ai_api_call_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_log_id: Mapped[int | None] = mapped_column(ForeignKey("scan_logs.id"), index=True, nullable=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    call_kind: Mapped[str] = mapped_column(String(80), nullable=False)
+    producer_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    producer_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    request_context_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    scan_log: Mapped[ScanLog | None] = relationship(back_populates="ai_api_call_logs")
+    user: Mapped[User | None] = relationship("User")

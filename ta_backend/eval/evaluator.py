@@ -5,9 +5,12 @@ from app.services.standard_vocabulary import (
     get_document_type_display_name,
     get_category_display_name,
     map_category_to_standard,
+    map_category_to_standard_strict,
     map_description_to_category,
+    map_description_to_category_strict,
     normalize_facility_name,
     normalize_to_standard_document_type,
+    normalize_to_standard_document_type_strict,
     STANDARD_DOCUMENT_TYPES,
     OTHER_CHARGE_CATEGORIES,
 )
@@ -378,8 +381,8 @@ class MedicalClaimEvaluator:
         return _metric_dict(tp, fp, fn, **details)
 
     def _evaluate_detected_documents_strict(self, pred: list, gt: list) -> dict[str, Any]:
-        pred_types = {doc_type for doc_type in (normalize_to_standard_document_type(d) for d in pred or []) if doc_type and doc_type != "OTHER"}
-        gt_types = {doc_type for doc_type in (normalize_to_standard_document_type(d) for d in gt or []) if doc_type and doc_type != "OTHER"}
+        pred_types = {doc_type for doc_type in (normalize_to_standard_document_type_strict(d) for d in pred or []) if doc_type}
+        gt_types = {doc_type for doc_type in (normalize_to_standard_document_type_strict(d) for d in gt or []) if doc_type}
         common = pred_types & gt_types
         return _metric_dict(len(common), len(pred_types - gt_types), len(gt_types - pred_types))
 
@@ -840,7 +843,7 @@ class MedicalClaimEvaluator:
             pred_cat_raw = pred_charge.get("category") or ""
             pred_desc = pred_charge.get("description") or ""
             pred_amount = pred_charge.get("amount")
-            pred_cat_mapped = map_category_to_standard(pred_cat_raw) or map_description_to_category(pred_desc)
+            pred_cat_mapped = map_category_to_standard_strict(pred_cat_raw) or map_description_to_category_strict(pred_desc)
             best_idx = -1
             best_score = 0.0
             best_desc_score = 0.0
@@ -850,7 +853,7 @@ class MedicalClaimEvaluator:
                 gt_cat_raw = gt_charge.get("category") or ""
                 gt_desc = gt_charge.get("description") or ""
                 gt_amount = gt_charge.get("amount")
-                gt_cat_mapped = map_category_to_standard(gt_cat_raw) or map_description_to_category(gt_desc)
+                gt_cat_mapped = map_category_to_standard_strict(gt_cat_raw) or map_description_to_category_strict(gt_desc)
                 desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_desc))
                 amount_match = _num_match(pred_amount, gt_amount)
                 cat_match = pred_cat_mapped and gt_cat_mapped and pred_cat_mapped.upper() == gt_cat_mapped.upper()

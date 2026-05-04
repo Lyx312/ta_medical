@@ -653,71 +653,93 @@ def build_aggregate_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     if not successful:
         return {
             "overall_macro_f1": 0.0,
+            "overall_macro_soft_f1": 0.0,
+            "overall_macro_strict_f1": 0.0,
             "overall_macro_precision": 0.0,
             "overall_macro_recall": 0.0,
+            "overall_macro_edit_burden_score": 0.0,
             "successful_claims": 0,
             "failed_claims": len(results),
             "claims_from_cache": claims_from_cache,
             "claims_from_fresh_scan": claims_from_fresh_scan,
             "per_section_macro_f1": {},
+            "per_section_macro_strict_f1": {},
             "per_section_macro_precision": {},
             "per_section_macro_recall": {},
             "per_field_macro_f1": {},
+            "per_field_macro_strict_f1": {},
             "per_field_macro_precision": {},
             "per_field_macro_recall": {},
         }
 
     section_names = {section for result in successful for section in result["score"]["per_section"].keys()}
     per_section_macro_f1: dict[str, float] = {}
+    per_section_macro_strict_f1: dict[str, float] = {}
     per_section_macro_precision: dict[str, float] = {}
     per_section_macro_recall: dict[str, float] = {}
     for section in sorted(section_names):
         precisions = [result["score"]["per_section"].get(section, {}).get("precision", 0.0) for result in successful]
         recalls = [result["score"]["per_section"].get(section, {}).get("recall", 0.0) for result in successful]
         f1s = [result["score"]["per_section"].get(section, {}).get("f1", 0.0) for result in successful]
+        strict_f1s = [result["score"]["per_section"].get(section, {}).get("strict_f1", result["score"]["per_section"].get(section, {}).get("f1", 0.0)) for result in successful]
         per_section_macro_precision[section] = round(sum(precisions) / len(precisions), 4)
         per_section_macro_recall[section] = round(sum(recalls) / len(recalls), 4)
         per_section_macro_f1[section] = round(sum(f1s) / len(f1s), 4)
+        per_section_macro_strict_f1[section] = round(sum(strict_f1s) / len(strict_f1s), 4)
 
     field_names = {field for result in successful for field in result["score"].get("per_field", {}).keys()}
     per_field_macro_f1: dict[str, float] = {}
+    per_field_macro_strict_f1: dict[str, float] = {}
     per_field_macro_precision: dict[str, float] = {}
     per_field_macro_recall: dict[str, float] = {}
     for field in sorted(field_names):
         precisions = [result["score"].get("per_field", {}).get(field, {}).get("precision", 0.0) for result in successful]
         recalls = [result["score"].get("per_field", {}).get(field, {}).get("recall", 0.0) for result in successful]
         f1s = [result["score"].get("per_field", {}).get(field, {}).get("f1", 0.0) for result in successful]
+        strict_f1s = [result["score"].get("per_field", {}).get(field, {}).get("strict_f1", result["score"].get("per_field", {}).get(field, {}).get("f1", 0.0)) for result in successful]
         per_field_macro_precision[field] = round(sum(precisions) / len(precisions), 4)
         per_field_macro_recall[field] = round(sum(recalls) / len(recalls), 4)
         per_field_macro_f1[field] = round(sum(f1s) / len(f1s), 4)
+        per_field_macro_strict_f1[field] = round(sum(strict_f1s) / len(strict_f1s), 4)
 
     overall_precisions = [result["score"].get("overall_precision", result["score"]["overall_f1"]) for result in successful]
     overall_recalls = [result["score"].get("overall_recall", result["score"]["overall_f1"]) for result in successful]
     overall_f1s = [result["score"]["overall_f1"] for result in successful]
+    overall_soft_f1s = [result["score"].get("soft_f1", result["score"]["overall_f1"]) for result in successful]
+    overall_strict_f1s = [result["score"].get("strict_f1", 0.0) for result in successful]
+    edit_burden_scores = [result["score"].get("edit_burden_score", 0.0) for result in successful]
     overall_macro_precision = round(sum(overall_precisions) / len(overall_precisions), 4)
     overall_macro_recall = round(sum(overall_recalls) / len(overall_recalls), 4)
     overall_macro_f1 = round(sum(overall_f1s) / len(overall_f1s), 4)
+    overall_macro_soft_f1 = round(sum(overall_soft_f1s) / len(overall_soft_f1s), 4)
+    overall_macro_strict_f1 = round(sum(overall_strict_f1s) / len(overall_strict_f1s), 4)
+    overall_macro_edit_burden_score = round(sum(edit_burden_scores) / len(edit_burden_scores), 4)
     return {
         "overall_macro_f1": overall_macro_f1,
+        "overall_macro_soft_f1": overall_macro_soft_f1,
+        "overall_macro_strict_f1": overall_macro_strict_f1,
         "overall_macro_precision": overall_macro_precision,
         "overall_macro_recall": overall_macro_recall,
+        "overall_macro_edit_burden_score": overall_macro_edit_burden_score,
         "successful_claims": len(successful),
         "failed_claims": len(results) - len(successful),
         "claims_from_cache": claims_from_cache,
         "claims_from_fresh_scan": claims_from_fresh_scan,
         "per_section_macro_f1": per_section_macro_f1,
+        "per_section_macro_strict_f1": per_section_macro_strict_f1,
         "per_section_macro_precision": per_section_macro_precision,
         "per_section_macro_recall": per_section_macro_recall,
         "per_field_macro_f1": per_field_macro_f1,
+        "per_field_macro_strict_f1": per_field_macro_strict_f1,
         "per_field_macro_precision": per_field_macro_precision,
         "per_field_macro_recall": per_field_macro_recall,
     }
 
 
 def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
-    print("\n" + "=" * 120)
-    print(f"{'CLAIM':<25} {'F1':>7} {'PREC':>7} {'REC':>7} {'CER':>7} {'SRC':>10} {'ELAPSED':>8}  STATUS")
-    print("-" * 120)
+    print("\n" + "=" * 132)
+    print(f"{'CLAIM':<25} {'SOFT':>7} {'STRICT':>7} {'PREC':>7} {'REC':>7} {'CER':>7} {'SRC':>10} {'ELAPSED':>8}  STATUS")
+    print("-" * 132)
 
     total_f1 = 0.0
     total_prec = 0.0
@@ -727,20 +749,21 @@ def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
         source = str(result.get("scan_source", "-"))
         if "error" in result:
             print(
-                f"{result['claim_id']:<25} {'ERR':>7} {'-':>7} {'-':>7} {'-':>7} {source:>10} "
+                f"{result['claim_id']:<25} {'ERR':>7} {'-':>7} {'-':>7} {'-':>7} {'-':>7} {source:>10} "
                 f"{result.get('elapsed_seconds', 0):>8}s  {str(result['error'])[:40]}"
             )
             continue
 
         if mode == "scan-only" or "score" not in result:
             print(
-                f"{result['claim_id']:<25} {'-':>7} {'-':>7} {'-':>7} {'-':>7} {source:>10} "
+                f"{result['claim_id']:<25} {'-':>7} {'-':>7} {'-':>7} {'-':>7} {'-':>7} {source:>10} "
                 f"{result.get('elapsed_seconds', 0):>8}s  scan_saved"
             )
             continue
 
         score = result["score"]
         claim_f1 = score.get("overall_f1", 0.0)
+        claim_strict_f1 = score.get("strict_f1", 0.0)
         claim_prec = score.get("overall_precision", claim_f1)
         claim_rec = score.get("overall_recall", claim_f1)
 
@@ -754,6 +777,7 @@ def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
             cer_str = "-"
 
         claim_f1_str = f"{claim_f1:.4f}"
+        claim_strict_f1_str = f"{claim_strict_f1:.4f}"
         claim_prec_str = f"{claim_prec:.4f}"
         claim_rec_str = f"{claim_rec:.4f}"
 
@@ -762,16 +786,17 @@ def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
         total_rec += claim_rec
         count += 1
         print(
-            f"{result['claim_id']:<25} {claim_f1_str:>7} {claim_prec_str:>7} {claim_rec_str:>7} {cer_str:>7} {source:>10} "
+            f"{result['claim_id']:<25} {claim_f1_str:>7} {claim_strict_f1_str:>7} {claim_prec_str:>7} {claim_rec_str:>7} {cer_str:>7} {source:>10} "
             f"{result.get('elapsed_seconds', 0):>8}s  evaluated"
         )
 
-    print("-" * 120)
+    print("-" * 132)
     if count > 0:
         macro_f1 = total_f1 / count
+        macro_strict_f1 = sum(result.get("score", {}).get("strict_f1", 0.0) for result in results if "error" not in result and "score" in result) / count
         macro_prec = total_prec / count
         macro_rec = total_rec / count
-        print(f"\nOverall Macro: F1={macro_f1:.4f}  P={macro_prec:.4f}  R={macro_rec:.4f}  ({count} claims evaluated)")
+        print(f"\nOverall Macro: soft_f1={macro_f1:.4f}  strict_f1={macro_strict_f1:.4f}  P={macro_prec:.4f}  R={macro_rec:.4f}  ({count} claims evaluated)")
 
     summary = build_aggregate_summary(results)
     print(
@@ -787,30 +812,37 @@ def print_evaluation_summary(summary: dict[str, Any]) -> None:
     print(f"\n{C_BOLD}EVALUATION SUMMARY{C_RESET}")
     print("=" * 80)
     overall_f1 = summary.get("overall_macro_f1", 0.0)
+    overall_soft_f1 = summary.get("overall_macro_soft_f1", overall_f1)
+    overall_strict_f1 = summary.get("overall_macro_strict_f1", 0.0)
     overall_prec = summary.get("overall_macro_precision", 0.0)
     overall_rec = summary.get("overall_macro_recall", 0.0)
-    print(f"Overall Macro:  {C_BOLD}F1={overall_f1:.4f}{C_RESET}  {C_BOLD}P={overall_prec:.4f}{C_RESET}  {C_BOLD}R={overall_rec:.4f}{C_RESET}")
+    overall_edit_burden = summary.get("overall_macro_edit_burden_score", 0.0)
+    print(f"Overall Macro:  {C_BOLD}soft_f1={overall_soft_f1:.4f}{C_RESET}  {C_BOLD}strict_f1={overall_strict_f1:.4f}{C_RESET}  {C_BOLD}P={overall_prec:.4f}{C_RESET}  {C_BOLD}R={overall_rec:.4f}{C_RESET}  {C_BOLD}EBS={overall_edit_burden:.4f}{C_RESET}")
 
     print(f"\n{C_BOLD}SECTION BREAKDOWN (Macro Avg):{C_RESET}")
-    print(f"{'SECTION':<20} {'F1':>8} {'PREC':>8} {'REC':>8}")
-    print("-" * 48)
+    print(f"{'SECTION':<20} {'SOFT':>8} {'STRICT':>8} {'PREC':>8} {'REC':>8}")
+    print("-" * 60)
     sections = summary.get("per_section_macro_f1", {})
+    strict_sections = summary.get("per_section_macro_strict_f1", {})
     prec_dict = summary.get("per_section_macro_precision", {})
     rec_dict = summary.get("per_section_macro_recall", {})
     for section in sorted(sections.keys()):
         f1 = sections.get(section, 0.0)
+        strict_f1 = strict_sections.get(section, 0.0)
         p = prec_dict.get(section, 0.0)
         r = rec_dict.get(section, 0.0)
-        print(f"{section:<20} {f1:>8.4f} {p:>8.4f} {r:>8.4f}")
+        print(f"{section:<20} {f1:>8.4f} {strict_f1:>8.4f} {p:>8.4f} {r:>8.4f}")
 
     field_f1s = summary.get("per_field_macro_f1", {})
+    field_strict_f1s = summary.get("per_field_macro_strict_f1", {})
     if field_f1s:
         sorted_fields = sorted(field_f1s.items(), key=lambda x: x[1])
         bottom_fields = sorted_fields[:5]
-        print(f"\n{C_BOLD}FIELDS NEEDING ATTENTION (lowest F1):{C_RESET}")
+        print(f"\n{C_BOLD}FIELDS NEEDING ATTENTION (lowest soft F1):{C_RESET}")
         for i, (field, f1) in enumerate(bottom_fields, 1):
             color = C_RED if f1 < 0.5 else C_YELLOW if f1 < 0.8 else C_RESET
-            print(f"  {i}. {field:<40} F1={color}{f1:.4f}{C_RESET}")
+            strict_f1 = field_strict_f1s.get(field, 0.0)
+            print(f"  {i}. {field:<40} soft={color}{f1:.4f}{C_RESET} strict={strict_f1:.4f}")
 
 
 def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:

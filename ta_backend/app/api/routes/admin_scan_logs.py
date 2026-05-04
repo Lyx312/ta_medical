@@ -8,6 +8,7 @@ from app.api.routes.auth import get_current_admin_dependency
 from app.db.session import get_db_session
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.admin_scan_log import (
+    AdminAIApiCallLogResponse,
     AdminScanLogAIRunResponse,
     AdminScanLogDetailResponse,
     AdminScanLogFileResponse,
@@ -128,6 +129,27 @@ async def get_scan_log(
                 payload=run.payload,
             )
             for run in scan_log.ai_runs
+        ],
+        ai_api_calls=[
+            AdminAIApiCallLogResponse(
+                provider=call.provider,
+                model_name=call.model_name,
+                call_kind=call.call_kind,
+                producer_id=call.producer_id,
+                producer_rank=call.producer_rank,
+                run_index=call.run_index,
+                temperature=call.temperature,
+                success=call.success,
+                error_message=call.error_message,
+                prompt_tokens=call.prompt_tokens,
+                completion_tokens=call.completion_tokens,
+                total_tokens=call.total_tokens,
+                latency_ms=call.latency_ms,
+                usage_payload=call.usage_payload,
+                request_context_payload=call.request_context_payload,
+                created_at=call.created_at,
+            )
+            for call in scan_log.ai_api_call_logs
         ],
         extraction_meta_payload=scan_log.extraction_meta_payload,
         error_payload=scan_log.error_payload,

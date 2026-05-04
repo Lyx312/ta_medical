@@ -440,6 +440,12 @@ class ProducerInferenceTrace:
     run_index: int
     temperature: float
     success: bool
+    call_kind: str = "scan_extraction"
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: int | None = None
+    usage_payload: dict[str, Any] | None = None
     payload: AIMedicalScanResponse | None = None
     error: str | None = None
 
@@ -454,6 +460,12 @@ class SuccessfulProducerInferenceTrace:
     temperature: float
     success: bool
     payload: AIMedicalScanResponse
+    call_kind: str = "scan_extraction"
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: int | None = None
+    usage_payload: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -468,6 +480,12 @@ def to_successful_trace(trace: ProducerInferenceTrace) -> SuccessfulProducerInfe
         run_index=trace.run_index,
         temperature=trace.temperature,
         success=trace.success,
+        call_kind=trace.call_kind,
+        prompt_tokens=trace.prompt_tokens,
+        completion_tokens=trace.completion_tokens,
+        total_tokens=trace.total_tokens,
+        latency_ms=trace.latency_ms,
+        usage_payload=trace.usage_payload,
         payload=trace.payload,
         error=trace.error,
     )

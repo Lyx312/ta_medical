@@ -3,6 +3,7 @@ import json
 from importlib import import_module
 from dataclasses import dataclass, replace
 from pathlib import Path
+import time
 from typing import Any, cast
 
 import yaml
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
+from app.repositories.scan_log_repository import AIApiCallLogCreate, ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse, ValidationPatientNameMatchStatus
 from app.services.ai_ensemble_config import (
     AI_EXTRACTION_MAX_PRODUCERS,
@@ -426,6 +428,148 @@ class BaseDocumentAIProcessor:
             )
         return cast(list[Any], human_content)
 
+    def _extract_usage_metadata(self, response: Any) -> dict[str, Any]:
+        usage_sources: list[Any] = []
+        for attr_name in ("usage_metadata", "response_metadata"):
+            value = getattr(response, attr_name, None)
+            if value is not None:
+                usage_sources.append(value)
+
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+        total_tokens: int | None = None
+        raw_usage: dict[str, Any] | None = None
+
+        for source in usage_sources:
+            if isinstance(source, dict):
+                raw_usage = source if raw_usage is None else {**raw_usage, **source}
+                token_usage = source.get("token_usage") if isinstance(source.get("token_usage"), dict) else None
+                candidates = [source]
+                if token_usage is not None:
+                    candidates.insert(0, token_usage)
+                for candidate in candidates:
+                    if prompt_tokens is None:
+                        prompt_tokens = self._coerce_usage_int(candidate.get("prompt_tokens") or candidate.get("input_tokens") or candidate.get("prompt_token_count") or candidate.get("input_token_count"))
+                    if completion_tokens is None:
+                        completion_tokens = self._coerce_usage_int(candidate.get("completion_tokens") or candidate.get("output_tokens") or candidate.get("candidates_token_count") or candidate.get("output_token_count"))
+                    if total_tokens is None:
+                        total_tokens = self._coerce_usage_int(candidate.get("total_tokens") or candidate.get("total_token_count"))
+            if prompt_tokens is not None or completion_tokens is not None or total_tokens is not None:
+                break
+
+        if total_tokens is None and (prompt_tokens is not None or completion_tokens is not None):
+            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "usage_payload": raw_usage,
+        }
+
+    def _coerce_usage_int(self, value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _persist_ai_api_call_log(self, payload: AIApiCallLogCreate) -> None:
+        try:
+            session_factory = get_session_factory()
+            with session_factory() as db:
+                ScanLogRepository(db).create_ai_api_call_log(payload)
+        except Exception:
+            return
+
+    async def _ainvoke_with_tracking(
+        self,
+        model: Any,
+        messages: list[Any],
+        *,
+        provider: str,
+        model_name: str,
+        call_kind: str,
+        success_context: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        context = dict(success_context or {})
+        started_at = time.perf_counter()
+        response: Any | None = None
+        error_message: str | None = None
+        success = False
+        try:
+            response = await model.ainvoke(messages)
+            success = True
+            return response, self._build_ai_call_tracking_payload(
+                response=response,
+                provider=provider,
+                model_name=model_name,
+                call_kind=call_kind,
+                context=context,
+                success=True,
+                error_message=None,
+                started_at=started_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc) or exc.__class__.__name__
+            tracking_payload = self._build_ai_call_tracking_payload(
+                response=response,
+                provider=provider,
+                model_name=model_name,
+                call_kind=call_kind,
+                context=context,
+                success=False,
+                error_message=error_message,
+                started_at=started_at,
+            )
+            self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+            raise
+        finally:
+            if success and response is not None:
+                pass
+
+    def _build_ai_call_tracking_payload(
+        self,
+        *,
+        response: Any,
+        provider: str,
+        model_name: str,
+        call_kind: str,
+        context: dict[str, Any],
+        success: bool,
+        error_message: str | None,
+        started_at: float,
+    ) -> dict[str, Any]:
+        usage = self._extract_usage_metadata(response) if response is not None else {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "usage_payload": None,
+        }
+        tracking_payload = {
+            "scan_log_id": context.get("scan_log_id"),
+            "user_id": context.get("user_id"),
+            "provider": provider,
+            "model_name": model_name,
+            "call_kind": call_kind,
+            "producer_id": context.get("producer_id"),
+            "producer_rank": context.get("producer_rank"),
+            "run_index": context.get("run_index"),
+            "temperature": context.get("temperature"),
+            "success": success,
+            "error_message": error_message,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "latency_ms": int(round((time.perf_counter() - started_at) * 1000)),
+            "usage_payload": usage.get("usage_payload"),
+            "request_context_payload": context.get("request_context_payload"),
+        }
+        if success:
+            self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+        return tracking_payload
+
 
 class MedicalDocumentProcessor(BaseDocumentAIProcessor):
     async def process(
@@ -433,6 +577,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
         validation_hints: dict[str, Any] | None = None,
+        ai_call_context: dict[str, Any] | None = None,
     ) -> MedicalExtractionOutcome:
         if not images:
             raise HTTPException(
@@ -454,6 +599,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                     patient_name_candidates=patient_name_candidates or [],
                     validation_hints=validation_hints or {},
                     prompt_bundle=prompt_bundle,
+                    ai_call_context=ai_call_context,
                 )
                 for producer_rank, model_spec in enumerate(model_specs)
                 for run_index in range(AI_EXTRACTION_RUNS_PER_MODEL)
@@ -486,7 +632,18 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             )
             raise error
 
-        fusion_engine = MedicalExtractionFusionEngine(judge_field=self._judge_field_conflict)
+        async def judge_field(field_path: str, judge_images: list[Any], candidates: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+            try:
+                return await self._judge_field_conflict(
+                    field_path,
+                    judge_images,
+                    candidates,
+                    ai_call_context=ai_call_context,
+                )
+            except TypeError:
+                return await self._judge_field_conflict(field_path, judge_images, candidates)
+
+        fusion_engine = MedicalExtractionFusionEngine(judge_field=judge_field)
         return await fusion_engine.fuse(
             successful_traces=successful_traces,
             all_traces=list(traces),
@@ -507,15 +664,28 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         patient_name_candidates: list[str],
         validation_hints: dict[str, Any],
         prompt_bundle: PromptBundle,
+        ai_call_context: dict[str, Any] | None,
     ) -> ProducerInferenceTrace:
         producer_id = f"{model_spec.provider}:{model_spec.model}"
         try:
-            payload = await self._run_model_inference(
+            payload, tracking_payload = await self._run_model_inference(
                 model_spec=model_spec,
                 images=images,
                 patient_name_candidates=patient_name_candidates,
                 validation_hints=validation_hints,
                 prompt_bundle=prompt_bundle,
+                ai_call_context={
+                    **(ai_call_context or {}),
+                    "producer_id": producer_id,
+                    "producer_rank": producer_rank,
+                    "run_index": run_index,
+                    "temperature": model_spec.temperature,
+                    "request_context_payload": {
+                        "image_count": len(images),
+                        "patient_name_candidate_count": len(patient_name_candidates),
+                        "validation_hint_keys": sorted((validation_hints or {}).keys()),
+                    },
+                },
             )
             return ProducerInferenceTrace(
                 producer_id=producer_id,
@@ -525,6 +695,12 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 run_index=run_index,
                 temperature=model_spec.temperature,
                 success=True,
+                call_kind="scan_extraction",
+                prompt_tokens=tracking_payload.get("prompt_tokens"),
+                completion_tokens=tracking_payload.get("completion_tokens"),
+                total_tokens=tracking_payload.get("total_tokens"),
+                latency_ms=tracking_payload.get("latency_ms"),
+                usage_payload=tracking_payload.get("usage_payload"),
                 payload=payload,
             )
         except Exception as exc:  # noqa: BLE001
@@ -536,6 +712,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 run_index=run_index,
                 temperature=model_spec.temperature,
                 success=False,
+                call_kind="scan_extraction",
                 error=self._describe_exception(exc),
             )
 
@@ -546,7 +723,8 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         patient_name_candidates: list[str],
         validation_hints: dict[str, Any],
         prompt_bundle: PromptBundle,
-    ) -> AIMedicalScanResponse:
+        ai_call_context: dict[str, Any] | None = None,
+    ) -> tuple[AIMedicalScanResponse, dict[str, Any]]:
         model = self._create_chat_model(model_spec)
         messages = self._normalize_message_content(
             self._build_messages(
@@ -556,12 +734,19 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 prompt_bundle=prompt_bundle,
             )
         )
-        response = await model.ainvoke(messages)
+        response, tracking_payload = await self._ainvoke_with_tracking(
+            model,
+            messages,
+            provider=model_spec.provider,
+            model_name=model_spec.model,
+            call_kind="scan_extraction",
+            success_context=ai_call_context,
+        )
 
         payload = self._parse_ai_response_to_json(response.content)
 
         try:
-            return AIMedicalScanResponse.model_validate(payload)
+            return AIMedicalScanResponse.model_validate(payload), tracking_payload
         except ValidationError as exc:
             print(f"AI response validation error: {exc}")
             raise HTTPException(
@@ -600,6 +785,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         field_path: str,
         images: list[Any],
         candidates: list[dict[str, Any]],
+        ai_call_context: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None]:
         judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
         prompt_bundle = self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
@@ -623,11 +809,24 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
         user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
         model = self._create_chat_model(judge_model_spec)
-        response = await model.ainvoke(
+        response, _tracking_payload = await self._ainvoke_with_tracking(
+            model,
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=self._build_image_messages(user_prompt, cast(list[DocumentImageInput], images))),
-            ]
+            ],
+            provider=judge_model_spec.provider,
+            model_name=judge_model_spec.model,
+            call_kind="field_judge",
+            success_context={
+                **(ai_call_context or {}),
+                "temperature": judge_model_spec.temperature,
+                "request_context_payload": {
+                    "field_path": field_path,
+                    "candidate_count": len(candidates),
+                    "image_count": len(images),
+                },
+            },
         )
         payload = self._parse_ai_response_to_json(response.content)
         selected_index = payload.get("selected_candidate_index")
@@ -658,6 +857,7 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
         images: list[DocumentImageInput],
         patient_name_candidates: list[str] | None = None,
         expected_patient_name: str | None = None,
+        ai_call_context: dict[str, Any] | None = None,
     ) -> DocumentValidationResponse:
         if not images:
             raise HTTPException(
@@ -677,6 +877,15 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     prompt_bundle=prompt_bundle,
                     patient_name_candidates=patient_name_candidates or [],
                     expected_patient_name=expected_patient_name,
+                    ai_call_context={
+                        **(ai_call_context or {}),
+                        "temperature": model_spec.temperature,
+                        "request_context_payload": {
+                            "image_count": len(images),
+                            "patient_name_candidate_count": len(patient_name_candidates or []),
+                            "has_expected_patient_name": expected_patient_name is not None,
+                        },
+                    },
                 )
             )
 
@@ -706,6 +915,7 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
         prompt_bundle: PromptBundle,
         patient_name_candidates: list[str],
         expected_patient_name: str | None,
+        ai_call_context: dict[str, Any] | None = None,
     ) -> DocumentValidationResponse:
         model = self._create_chat_model(model_spec)
         messages = self._build_messages(
@@ -714,7 +924,14 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
             patient_name_candidates=patient_name_candidates,
             expected_patient_name=expected_patient_name,
         )
-        response = await model.ainvoke(messages)
+        response, _tracking_payload = await self._ainvoke_with_tracking(
+            model,
+            messages,
+            provider=model_spec.provider,
+            model_name=model_spec.model,
+            call_kind="scan_validation",
+            success_context=ai_call_context,
+        )
         payload = self._parse_ai_response_to_json(response.content)
 
         try:

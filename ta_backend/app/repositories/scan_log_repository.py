@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models.scan_log import ScanLog, ScanLogAIRun, ScanLogFile
+from app.models.scan_log import AIApiCallLog, ScanLog, ScanLogAIRun, ScanLogFile
 from app.models.user import User
 
 
@@ -35,6 +35,27 @@ class ScanLogAIRunCreate:
     success: bool
     error_message: str | None = None
     payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AIApiCallLogCreate:
+    provider: str
+    model_name: str
+    call_kind: str
+    success: bool
+    scan_log_id: int | None = None
+    user_id: int | None = None
+    producer_id: str | None = None
+    producer_rank: int | None = None
+    run_index: int | None = None
+    temperature: float | None = None
+    error_message: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: int | None = None
+    usage_payload: dict[str, Any] | None = None
+    request_context_payload: dict[str, Any] | None = None
 
 
 class ScanLogRepository:
@@ -160,6 +181,31 @@ class ScanLogRepository:
                 )
             )
 
+    def create_ai_api_call_log(self, payload: AIApiCallLogCreate) -> AIApiCallLog:
+        record = AIApiCallLog(
+            scan_log_id=payload.scan_log_id,
+            user_id=payload.user_id,
+            provider=payload.provider,
+            model_name=payload.model_name,
+            call_kind=payload.call_kind,
+            producer_id=payload.producer_id,
+            producer_rank=payload.producer_rank,
+            run_index=payload.run_index,
+            temperature=payload.temperature,
+            success=payload.success,
+            error_message=payload.error_message,
+            prompt_tokens=payload.prompt_tokens,
+            completion_tokens=payload.completion_tokens,
+            total_tokens=payload.total_tokens,
+            latency_ms=payload.latency_ms,
+            usage_payload=payload.usage_payload,
+            request_context_payload=payload.request_context_payload,
+        )
+        self._db.add(record)
+        self._db.commit()
+        self._db.refresh(record)
+        return record
+
     def get_by_id(self, scan_log_id: int) -> ScanLog | None:
         return self._db.execute(
             select(ScanLog)
@@ -169,6 +215,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
                 selectinload(ScanLog.ai_runs),
+                selectinload(ScanLog.ai_api_call_logs),
             )
         ).scalar_one_or_none()
 
@@ -178,6 +225,7 @@ class ScanLogRepository:
             .where(ScanLog.id == scan_log_id)
             .options(
                 selectinload(ScanLog.ai_runs),
+                selectinload(ScanLog.ai_api_call_logs),
             )
         ).scalar_one_or_none()
 
@@ -189,6 +237,7 @@ class ScanLogRepository:
             .limit(1)
             .options(
                 selectinload(ScanLog.ai_runs),
+                selectinload(ScanLog.ai_api_call_logs),
             )
         ).scalar_one_or_none()
 
@@ -204,6 +253,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
                 selectinload(ScanLog.ai_runs),
+                selectinload(ScanLog.ai_api_call_logs),
             )
         ).scalar_one_or_none()
 
@@ -224,6 +274,7 @@ class ScanLogRepository:
                 selectinload(ScanLog.user),
                 selectinload(ScanLog.linked_claims),
                 selectinload(ScanLog.ai_runs),
+                selectinload(ScanLog.ai_api_call_logs),
             )
         )
         if status:

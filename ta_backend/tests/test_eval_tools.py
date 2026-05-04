@@ -359,6 +359,60 @@ def test_medical_claim_evaluator_strict_detects_financial_mismatch_as_critical()
     assert result["pass_verify_only"] is False
 
 
+def test_medical_claim_evaluator_strict_detected_documents_rejects_ambiguous_other() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Pembayaran"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 0, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {**predicted["summary"], "detected_documents": ["Kwitansi"]},
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 0.0
+
+
+def test_medical_claim_evaluator_strict_facility_rejects_wrong_entity() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Petrokimia Gresik",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 0, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {**predicted["summary"], "medical_facility_name": "Rumah Sakit Semen Gresik"},
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.medical_facility_name"]["strict_f1"] == 0.0
+
+
 def test_guess_mime_type_uses_file_extension() -> None:
     assert guess_mime_type(Path("scan.jpg")) == "image/jpeg"
 

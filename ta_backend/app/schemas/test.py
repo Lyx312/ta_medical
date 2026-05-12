@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -20,3 +22,17 @@ class GreetRequest(BaseModel):
 
 class GreetResponse(BaseModel):
     message: str
+
+
+class ModelInvokeTestResponse(BaseModel):
+    success: bool
+    provider: str
+    model_name: str
+    supports_image_input: bool
+    image_supplied: bool
+    latency_ms: int
+    raw_text: str
+    parsed_json: dict[str, Any] | list[Any] | None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None

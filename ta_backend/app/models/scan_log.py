@@ -25,6 +25,7 @@ class ScanLog(Base):
     validation_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     extraction_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     extraction_meta_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    progress_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

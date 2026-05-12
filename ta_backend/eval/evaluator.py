@@ -2,17 +2,9 @@ import re
 from typing import Any
 
 from app.services.standard_vocabulary import (
-    get_document_type_display_name,
-    get_category_display_name,
-    map_category_to_standard,
-    map_category_to_standard_strict,
-    map_description_to_category,
-    map_description_to_category_strict,
     normalize_facility_name,
-    normalize_to_standard_document_type,
-    normalize_to_standard_document_type_strict,
-    STANDARD_DOCUMENT_TYPES,
-    OTHER_CHARGE_CATEGORIES,
+    normalize_to_evaluation_document_type,
+    normalize_to_evaluation_other_charge_category,
 )
 from eval.config import DEFAULT_THRESHOLDS, EvalThresholds
 from eval.medicine_matcher import match_medicines
@@ -119,6 +111,60 @@ def _list_exact_match(pred: Any, gt: Any) -> bool:
     if not pred_list and not gt_list:
         return True
     return sorted(str(item).strip() for item in pred_list) == sorted(str(item).strip() for item in gt_list)
+
+
+def _build_lcs_index_pairs(pred: list[str], gt: list[str]) -> list[tuple[int, int]]:
+    if not pred or not gt:
+        return []
+
+    dp = [[0] * (len(gt) + 1) for _ in range(len(pred) + 1)]
+    for pred_index in range(len(pred) - 1, -1, -1):
+        for gt_index in range(len(gt) - 1, -1, -1):
+            if pred[pred_index] == gt[gt_index]:
+                dp[pred_index][gt_index] = dp[pred_index + 1][gt_index + 1] + 1
+            else:
+                dp[pred_index][gt_index] = max(dp[pred_index + 1][gt_index], dp[pred_index][gt_index + 1])
+
+    matches: list[tuple[int, int]] = []
+    pred_index = 0
+    gt_index = 0
+    while pred_index < len(pred) and gt_index < len(gt):
+        if pred[pred_index] == gt[gt_index]:
+            matches.append((pred_index, gt_index))
+            pred_index += 1
+            gt_index += 1
+        elif dp[pred_index + 1][gt_index] >= dp[pred_index][gt_index + 1]:
+            pred_index += 1
+        else:
+            gt_index += 1
+    return matches
+
+
+def _normalize_detected_document_sequence(values: list[Any]) -> list[str]:
+    return [normalize_to_evaluation_document_type(str(value)) or "other" for value in values]
+
+
+def _build_unmatched_document_items(
+    raw_values: list[Any],
+    normalized_values: list[str],
+    matched_indices: set[int],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "raw_value": raw_values[index],
+            "normalized_value": normalized_values[index],
+        }
+        for index in range(len(normalized_values))
+        if index not in matched_indices
+    ]
+
+
+def _normalize_other_charge_category_for_eval(category: Any, description: Any) -> str | None:
+    canonical = normalize_to_evaluation_other_charge_category(str(category) if category is not None else None)
+    if canonical is not None:
+        return canonical
+    return normalize_to_evaluation_other_charge_category(str(description) if description is not None else None)
 
 
 def _num_match(pred: Any, gt: Any, tolerance: float = 0.0) -> bool:
@@ -360,31 +406,63 @@ class MedicalClaimEvaluator:
         }
 
     def _evaluate_detected_documents(self, pred: list, gt: list) -> dict[str, Any]:
-        pred_types = [normalize_to_standard_document_type(d) for d in pred] if pred else []
-        gt_types = [normalize_to_standard_document_type(d) for d in gt] if gt else []
+        pred_raw = pred if isinstance(pred, list) else []
+        gt_raw = gt if isinstance(gt, list) else []
+        pred_types = _normalize_detected_document_sequence(pred_raw)
+        gt_types = _normalize_detected_document_sequence(gt_raw)
 
-        pred_set = set(pred_types)
-        gt_set = set(gt_types)
-
-        common = pred_set & gt_set
-        tp = len(common)
-        fp = len(pred_set - gt_set)
-        fn = len(gt_set - pred_set)
+        matched_pairs = _build_lcs_index_pairs(pred_types, gt_types)
+        matched_pred_indices = {pred_index for pred_index, _ in matched_pairs}
+        matched_gt_indices = {gt_index for _, gt_index in matched_pairs}
+        tp = len(matched_pairs)
+        fp = len(pred_types) - tp
+        fn = len(gt_types) - tp
 
         details = {
-            "predicted_types": pred_types,
-            "ground_truth_types": gt_types,
-            "matched": list(common),
-            "unmatched_predicted": list(pred_set - gt_set),
-            "unmatched_ground_truth": list(gt_set - pred_set),
+            "predicted_sequence": pred_types,
+            "ground_truth_sequence": gt_types,
+            "matched_sequence": [pred_types[pred_index] for pred_index, _ in matched_pairs],
+            "matches": [
+                {
+                    "predicted_index": pred_index,
+                    "ground_truth_index": gt_index,
+                    "predicted_raw": pred_raw[pred_index],
+                    "ground_truth_raw": gt_raw[gt_index],
+                    "normalized_value": pred_types[pred_index],
+                }
+                for pred_index, gt_index in matched_pairs
+            ],
+            "unmatched_predicted": _build_unmatched_document_items(pred_raw, pred_types, matched_pred_indices),
+            "unmatched_ground_truth": _build_unmatched_document_items(gt_raw, gt_types, matched_gt_indices),
         }
         return _metric_dict(tp, fp, fn, **details)
 
     def _evaluate_detected_documents_strict(self, pred: list, gt: list) -> dict[str, Any]:
-        pred_types = {doc_type for doc_type in (normalize_to_standard_document_type_strict(d) for d in pred or []) if doc_type}
-        gt_types = {doc_type for doc_type in (normalize_to_standard_document_type_strict(d) for d in gt or []) if doc_type}
-        common = pred_types & gt_types
-        return _metric_dict(len(common), len(pred_types - gt_types), len(gt_types - pred_types))
+        pred_raw = pred if isinstance(pred, list) else []
+        gt_raw = gt if isinstance(gt, list) else []
+        pred_types = _normalize_detected_document_sequence(pred_raw)
+        gt_types = _normalize_detected_document_sequence(gt_raw)
+        if pred_types == gt_types:
+            return _metric_dict(
+                len(gt_types),
+                0,
+                0,
+                predicted_sequence=pred_types,
+                ground_truth_sequence=gt_types,
+                exact_match=True,
+                unmatched_predicted=[],
+                unmatched_ground_truth=[],
+            )
+        return _metric_dict(
+            0,
+            len(pred_types),
+            len(gt_types),
+            predicted_sequence=pred_types,
+            ground_truth_sequence=gt_types,
+            exact_match=False,
+            unmatched_predicted=_build_unmatched_document_items(pred_raw, pred_types, set()),
+            unmatched_ground_truth=_build_unmatched_document_items(gt_raw, gt_types, set()),
+        )
 
     def _evaluate_facility_name(self, pred: str | None, gt: str | None) -> dict[str, Any]:
         pred_normalized = normalize_facility_name(pred) if pred else None
@@ -791,7 +869,7 @@ class MedicalClaimEvaluator:
         for pred_charge in pred:
             pred_cat_raw = pred_charge.get("category") or ""
             pred_desc = pred_charge.get("description") or ""
-            pred_cat_mapped = map_category_to_standard(pred_cat_raw) or map_description_to_category(pred_desc)
+            pred_cat_mapped = _normalize_other_charge_category_for_eval(pred_cat_raw, pred_desc)
             best_idx = -1
             best_score = 0.0
 
@@ -800,7 +878,7 @@ class MedicalClaimEvaluator:
                     continue
                 gt_cat_raw = gt_charge.get("category") or ""
                 gt_desc = gt_charge.get("description") or ""
-                gt_cat_mapped = map_category_to_standard(gt_cat_raw) or map_description_to_category(gt_desc)
+                gt_cat_mapped = _normalize_other_charge_category_for_eval(gt_cat_raw, gt_desc)
                 cat_match = pred_cat_mapped and gt_cat_mapped and pred_cat_mapped.upper() == gt_cat_mapped.upper()
                 desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_desc))
                 combined = (1.0 if cat_match else 0.0) * 0.5 + desc_score * 0.5
@@ -816,6 +894,8 @@ class MedicalClaimEvaluator:
                         "predicted": pred_charge,
                         "ground_truth": gt[best_idx],
                         "similarity": round(best_score, 4),
+                        "predicted_category_canonical": pred_cat_mapped,
+                        "ground_truth_category_canonical": gt_cat_mapped,
                     }
                 )
             else:
@@ -843,7 +923,7 @@ class MedicalClaimEvaluator:
             pred_cat_raw = pred_charge.get("category") or ""
             pred_desc = pred_charge.get("description") or ""
             pred_amount = pred_charge.get("amount")
-            pred_cat_mapped = map_category_to_standard_strict(pred_cat_raw) or map_description_to_category_strict(pred_desc)
+            pred_cat_mapped = _normalize_other_charge_category_for_eval(pred_cat_raw, pred_desc)
             best_idx = -1
             best_score = 0.0
             best_desc_score = 0.0
@@ -853,7 +933,7 @@ class MedicalClaimEvaluator:
                 gt_cat_raw = gt_charge.get("category") or ""
                 gt_desc = gt_charge.get("description") or ""
                 gt_amount = gt_charge.get("amount")
-                gt_cat_mapped = map_category_to_standard_strict(gt_cat_raw) or map_description_to_category_strict(gt_desc)
+                gt_cat_mapped = _normalize_other_charge_category_for_eval(gt_cat_raw, gt_desc)
                 desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_desc))
                 amount_match = _num_match(pred_amount, gt_amount)
                 cat_match = pred_cat_mapped and gt_cat_mapped and pred_cat_mapped.upper() == gt_cat_mapped.upper()
@@ -866,7 +946,19 @@ class MedicalClaimEvaluator:
             if best_idx >= 0:
                 strict_tp += 1
                 strict_gt_matched[best_idx] = True
-                strict_matches.append({"predicted": pred_charge, "ground_truth": gt[best_idx], "similarity": round(best_score, 4), "description_similarity": round(best_desc_score, 4)})
+                strict_matches.append(
+                    {
+                        "predicted": pred_charge,
+                        "ground_truth": gt[best_idx],
+                        "similarity": round(best_score, 4),
+                        "description_similarity": round(best_desc_score, 4),
+                        "predicted_category_canonical": pred_cat_mapped,
+                        "ground_truth_category_canonical": _normalize_other_charge_category_for_eval(
+                            gt[best_idx].get("category"),
+                            gt[best_idx].get("description"),
+                        ),
+                    }
+                )
             else:
                 strict_fp += 1
         strict_fn = sum(1 for matched in strict_gt_matched if not matched)

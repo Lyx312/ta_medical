@@ -6,7 +6,7 @@ It reuses the backend scan route logic by calling `/api/ai/scan-documents` throu
 
 ## Dataset Layout
 
-Each claim uses one `ground_truth.json`.
+Each claim uses one `<folder>.json`.
 
 ```text
 eval_examples/
@@ -14,11 +14,11 @@ eval_examples/
     images/
       page1.jpg
       page2.jpg
-    claim_001_ground_truth.json
+    claim_001.json
   claim_002/
     images/
       scan.jpg
-    claim_002_ground_truth.json
+    claim_002.json
 ```
 
 Flat image folders also work:
@@ -27,7 +27,7 @@ Flat image folders also work:
 claim_003/
   receipt.jpg
   note.png
-  claim_003_ground_truth.json
+  claim_003.json
 ```
 
 ## Ground Truth Format
@@ -38,7 +38,7 @@ claim_003/
   "patient_name_candidates": ["Budi Saputra", "Siti Aminah"],
   "expected": {
     "summary": {
-      "detected_documents": ["receipt", "doctor_note"],
+      "detected_documents": ["Kwitansi", "Formulir Rawat Jalan"],
       "medical_facility_name": "RS Sehat Sentosa",
       "service_date": "2024-08-10",
       "transaction_date": null,
@@ -88,6 +88,9 @@ claim_003/
 Notes:
 - `images` paths must be relative to the claim folder.
 - `patient_name_candidates` is optional.
+- `summary.detected_documents` should preserve distinct packet documents in packet order.
+- Ground truth should prefer the extraction prompt's document labels such as `Kwitansi`, `Resep`, `Salinan Resep`, `Nota Penjualan`, `Tanda Penerimaan Pembayaran`, and `Formulir Rawat Jalan`.
+- The evaluator still normalizes legacy/internal labels such as `receipt`, `medical_form`, `doctor_note`, `lab_result`, and `radiology_result` for compatibility with older cached predictions.
 
 ## Generate a Template
 
@@ -109,7 +112,7 @@ Windows batch shortcut:
 run_eval.bat template -- --folder "path/to/claim_001" --candidates "Budi Saputra" "Siti Aminah"
 ```
 
-This writes `<folder>_ground_truth.json` into the claim folder by default.
+This writes `<folder>.json` into the claim folder by default.
 
 Then:
 - fill in the `expected` values manually
@@ -171,6 +174,30 @@ Optional output path:
 ```bash
 python -m eval.run_evaluation --folder "path/to/eval_examples" --output "path/to/eval_results.json"
 ```
+
+## Fit Self-Consistency Calibration
+
+After collecting labeled claims and fresh scan results under `results/`, fit the runtime confidence calibrator:
+
+```bash
+python -m eval.self_consistency_calibration --folder "path/to/eval_examples"
+```
+
+Optional outputs:
+
+```bash
+python -m eval.self_consistency_calibration \
+  --folder "path/to/eval_examples" \
+  --results-dir "path/to/eval_examples/results" \
+  --artifact-out "path/to/ai_ensemble_self_consistency_logistic_v1.json" \
+  --report-out "path/to/self_consistency_calibration_report.json"
+```
+
+This:
+- reads `field_confidence` from cached scan run logs
+- builds claim-level calibration rows
+- runs claim-level cross-validation
+- writes the runtime JSON artifact consumed by `ai_ensemble.py`
 
 ## Output
 
@@ -275,10 +302,11 @@ JSON top-level structure:
 ## Scoring Rules
 
 - Scalar fields: exact match or numeric exact match → precision, recall, F1
+- `summary.detected_documents`: ordered packet-inventory matching after evaluator normalization; duplicates and order both affect score
 - `anamnesis` and `therapy_note`: token-based F1 + character error rate (CER)
 - `diagnoses`: token similarity plus doctor-name support
 - `medicines`: Hungarian matching using medicine-name similarity and quantity proximity
-- `other_charges`: category + description similarity
+- `other_charges`: prompt-contract category normalization plus description similarity
 - `financial_recap`: numeric exact match on `total_medicines`, `total_other_charges`, and `grand_total`
 
 **Note:** CER (Character Error Rate) measures character-level edit distance. Lower is better (0 = perfect, 1 = completely wrong).

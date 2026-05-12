@@ -11,6 +11,7 @@ from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from app.core.ai_pipeline_logging import ai_pipeline_exception_fields, ai_pipeline_log
 from app.core.config import ROOT_DIR, get_settings
 from app.repositories.claim_medicine_knowledge_repository import ClaimMedicineKnowledgeRepository
 from app.schemas.ai import AIMedicalScanResponse, AIScanMedicine
@@ -88,43 +89,78 @@ class ScanMedicineImageInterpretationJudge(BaseDocumentAIProcessor):
         prompt_bundle = self._load_prompt_bundle()
         model_spec = self.get_primary_enabled_model_spec()
         model = self._create_chat_model(model_spec)
-
-        template_input = {
-            "diagnosis_text_json": json.dumps(diagnosis_text, ensure_ascii=False),
-            "anamnesis_text_json": json.dumps(anamnesis_text, ensure_ascii=False),
-            "ambiguous_medicines_json": json.dumps(ambiguous_medicines, ensure_ascii=False, indent=2),
-            "ranked_group_suggestions_json": json.dumps(ranked_group_suggestions, ensure_ascii=False, indent=2),
-            "db_medicine_hints_json": json.dumps(db_medicine_hints, ensure_ascii=False, indent=2),
-            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
-        }
-
-        system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
-        user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
-
-        response, _tracking_payload = await self._ainvoke_with_tracking(
-            model,
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=self._build_image_messages(user_prompt, images)),
-            ],
+        ai_pipeline_log(
+            event="medicine_prompt_started",
+            component="scan_medicine_prioritization",
+            scan_log_id=ai_call_context.get("scan_log_id") if isinstance(ai_call_context, dict) else None,
+            user_id=ai_call_context.get("user_id") if isinstance(ai_call_context, dict) else None,
             provider=model_spec.provider,
-            model_name=model_spec.model,
+            model=model_spec.model,
             call_kind="medicine_prioritization",
-            success_context={
-                **(ai_call_context or {}),
-                "temperature": model_spec.temperature,
-                "request_context_payload": {
-                    "image_count": len(images),
-                    "ambiguous_medicine_count": len(ambiguous_medicines),
-                    "group_suggestion_count": len(ranked_group_suggestions),
-                    "db_hint_count": len(db_medicine_hints),
-                },
-            },
+            image_count=len(images),
+            ambiguous_medicine_count=len(ambiguous_medicines),
+            group_suggestion_count=len(ranked_group_suggestions),
+            db_hint_count=len(db_medicine_hints),
         )
-        payload = self._parse_ai_response_to_json(response.content)
         try:
-            return BatchMedicineInterpretationResponse.model_validate(payload)
-        except ValidationError as exc:
+            template_input = {
+                "diagnosis_text_json": json.dumps(diagnosis_text, ensure_ascii=False),
+                "anamnesis_text_json": json.dumps(anamnesis_text, ensure_ascii=False),
+                "ambiguous_medicines_json": json.dumps(ambiguous_medicines, ensure_ascii=False, indent=2),
+                "ranked_group_suggestions_json": json.dumps(ranked_group_suggestions, ensure_ascii=False, indent=2),
+                "db_medicine_hints_json": json.dumps(db_medicine_hints, ensure_ascii=False, indent=2),
+                "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+            }
+
+            system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
+            user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
+
+            response, _tracking_payload = await self._ainvoke_with_tracking(
+                model,
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=self._build_image_messages(user_prompt, images)),
+                ],
+                provider=model_spec.provider,
+                model_name=model_spec.model,
+                call_kind="medicine_prioritization",
+                success_context={
+                    **(ai_call_context or {}),
+                    "temperature": model_spec.temperature,
+                    "request_context_payload": {
+                        "image_count": len(images),
+                        "ambiguous_medicine_count": len(ambiguous_medicines),
+                        "group_suggestion_count": len(ranked_group_suggestions),
+                        "db_hint_count": len(db_medicine_hints),
+                    },
+                },
+            )
+            payload = self._parse_ai_response_to_json(response.content)
+            result = BatchMedicineInterpretationResponse.model_validate(payload)
+            ai_pipeline_log(
+                event="medicine_prompt_completed",
+                component="scan_medicine_prioritization",
+                scan_log_id=ai_call_context.get("scan_log_id") if isinstance(ai_call_context, dict) else None,
+                user_id=ai_call_context.get("user_id") if isinstance(ai_call_context, dict) else None,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                call_kind="medicine_prioritization",
+                judgement_count=len(result.judgements),
+                success=True,
+            )
+            return result
+        except Exception as exc:
+            ai_pipeline_log(
+                event="medicine_prompt_failed",
+                component="scan_medicine_prioritization",
+                scan_log_id=ai_call_context.get("scan_log_id") if isinstance(ai_call_context, dict) else None,
+                user_id=ai_call_context.get("user_id") if isinstance(ai_call_context, dict) else None,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                call_kind="medicine_prioritization",
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
             raise RuntimeError("Batch medicine interpretation payload is invalid.") from exc
 
 
@@ -389,7 +425,25 @@ async def prioritize_scan_medicines(
     user_id: int | None = None,
 ) -> tuple[AIMedicalScanResponse, dict[str, Any]]:
     medicines = list(scan_result.medicines)
+    ai_pipeline_log(
+        event="medicine_prioritization_started",
+        component="scan_medicine_prioritization",
+        scan_log_id=scan_log_id,
+        user_id=user_id,
+        medicine_count=len(medicines),
+        interpretation_mode=interpretation_mode,
+    )
     if len(medicines) <= 1:
+        ai_pipeline_log(
+            event="medicine_prioritization_completed",
+            component="scan_medicine_prioritization",
+            scan_log_id=scan_log_id,
+            user_id=user_id,
+            medicine_count=len(medicines),
+            ambiguous_count=0,
+            applied=False,
+            success=True,
+        )
         return scan_result, {
             "enabled": True,
             "applied": False,
@@ -405,6 +459,16 @@ async def prioritize_scan_medicines(
     ranked_groups = medicines_meta.get("groups") if isinstance(medicines_meta, dict) else None
 
     if not isinstance(selected_groups, list) or len(selected_groups) == 0:
+        ai_pipeline_log(
+            event="medicine_prioritization_completed",
+            component="scan_medicine_prioritization",
+            scan_log_id=scan_log_id,
+            user_id=user_id,
+            medicine_count=len(medicines),
+            ambiguous_count=0,
+            applied=False,
+            success=True,
+        )
         return scan_result, {
             "enabled": True,
             "applied": False,
@@ -455,6 +519,15 @@ async def prioritize_scan_medicines(
     batch_error: str | None = None
 
     if ambiguous_indices:
+        ai_pipeline_log(
+            event="medicine_prioritization_batch_prepared",
+            component="scan_medicine_prioritization",
+            scan_log_id=scan_log_id,
+            user_id=user_id,
+            medicine_count=len(medicines),
+            ambiguous_count=len(ambiguous_indices),
+            interpretation_mode=interpretation_mode,
+        )
         ambiguous_payload: list[dict[str, Any]] = []
         for index in ambiguous_indices:
             record = records[index]
@@ -507,6 +580,15 @@ async def prioritize_scan_medicines(
             batch_success = True
         except Exception as exc:  # noqa: BLE001
             batch_error = str(exc) or exc.__class__.__name__
+            ai_pipeline_log(
+                event="medicine_prioritization_batch_failed",
+                component="scan_medicine_prioritization",
+                scan_log_id=scan_log_id,
+                user_id=user_id,
+                ambiguous_count=len(ambiguous_indices),
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
 
     sorted_records = records[:]
     changed = True
@@ -566,4 +648,15 @@ async def prioritize_scan_medicines(
         "judgement_logs": judgement_logs,
         "suggested_medicines_from_document_groups": suggested_from_groups,
     }
+    ai_pipeline_log(
+        event="medicine_prioritization_completed",
+        component="scan_medicine_prioritization",
+        scan_log_id=scan_log_id,
+        user_id=user_id,
+        medicine_count=len(sorted_medicines),
+        ambiguous_count=len(ambiguous_indices),
+        applied=sorted_indices != list(range(len(records))),
+        batch_success=batch_success,
+        success=True,
+    )
     return prioritized_result, log_payload

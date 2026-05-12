@@ -156,7 +156,7 @@ def write_ground_truth(claim_dir: Path) -> None:
             },
         },
     }
-    (claim_dir / f"{claim_dir.name}_ground_truth.json").write_text(json.dumps(ground_truth), encoding="utf-8")
+    (claim_dir / f"{claim_dir.name}.json").write_text(json.dumps(ground_truth), encoding="utf-8")
 
 
 def test_match_medicines_tracks_unmatched_prediction_and_ground_truth() -> None:
@@ -193,7 +193,7 @@ def test_load_ground_truth_supports_relative_image_paths(tmp_path: Path) -> None
             "other_charges": [],
         },
     }
-    (claim_dir / f"{claim_dir.name}_ground_truth.json").write_text(json.dumps(ground_truth), encoding="utf-8")
+    (claim_dir / f"{claim_dir.name}.json").write_text(json.dumps(ground_truth), encoding="utf-8")
 
     loaded, image_paths = load_ground_truth(claim_dir)
 
@@ -205,7 +205,7 @@ def test_load_ground_truth_supports_relative_image_paths(tmp_path: Path) -> None
 def test_load_ground_truth_rejects_empty_image_list(tmp_path: Path) -> None:
     claim_dir = tmp_path / "claim_001"
     claim_dir.mkdir()
-    (claim_dir / f"{claim_dir.name}_ground_truth.json").write_text(json.dumps({"images": [], "expected": {}}), encoding="utf-8")
+    (claim_dir / f"{claim_dir.name}.json").write_text(json.dumps({"images": [], "expected": {}}), encoding="utf-8")
 
     with pytest.raises(GroundTruthError):
         load_ground_truth(claim_dir)
@@ -359,6 +359,79 @@ def test_medical_claim_evaluator_strict_detects_financial_mismatch_as_critical()
     assert result["pass_verify_only"] is False
 
 
+def test_medical_claim_evaluator_detected_documents_preserves_order_and_duplicates() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi", "Resep", "Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 0, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {
+            **predicted["summary"],
+            "detected_documents": ["Kwitansi", "Kwitansi", "Resep"],
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.detected_documents"]["f1"] == 0.6667
+    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 0.0
+    assert result["per_field"]["summary.detected_documents"]["matched_sequence"] == ["receipt", "receipt"]
+
+
+def test_medical_claim_evaluator_detected_documents_normalizes_prompt_and_internal_labels() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi", "Formulir Rawat Jalan", "Kwitansi Apotek Sehat"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 0, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {
+            **predicted["summary"],
+            "detected_documents": ["receipt", "medical_form", "pharmacy_receipt"],
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.detected_documents"]["f1"] == 1.0
+    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 1.0
+    assert result["per_field"]["summary.detected_documents"]["predicted_sequence"] == [
+        "receipt",
+        "medical_form",
+        "pharmacy_receipt",
+    ]
+    assert result["per_field"]["summary.detected_documents"]["ground_truth_sequence"] == [
+        "receipt",
+        "medical_form",
+        "pharmacy_receipt",
+    ]
+
+
 def test_medical_claim_evaluator_strict_detected_documents_rejects_ambiguous_other() -> None:
     evaluator = MedicalClaimEvaluator()
     predicted = {
@@ -383,6 +456,7 @@ def test_medical_claim_evaluator_strict_detected_documents_rejects_ambiguous_oth
 
     result = evaluator.evaluate(predicted, ground_truth)
 
+    assert result["per_field"]["summary.detected_documents"]["f1"] == 0.0
     assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 0.0
 
 
@@ -411,6 +485,132 @@ def test_medical_claim_evaluator_strict_facility_rejects_wrong_entity() -> None:
     result = evaluator.evaluate(predicted, ground_truth)
 
     assert result["per_field"]["summary.medical_facility_name"]["strict_f1"] == 0.0
+
+
+def test_medical_claim_evaluator_detected_documents_supports_doctor_lab_and_radiology_types() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["doctor_note", "lab_result", "radiology_result"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 0, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {
+            **predicted["summary"],
+            "detected_documents": ["doctor note", "lab result", "radiology result"],
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.detected_documents"]["predicted_sequence"] == [
+        "doctor_note",
+        "lab_result",
+        "radiology_result",
+    ]
+    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 1.0
+
+
+def test_medical_claim_evaluator_other_charge_normalizes_legacy_labels_to_prompt_contract() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 175000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [
+            {"category": "Jasa Medik Dokter", "description": "Konsultasi dokter", "amount": 115000},
+            {"category": "Administrasi", "description": "Administrasi", "amount": 10000},
+            {"category": "Perawatan", "description": "Tindakan medis", "amount": 50000},
+        ],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 175000, "grand_total": 175000},
+    }
+    ground_truth = {
+        **predicted,
+        "other_charges": [
+            {"category": "CONSULTATION", "description": "Konsultasi dokter", "amount": 115000},
+            {"category": "ADMINISTRATION", "description": "Administrasi", "amount": 10000},
+            {"category": "SERVICE", "description": "Tindakan medis", "amount": 50000},
+        ],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_section"]["other_charges"]["soft_f1"] == 1.0
+    assert result["per_section"]["other_charges"]["strict_f1"] == 1.0
+
+
+def test_medical_claim_evaluator_other_charge_uses_description_fallback_only_when_category_missing() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 115000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [{"category": None, "description": "Konsultasi dokter", "amount": 115000}],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 115000, "grand_total": 115000},
+    }
+    ground_truth = {
+        **predicted,
+        "other_charges": [{"category": "CONSULTATION", "description": "Konsultasi dokter", "amount": 115000}],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_section"]["other_charges"]["strict_f1"] == 1.0
+
+
+def test_medical_claim_evaluator_other_charge_strict_rejects_category_mismatch_with_similar_description() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 115000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [{"category": "ADMINISTRATION", "description": "Konsultasi dokter", "amount": 115000}],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 115000, "grand_total": 115000},
+    }
+    ground_truth = {
+        **predicted,
+        "other_charges": [{"category": "CONSULTATION", "description": "Konsultasi dokter", "amount": 115000}],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_section"]["other_charges"]["soft_f1"] >= 0.0
+    assert result["per_section"]["other_charges"]["strict_f1"] == 0.0
 
 
 def test_guess_mime_type_uses_file_extension() -> None:
@@ -604,7 +804,7 @@ def test_run_evaluation_main_writes_output_json(tmp_path: Path, monkeypatch: pyt
 def test_generate_template_main_writes_ground_truth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     claim_dir = tmp_path / "claim_001"
     claim_dir.mkdir(parents=True)
-    output_path = claim_dir / f"{claim_dir.name}_ground_truth.json"
+    output_path = claim_dir / f"{claim_dir.name}.json"
 
     async def fake_generate_template_for_folder(
         folder: Path,

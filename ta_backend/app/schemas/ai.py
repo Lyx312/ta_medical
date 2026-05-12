@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -79,6 +79,50 @@ class AIMedicalScanResponse(BaseModel):
 
 class AIScanDocumentsResponse(AIMedicalScanResponse):
     scan_log_id: int
+
+
+ScanJobStage = Literal[
+    "queued",
+    "preprocessing",
+    "validating",
+    "extracting",
+    "fusing",
+    "prioritizing_medicines",
+    "completed",
+    "failed",
+]
+ScanJobStatus = Literal["pending", "running", "succeeded", "failed"]
+
+
+class ScanProgressPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage: ScanJobStage
+    title: str
+    detail: str | None = None
+    percent: int = Field(ge=0, le=100)
+    status: ScanJobStatus
+    image_count: int | None = Field(default=None, ge=0)
+    total_runs: int | None = Field(default=None, ge=0)
+    completed_runs: int | None = Field(default=None, ge=0)
+    successful_runs: int | None = Field(default=None, ge=0)
+    medicine_count: int | None = Field(default=None, ge=0)
+
+
+class AIScanJobStartResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scan_log_id: int
+    progress: ScanProgressPayload
+
+
+class AIScanJobStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scan_log_id: int
+    progress: ScanProgressPayload
+    result: AIScanDocumentsResponse | None = None
+    error_message: str | None = None
 
 
 ValidationDocumentType = Literal[

@@ -125,6 +125,43 @@ export type AIMedicalScanResult = {
   };
 };
 
+export type ScanProgressStage =
+  | 'queued'
+  | 'preprocessing'
+  | 'validating'
+  | 'extracting'
+  | 'fusing'
+  | 'prioritizing_medicines'
+  | 'completed'
+  | 'failed';
+
+export type ScanProgressStatus = 'pending' | 'running' | 'succeeded' | 'failed';
+
+export type ScanProgressPayload = {
+  stage: ScanProgressStage;
+  title: string;
+  detail: string | null;
+  percent: number;
+  status: ScanProgressStatus;
+  image_count?: number | null;
+  total_runs?: number | null;
+  completed_runs?: number | null;
+  successful_runs?: number | null;
+  medicine_count?: number | null;
+};
+
+export type AIScanJobStartResponse = {
+  scan_log_id: number;
+  progress: ScanProgressPayload;
+};
+
+export type AIScanJobStatusResponse = {
+  scan_log_id: number;
+  progress: ScanProgressPayload;
+  result: AIMedicalScanResult | null;
+  error_message: string | null;
+};
+
 export type ClaimResponse = {
   id: number;
   user_id: number;

@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from difflib import SequenceMatcher
-from functools import lru_cache
 from itertools import combinations
-import math
 import re
-from typing import Any, Awaitable, Callable, Collection, cast
-
+from typing import Any, Awaitable, Callable, cast
+from app.core.ai_pipeline_logging import ai_pipeline_context_fields, ai_pipeline_log
 from app.schemas.ai import (
     AIMedicalScanResponse,
     AIScanDiagnosis,
@@ -20,28 +16,18 @@ from app.schemas.ai import (
     AIScanSummary,
 )
 from app.services.ai_ensemble_config import (
-    CALIBRATION_VERSION,
-    CONSULTATION_KEYWORDS,
-    CRITICAL_FIELD_PATHS,
     CRITICAL_FIELD_THRESHOLD,
-    DATE_FIELD_SUFFIXES,
-    FINANCIAL_FIELD_PATHS,
     FUSION_VERSION,
-    GENERIC_MEDICINE_KEYWORDS,
     GENDER_AMBIGUITY_MARGIN_THRESHOLD,
     GENDER_NULL_SUPPORT_RATIO_THRESHOLD,
     HANDWRITTEN_DIVERGENCE_THRESHOLD,
-    HANDWRITTEN_UNCERTAINTY_CONFIDENCE_PENALTY,
     HANDWRITTEN_UNCERTAINTY_MARGIN_THRESHOLD,
     HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD,
     MEDICINE_PRIMARY_COUNT_BUFFER,
     MEDICINE_PRIMARY_COUNT_SOFT_CAP,
     MEDICINE_SPLIT_COMPONENT_MIN,
     NON_CRITICAL_FIELD_THRESHOLD,
-    NUMERIC_FIELD_PATHS,
     OTHER_CHARGE_BUCKET_ORDER,
-    OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
-    PACKAGE_LEVEL_MEDICINE_KEYWORDS,
     PATIENT_NAME_JUDGE_MARGIN_THRESHOLD,
     PATIENT_NAME_JUDGE_MAX_WINNER_PRODUCER_COUNT,
     PATIENT_NAME_JUDGE_MAX_WINNER_SUPPORT_COUNT,
@@ -49,386 +35,45 @@ from app.services.ai_ensemble_config import (
     RECONCILIATION_LARGE_OVERRIDE_RATIO_THRESHOLD,
     RECONCILIATION_VERSION,
     RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD,
-    SEMANTIC_FIELD_PATHS,
-    SEMANTIC_FIELD_SUFFIXES,
     SEMANTIC_FIELD_THRESHOLD,
-    SERVICE_KEYWORDS,
-    STRUCTURED_TERM_LEXICON,
 )
-from app.services.standard_vocabulary import (
-    map_category_to_standard,
-    normalize_facility_name,
-    normalize_to_standard_document_type,
+from app.services.ai_ensemble_helpers import (
+    FINANCIAL_TOTAL_FIELD_SEQUENCE,
+    LIST_ITEM_FIELD_PATH_PATTERN,
+    TERBILANG_CONFLICT_TOLERANCE_ABSOLUTE,
+    TERBILANG_CONFLICT_TOLERANCE_RATIO,
+    TERBILANG_MATCH_PATTERN,
+    TERBILANG_OVERRIDE_MARGIN,
+    build_self_consistency_features,
+    choose_target_list_count,
+    clamp_confidence,
+    classify_other_charge_kind,
+    clear_self_consistency_calibration_cache,
+    coerce_numeric_value,
+    extract_compound_medicine_components,
+    extract_other_charge_descriptor_signature,
+    format_output_value,
+    infer_document_type_from_label,
+    is_critical_field_path,
+    is_financial_field_path,
+    is_package_level_medicine_name,
+    is_semantic_field_path,
+    load_self_consistency_calibration_artifact,
+    normalize_candidate_key,
+    normalize_comparison_text,
+    normalize_gender_value,
+    normalize_other_charge_bucket,
+    normalize_whitespace,
+    other_charge_kinds_share_family,
+    parse_indonesian_amount_words,
+    parse_other_charge_group_key,
+    sequence_similarity,
+    serialize_field_candidates,
+    serialize_supported_runs,
+    slugify_key,
+    consensus_sort_tuple,
+    is_generic_medicine_key,
 )
-
-
-COMPOUND_MEDICINE_SPLIT_PATTERN = re.compile(r",|\+|/|&|\bdan\b", re.IGNORECASE)
-ALPHANUMERIC_TOKEN_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
-LIST_ITEM_FIELD_PATH_PATTERN = re.compile(r"^(diagnoses|medicines|other_charges)\[([^\]]+)\]\.([a-z_]+)$")
-TERBILANG_MATCH_PATTERN = re.compile(r"\b(?:terbilang|rupiah)\b", re.IGNORECASE)
-FINANCIAL_TOTAL_FIELD_SEQUENCE = (
-    "summary.total_amount",
-    "financial_recap.total_medicines",
-    "financial_recap.total_other_charges",
-    "financial_recap.grand_total",
-)
-TERBILANG_CONFLICT_TOLERANCE_RATIO = 0.01
-TERBILANG_CONFLICT_TOLERANCE_ABSOLUTE = 5000.0
-TERBILANG_OVERRIDE_MARGIN = 0.15
-
-INDONESIAN_NUMBER_WORDS: dict[str, int] = {
-    "nol": 0,
-    "satu": 1,
-    "dua": 2,
-    "tiga": 3,
-    "empat": 4,
-    "lima": 5,
-    "enam": 6,
-    "tujuh": 7,
-    "delapan": 8,
-    "sembilan": 9,
-    "sepuluh": 10,
-    "sebelas": 11,
-}
-INDONESIAN_SCALE_WORDS = {"belas", "puluh", "ratus", "ribu", "juta"}
-INDONESIAN_IGNORED_AMOUNT_WORDS = {"rupiah", "rp", "terbilang", "dan"}
-INDONESIAN_ALIAS_WORD_EXPANSIONS: dict[str, tuple[str, ...]] = {
-    "seratus": ("satu", "ratus"),
-    "seribu": ("satu", "ribu"),
-    "sejuta": ("satu", "juta"),
-}
-INDONESIAN_WORD_TOKEN_PATTERN = re.compile(r"[a-z]+", re.IGNORECASE)
-
-
-def contains_keyword(text: str, keywords: Collection[str]) -> bool:
-    lowered_text = text.casefold()
-    return any(keyword in lowered_text for keyword in keywords)
-
-
-def sequence_similarity(left: str, right: str) -> float:
-    return SequenceMatcher(None, left, right).ratio()
-
-
-def is_critical_field_path(field_path: str) -> bool:
-    return field_path in CRITICAL_FIELD_PATHS
-
-
-def is_semantic_field_path(field_path: str) -> bool:
-    return field_path in SEMANTIC_FIELD_PATHS or field_path.endswith(SEMANTIC_FIELD_SUFFIXES)
-
-
-def is_financial_field_path(field_path: str) -> bool:
-    return field_path in FINANCIAL_FIELD_PATHS
-
-
-def is_generic_medicine_key(value: str) -> bool:
-    lowered_value = value.casefold()
-    return lowered_value in {
-        "obat",
-        "obatan",
-        "obatobatan",
-        "medicine",
-        "medication",
-        "drug",
-        "pharmacy",
-        "apotek",
-    }
-
-
-def is_package_level_medicine_name(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    normalized_value = normalize_whitespace(value)
-    if not normalized_value:
-        return False
-    lowered_value = normalized_value.casefold()
-    normalized_key = normalize_comparison_text(normalized_value)
-    return (
-        contains_keyword(lowered_value, PACKAGE_LEVEL_MEDICINE_KEYWORDS)
-        or is_generic_medicine_key(normalized_key)
-    )
-
-
-def extract_compound_medicine_components(value: Any) -> list[str]:
-    if not isinstance(value, str):
-        return []
-    normalized_value = normalize_whitespace(value)
-    if not normalized_value:
-        return []
-    parts = COMPOUND_MEDICINE_SPLIT_PATTERN.split(normalized_value)
-    components: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        normalized_part = normalize_candidate_key("medicines.name", part)
-        if normalized_part in {"__null__", ""} or is_generic_medicine_key(normalized_part):
-            continue
-        if len(normalized_part) < 4 or normalized_part in seen:
-            continue
-        seen.add(normalized_part)
-        components.append(normalized_part)
-    return components
-
-
-def normalize_other_charge_bucket(raw_kind: str) -> str:
-    return raw_kind if raw_kind in {"medicine", "consultation", "service"} else "other"
-
-
-def classify_other_charge_kind(category: Any, description: Any) -> str:
-    category_text = normalize_whitespace(str(category or "")).casefold()
-    description_text = normalize_whitespace(str(description or "")).casefold()
-    combined_text = f"{category_text} {description_text}".strip()
-
-    standard_cat = map_category_to_standard(combined_text)
-    if standard_cat and standard_cat != "OTHER":
-        return standard_cat
-
-    has_medicine_keyword = contains_keyword(combined_text, GENERIC_MEDICINE_KEYWORDS)
-    has_consultation_keyword = contains_keyword(combined_text, CONSULTATION_KEYWORDS)
-    has_service_keyword = contains_keyword(combined_text, SERVICE_KEYWORDS)
-
-    if has_medicine_keyword and (has_consultation_keyword or has_service_keyword):
-        return "OTHER"
-    if has_medicine_keyword:
-        return "OTHER"
-    if has_service_keyword:
-        return "SERVICE"
-    if has_consultation_keyword:
-        return "CONSULTATION"
-    return "OTHER"
-
-
-def extract_other_charge_descriptor_signature(category: Any, description: Any) -> str:
-    raw_parts = [normalize_whitespace(str(description or "")).casefold(), normalize_whitespace(str(category or "")).casefold()]
-    tokens: list[str] = []
-    seen_tokens: set[str] = set()
-    for part in raw_parts:
-        for token in ALPHANUMERIC_TOKEN_SPLIT_PATTERN.split(part):
-            normalized_token = normalize_comparison_text(token)
-            if (
-                not normalized_token
-                or normalized_token in OTHER_CHARGE_DESCRIPTOR_STOPWORDS
-                or is_generic_medicine_key(normalized_token)
-            ):
-                continue
-            if normalized_token in seen_tokens:
-                continue
-            seen_tokens.add(normalized_token)
-            tokens.append(normalized_token)
-
-    if tokens:
-        return "".join(tokens)
-
-    description_key = normalize_candidate_key("other_charges.description", description)
-    if description_key != "__null__":
-        return description_key
-
-    category_key = normalize_candidate_key("other_charges.category", category)
-    return category_key if category_key != "__null__" else "other"
-
-
-def _tokenize_indonesian_amount_text(text: str) -> list[str]:
-    raw_tokens = INDONESIAN_WORD_TOKEN_PATTERN.findall(normalize_whitespace(text).casefold())
-    normalized_tokens: list[str] = []
-    for token in raw_tokens:
-        expansion = INDONESIAN_ALIAS_WORD_EXPANSIONS.get(token)
-        if expansion is not None:
-            normalized_tokens.extend(expansion)
-            continue
-        normalized_tokens.append(token)
-    return normalized_tokens
-
-
-def _extract_indonesian_number_sequences(tokens: list[str]) -> list[list[str]]:
-    number_words = set(INDONESIAN_NUMBER_WORDS) | INDONESIAN_SCALE_WORDS
-    sequences: list[list[str]] = []
-    current_sequence: list[str] = []
-
-    for token in tokens:
-        if token in number_words:
-            current_sequence.append(token)
-            continue
-        if token in INDONESIAN_IGNORED_AMOUNT_WORDS:
-            continue
-        if current_sequence:
-            sequences.append(current_sequence)
-            current_sequence = []
-
-    if current_sequence:
-        sequences.append(current_sequence)
-
-    return sequences
-
-
-def _parse_indonesian_sub_thousand(tokens: list[str]) -> tuple[int | None, int]:
-    if not tokens:
-        return 0, 0
-
-    units_0_to_9 = {
-        token: value
-        for token, value in INDONESIAN_NUMBER_WORDS.items()
-        if 0 <= value <= 9
-    }
-    units_1_to_9 = {
-        token: value
-        for token, value in INDONESIAN_NUMBER_WORDS.items()
-        if 1 <= value <= 9
-    }
-
-    index = 0
-    value = 0
-    consumed = 0
-
-    if tokens[index:index + 1] == ["ratus"]:
-        value += 100
-        index += 1
-        consumed += 1
-    elif index + 1 < len(tokens) and tokens[index] in units_1_to_9 and tokens[index + 1] == "ratus":
-        value += units_1_to_9[tokens[index]] * 100
-        index += 2
-        consumed += 2
-
-    if index < len(tokens):
-        token = tokens[index]
-        if token == "sepuluh":
-            value += 10
-            index += 1
-            consumed += 1
-        elif token == "sebelas":
-            value += 11
-            index += 1
-            consumed += 1
-        elif index + 1 < len(tokens) and token in units_1_to_9 and tokens[index + 1] == "belas":
-            value += units_1_to_9[token] + 10
-            index += 2
-            consumed += 2
-        elif index + 1 < len(tokens) and token in units_1_to_9 and tokens[index + 1] == "puluh":
-            value += units_1_to_9[token] * 10
-            index += 2
-            consumed += 2
-            if index < len(tokens) and tokens[index] in units_0_to_9:
-                value += units_0_to_9[tokens[index]]
-                index += 1
-                consumed += 1
-        elif token in units_0_to_9:
-            value += units_0_to_9[token]
-            index += 1
-            consumed += 1
-
-    if index != len(tokens):
-        return None, 0
-
-    return value, consumed
-
-
-def _parse_indonesian_number_sequence(tokens: list[str]) -> tuple[int | None, int]:
-    if not tokens:
-        return None, 0
-
-    scale_values = {
-        "juta": 1_000_000,
-        "ribu": 1_000,
-    }
-    total = 0
-    consumed = 0
-    previous_scale = 10_000_000
-    chunk_tokens: list[str] = []
-
-    for token in tokens:
-        if token not in scale_values:
-            chunk_tokens.append(token)
-            continue
-
-        scale = scale_values[token]
-        if scale >= previous_scale:
-            return None, 0
-
-        chunk_value, chunk_consumed = _parse_indonesian_sub_thousand(chunk_tokens)
-        if chunk_tokens and chunk_value is None:
-            return None, 0
-
-        if chunk_consumed > 0:
-            if chunk_value is None:
-                return None, 0
-            multiplier = chunk_value
-        else:
-            multiplier = 1
-        total += multiplier * scale
-        consumed += chunk_consumed + 1
-        previous_scale = scale
-        chunk_tokens = []
-
-    chunk_value, chunk_consumed = _parse_indonesian_sub_thousand(chunk_tokens)
-    if chunk_tokens and chunk_value is None:
-        return None, 0
-
-    total += int(chunk_value or 0)
-    consumed += chunk_consumed
-    if consumed == 0 or total <= 0:
-        return None, 0
-
-    return total, consumed
-
-
-def parse_indonesian_amount_words(text: str) -> tuple[float | int | None, float]:
-    normalized_text = normalize_whitespace(text).casefold()
-    if not normalized_text:
-        return None, 0.0
-
-    tokens = _tokenize_indonesian_amount_text(normalized_text)
-    sequences = _extract_indonesian_number_sequences(tokens)
-
-    best_value: int | None = None
-    best_consumed = 0
-    for sequence in sequences:
-        value, consumed = _parse_indonesian_number_sequence(sequence)
-        if value is None or consumed <= 0:
-            continue
-        if consumed > best_consumed or (consumed == best_consumed and (best_value is None or value > best_value)):
-            best_value = value
-            best_consumed = consumed
-
-    if best_value is not None:
-        confidence = min(1.0, 0.45 + (0.12 * best_consumed))
-        return best_value, round(confidence, 4)
-
-    for matched_number in re.findall(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})+|\d+)(?!\d)", normalized_text):
-        normalized_number = matched_number
-        if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", matched_number):
-            normalized_number = re.sub(r"[.,]", "", matched_number)
-        parsed_numeric = coerce_numeric_value(normalized_number)
-        if parsed_numeric is None or float(parsed_numeric) <= 0:
-            continue
-        return parsed_numeric, 0.57
-
-    return None, 0.0
-
-
-def parse_other_charge_group_key(group_key: str) -> tuple[str, str | None, str]:
-    raw_kind, amount_text, descriptor_key = (group_key.split(":", 2) + ["", ""])[:3]
-    return raw_kind or "other", None if amount_text in {"", "__null__"} else amount_text, descriptor_key
-
-
-def other_charge_kinds_share_family(left_kind: str, right_kind: str) -> bool:
-    if left_kind == right_kind:
-        return True
-    return {left_kind, right_kind}.issubset({"consultation", "service"})
-
-
-def score_candidate_group(producer_ranks: dict[str, int], producer_ids: set[str], run_count: int) -> float:
-    producer_weight = sum(max(0.6, 1.0 - (producer_ranks[producer_id] * 0.1)) for producer_id in producer_ids)
-    run_bonus = max(0, run_count - len(producer_ids)) * 0.05
-    return producer_weight + run_bonus
-
-
-def choose_target_list_count(counts: list[int]) -> int:
-    if not counts:
-        return 0
-
-    frequencies: dict[int, int] = {}
-    for count in counts:
-        frequencies[count] = frequencies.get(count, 0) + 1
-
-    return sorted(frequencies.items(), key=lambda item: (-item[1], -item[0]))[0][0]
 
 
 @dataclass(frozen=True)
@@ -538,193 +183,10 @@ class ReconciliationArtifacts:
 JudgeFieldFn = Callable[[str, list[Any], list[dict[str, Any]]], Awaitable[tuple[str | None, str | None]]]
 
 
-def clamp_confidence(value: float) -> float:
-    return round(max(0.0, min(1.0, value)), 4)
-
-
-@lru_cache(maxsize=2048)
-def normalize_whitespace(value: str) -> str:
-    return " ".join(value.strip().split())
-
-
-@lru_cache(maxsize=4096)
-def normalize_comparison_text(value: str) -> str:
-    return re.sub(r"[\W_]+", "", normalize_whitespace(value).casefold())
-
-
-def canonical_structured_field_key(field_path: str) -> str | None:
-    if field_path == "diagnoses.description" or (
-        field_path.startswith("diagnoses[") and field_path.endswith("].description")
-    ):
-        return "diagnoses.description"
-    if field_path == "medicines.name" or (
-        field_path.startswith("medicines[") and field_path.endswith("].name")
-    ):
-        return "medicines.name"
-    return None
-
-
-def infer_document_type_from_label(label: str) -> str:
-    normalized = normalize_comparison_text(label)
-    if any(keyword in normalized for keyword in ("resep", "prescription")):
-        return "prescription"
-    if any(keyword in normalized for keyword in ("formulir", "medicalform", "rawatjalan", "doctornote", "clinicalnote")):
-        return "medical_form"
-    if any(keyword in normalized for keyword in ("lab", "laboratorium")):
-        return "lab_result"
-    if any(keyword in normalized for keyword in ("radiology", "radiologi", "xray")):
-        return "radiology_result"
-    if any(keyword in normalized for keyword in ("receipt", "kwitansi", "invoice", "struk", "apotek")):
-        return "receipt"
-    return "unknown"
-
-
-def slugify_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-") or "item"
-
-
-def coerce_numeric_value(value: Any) -> float | int | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        if not math.isfinite(float(value)):
-            return None
-        return int(value) if isinstance(value, float) and value.is_integer() else value
-    if not isinstance(value, str):
-        return None
-
-    cleaned = value.strip().replace(" ", "").replace("IDR", "").replace("idr", "")
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".") if cleaned.rfind(",") > cleaned.rfind(".") else cleaned.replace(",", "")
-    elif cleaned.count(",") > 1:
-        cleaned = cleaned.replace(",", "")
-    elif cleaned.count(".") > 1:
-        cleaned = cleaned.replace(".", "")
-    else:
-        cleaned = cleaned.replace(",", "")
-    cleaned = re.sub(r"[^0-9.\-]", "", cleaned)
-    if not cleaned or cleaned in {"-", ".", "-."}:
-        return None
-
-    parsed = float(cleaned)
-    if not math.isfinite(parsed):
-        return None
-    return int(parsed) if parsed.is_integer() else round(parsed, 2)
-
-
-def coerce_date_value(value: Any) -> str | None:
-    if value is None or value == "" or not isinstance(value, str):
-        return None
-    candidate = value.strip()
-    if not candidate:
-        return None
-
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d.%m.%Y", "%d %m %Y"):
-        try:
-            return datetime.strptime(candidate, fmt).date().isoformat()
-        except ValueError:
-            continue
-
-    return candidate
-
-
-def normalize_gender_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized_value = normalize_whitespace(str(value)).casefold()
-    if not normalized_value:
-        return None
-    if normalized_value in {"male", "m", "pria", "laki laki", "lakilaki", "lelaki"}:
-        return "MALE"
-    if normalized_value in {"female", "f", "wanita", "perempuan"}:
-        return "FEMALE"
-    return normalize_whitespace(str(value)).upper()
-
-
-def normalize_candidate_key(field_path: str, value: Any) -> str:
-    if value is None:
-        return "__null__"
-    leaf_name = field_path.rsplit(".", 1)[-1]
-    if leaf_name in DATE_FIELD_SUFFIXES:
-        return coerce_date_value(value) or "__null__"
-    if field_path in NUMERIC_FIELD_PATHS:
-        numeric_value = coerce_numeric_value(value)
-        return "__null__" if numeric_value is None else str(numeric_value)
-    if field_path.endswith("currency"):
-        return normalize_whitespace(str(value)).upper()
-    if field_path.endswith("gender"):
-        return normalize_gender_value(value) or "__null__"
-    if field_path == "summary.medical_facility_name":
-        return normalize_facility_name(value) or "__null__"
-    if field_path == "summary.detected_documents" or leaf_name == "detected_documents":
-        return normalize_to_standard_document_type(value) or "__null__"
-    if field_path.endswith(".category") and "other_charges" in field_path:
-        mapped = map_category_to_standard(value)
-        return mapped or "__null__"
-    if is_semantic_field_path(field_path):
-        return normalize_whitespace(str(value)).casefold()
-    return normalize_comparison_text(str(value))
-
-
-def format_output_value(field_path: str, value: Any) -> Any:
-    if value is None:
-        return None
-    leaf_name = field_path.rsplit(".", 1)[-1]
-    if leaf_name in DATE_FIELD_SUFFIXES:
-        return coerce_date_value(value)
-    if field_path in NUMERIC_FIELD_PATHS:
-        return coerce_numeric_value(value)
-    if field_path.endswith("currency"):
-        return normalize_whitespace(str(value)).upper()
-    if field_path.endswith("gender"):
-        return normalize_gender_value(value)
-    if field_path == "summary.medical_facility_name":
-        return normalize_facility_name(value)
-    return normalize_whitespace(value) if isinstance(value, str) else value
-
-
-def serialize_supported_runs(traces: list[ProducerInferenceTrace]) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
-    for trace in traces:
-        entry = grouped.setdefault(
-            trace.producer_id,
-            {
-                "producer_id": trace.producer_id,
-                "provider": trace.provider,
-                "model": trace.model,
-                "producer_rank": trace.producer_rank,
-                "run_indices": [],
-            },
-        )
-        entry["run_indices"].append(trace.run_index)
-    return sorted(grouped.values(), key=lambda item: (item["producer_rank"], item["producer_id"]))
-
-
-def serialize_field_candidates(candidates: list[dict[str, Any]], *, selected_key: str) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for candidate in candidates:
-        candidate_traces = candidate.get("traces", [])
-        traces = cast(list[ProducerInferenceTrace], candidate_traces)
-        producer_ids = candidate.get("producers", set())
-        producer_count = len(producer_ids) if isinstance(producer_ids, set) else int(candidate.get("producer_count", 0))
-        serialized.append(
-            {
-                "normalized_key": candidate.get("normalized_key"),
-                "value": candidate.get("raw_value"),
-                "selected": candidate.get("normalized_key") == selected_key,
-                "support_count": candidate.get("run_count", 0),
-                "producer_count": producer_count,
-                "support": serialize_supported_runs(traces),
-            }
-        )
-    return serialized
-
-
 class MedicalExtractionFusionEngine:
     def __init__(self, *, judge_field: JudgeFieldFn) -> None:
         self._judge_field = judge_field
+        self._calibration_artifact = load_self_consistency_calibration_artifact()
 
     async def fuse(
         self,
@@ -736,15 +198,25 @@ class MedicalExtractionFusionEngine:
         execution_mode: str,
         primary_model_provider: str | None,
         primary_model_name: str | None,
+        ai_call_context: dict[str, Any] | None = None,
     ) -> MedicalExtractionOutcome:
         state = FusionWorkingState()
         normalized_hints = validation_hints or {}
+        ai_pipeline_log(
+            event="ensemble_fusion_started",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            total_run_count=len(all_traces),
+            successful_run_count=len(successful_traces),
+            execution_mode=execution_mode,
+        )
 
         selected_output = await self._select_packet_output(
             successful_traces,
             images,
             state,
             validation_hints=normalized_hints,
+            ai_call_context=ai_call_context,
         )
 
         result = AIMedicalScanResponse(
@@ -759,6 +231,14 @@ class MedicalExtractionFusionEngine:
             result,
             images=images,
             state=state,
+        )
+        ai_pipeline_log(
+            event="financial_reconciliation_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            corrected_field_count=len(reconciliation.corrected_fields),
+            unresolved_conflict_count=len(reconciliation.unresolved_conflicts),
+            success=True,
         )
         self._apply_safe_output_policies(result, state)
         constraint_checks = self._apply_financial_constraints(result, state.field_confidence)
@@ -782,13 +262,25 @@ class MedicalExtractionFusionEngine:
             review_reasons=review_reasons,
             overall_confidence=overall_confidence,
         )
+        ai_pipeline_log(
+            event="ensemble_fusion_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            successful_run_count=len(successful_traces),
+            total_run_count=len(all_traces),
+            judge_invocation_count=len(state.judge_invocations),
+            nullified_field_count=len(state.nullified_fields),
+            review_required=review_required,
+            overall_confidence=overall_confidence,
+            success=True,
+        )
         return MedicalExtractionOutcome(
             result=result,
             overall_confidence=overall_confidence,
             field_confidence=state.field_confidence,
             review_required=review_required,
             review_reasons=review_reasons,
-            calibration_version=CALIBRATION_VERSION,
+            calibration_version=self._calibration_artifact.calibration_version,
             ai_execution_mode=execution_mode,
             primary_model_provider=primary_model_provider,
             primary_model_name=primary_model_name,
@@ -803,6 +295,7 @@ class MedicalExtractionFusionEngine:
         state: FusionWorkingState,
         *,
         validation_hints: dict[str, Any],
+        ai_call_context: dict[str, Any] | None = None,
     ) -> SelectedFusionOutput:
         summary = await self._fuse_summary(
             traces,
@@ -811,6 +304,14 @@ class MedicalExtractionFusionEngine:
             state.judge_invocations,
             validation_hints=validation_hints,
             inventory_conflicts=state.inventory_conflicts,
+        )
+        ai_pipeline_log(
+            event="detected_document_fusion_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            detected_document_count=len(summary.detected_documents),
+            inventory_conflict_count=len(state.inventory_conflicts),
+            success=True,
         )
         patient_info = await self._fuse_section_object(
             section_name="patient_info",
@@ -828,6 +329,14 @@ class MedicalExtractionFusionEngine:
             state.field_confidence,
             state.judge_invocations,
             list_group_meta=state.list_group_meta,
+        )
+        ai_pipeline_log(
+            event="list_fusion_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            list_name="diagnoses",
+            item_count=len(medical_context.diagnoses),
+            success=True,
         )
         financial_recap = await self._fuse_section_object(
             section_name="financial_recap",
@@ -848,6 +357,14 @@ class MedicalExtractionFusionEngine:
             validation_hints=validation_hints,
             list_group_meta=state.list_group_meta,
         )
+        ai_pipeline_log(
+            event="list_fusion_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            list_name="medicines",
+            item_count=len(medicines),
+            success=True,
+        )
         medicine_amount_keys = {
             normalize_candidate_key("medicines.total_price", medicine.total_price)
             for medicine in medicines
@@ -862,6 +379,14 @@ class MedicalExtractionFusionEngine:
             exclude_amount_keys=medicine_amount_keys,
             validation_hints=validation_hints,
             list_group_meta=state.list_group_meta,
+        )
+        ai_pipeline_log(
+            event="list_fusion_completed",
+            component="medical_extraction_fusion_engine",
+            **ai_pipeline_context_fields(ai_call_context),
+            list_name="other_charges",
+            item_count=len(other_charges),
+            success=True,
         )
         return SelectedFusionOutput(
             summary=summary,
@@ -898,9 +423,6 @@ class MedicalExtractionFusionEngine:
         result: AIMedicalScanResponse,
         state: FusionWorkingState,
     ) -> None:
-        state.normalized_terms.extend(
-            self._normalize_structured_terms(result, state.field_confidence, state.list_group_meta)
-        )
         state.nullified_fields.extend(
             self._nullify_ambiguous_fields(result, state.field_confidence, state.list_group_meta)
         )
@@ -930,7 +452,9 @@ class MedicalExtractionFusionEngine:
     ) -> dict[str, Any]:
         return {
             "fusion_version": FUSION_VERSION,
-            "calibration_version": CALIBRATION_VERSION,
+            "calibration_version": self._calibration_artifact.calibration_version,
+            "calibration_artifact_status": self._calibration_artifact.artifact_status,
+            "calibration_artifact_warning": self._calibration_artifact.warning_note,
             "reconciliation_version": RECONCILIATION_VERSION,
             "field_confidence": state.field_confidence,
             "list_group_meta": state.list_group_meta,
@@ -1100,6 +624,7 @@ class MedicalExtractionFusionEngine:
         primary_rank = min((trace.producer_rank for trace in traces), default=0)
         item_counts = [len(self._list_items_for_trace(trace, list_name)) for trace in traces]
 
+        first_seen_index = 0
         for trace in traces:
             for item in self._list_items_for_trace(trace, list_name):
                 item_key = self._build_list_item_key(list_name, item)
@@ -1113,21 +638,20 @@ class MedicalExtractionFusionEngine:
                         "key": resolved_key,
                         "items": [],
                         "producers": set(),
-                        "producer_ranks": {},
+                        "first_seen_index": first_seen_index,
                     },
                 )
                 group["items"].append((trace, item))
                 group["producers"].add(trace.producer_id)
-                group["producer_ranks"][trace.producer_id] = trace.producer_rank
+                first_seen_index += 1
 
         ranked_groups: list[dict[str, Any]] = []
         for group in item_groups.values():
             run_count = len(group["items"])
+            producer_count = len(cast(set[str], group["producers"]))
             raw_kind = self._extract_other_charge_raw_kind(group["key"]) if list_name == "other_charges" else None
             bucket = normalize_other_charge_bucket(raw_kind or "other")
-            score = score_candidate_group(group["producer_ranks"], group["producers"], run_count)
-            if raw_kind == "mixed":
-                score = max(score - 0.2, 0.0)
+            score = float(run_count) + (0.01 * float(producer_count))
             representative_item = cast(tuple[SuccessfulProducerInferenceTrace, Any], group["items"][0])[1]
             medicine_names = [
                 normalize_whitespace(getattr(item, "name", ""))
@@ -1163,10 +687,10 @@ class MedicalExtractionFusionEngine:
 
         ranked_groups.sort(
             key=lambda group: (
-                -group["score"],
-                -len(group["producers"]),
-                -group["run_count"],
-                group["key"],
+                -int(group["run_count"]),
+                -len(cast(set[str], group["producers"])),
+                not bool(group.get("has_primary_support")),
+                int(group.get("first_seen_index", 0)),
             )
         )
         return item_counts, ranked_groups
@@ -1303,7 +827,7 @@ class MedicalExtractionFusionEngine:
         values: list[tuple[SuccessfulProducerInferenceTrace, Any]],
     ) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
-        for trace, value in values:
+        for index, (trace, value) in enumerate(values):
             normalized_key = normalize_candidate_key(field_path, value)
             group = groups.setdefault(
                 normalized_key,
@@ -1312,36 +836,36 @@ class MedicalExtractionFusionEngine:
                     "raw_value": format_output_value(field_path, value),
                     "traces": [],
                     "producers": set(),
-                    "producer_ranks": {},
+                    "first_seen_index": index,
                 },
             )
             if group["raw_value"] is None and value is not None:
                 group["raw_value"] = format_output_value(field_path, value)
             group["traces"].append(trace)
             group["producers"].add(trace.producer_id)
-            group["producer_ranks"][trace.producer_id] = trace.producer_rank
 
         ranked = [
             {
                 **group,
-                "score": score_candidate_group(group["producer_ranks"], group["producers"], len(group["traces"])),
                 "run_count": len(group["traces"]),
                 "producer_count": len(group["producers"]),
+                "score": float(len(group["traces"])) + (0.01 * float(len(group["producers"]))),
             }
             for group in groups.values()
         ]
         ranked.sort(
             key=lambda item: (
-                -item["score"],
-                -item["producer_count"],
-                -item["run_count"],
-                item["raw_value"] is None,
-                str(item["raw_value"]),
+                consensus_sort_tuple(
+                    run_count=int(item["run_count"]),
+                    producer_count=int(item["producer_count"]),
+                    stable_key=int(item.get("first_seen_index", 0)),
+                    null_last=item["raw_value"] is None,
+                )
             )
         )
         return ranked
 
-    def _compute_scalar_confidence(
+    def _build_self_consistency_features(
         self,
         field_path: str,
         *,
@@ -1350,16 +874,21 @@ class MedicalExtractionFusionEngine:
         total_runs: int,
         total_producers: int,
         judge_used: bool,
-    ) -> tuple[float, float]:
-        producer_support_ratio = len(winner["producers"]) / max(total_producers, 1)
-        run_support_ratio = winner["run_count"] / max(total_runs, 1)
-        margin_ratio = 1.0 if runner_up is None or winner["score"] <= 0 else max((winner["score"] - runner_up["score"]) / winner["score"], 0.0)
-        raw_confidence = clamp_confidence((0.45 * producer_support_ratio) + (0.20 * run_support_ratio) + (0.35 * margin_ratio))
-        if judge_used and winner["raw_value"] is not None:
-            raw_confidence = max(raw_confidence, 0.72 if is_critical_field_path(field_path) else 0.68)
-        return raw_confidence, clamp_confidence(producer_support_ratio)
+    ) -> dict[str, float]:
+        return build_self_consistency_features(
+            field_path,
+            vote_count=int(winner.get("run_count", 0)),
+            producer_count=len(cast(set[str], winner["producers"])),
+            runner_up_vote_count=int(runner_up.get("run_count", 0)) if runner_up is not None else 0,
+            total_runs=total_runs,
+            total_producers=total_producers,
+            judge_used=judge_used,
+        )
 
-    def _handwritten_uncertainty_penalty(
+    def _calibrate_self_consistency_confidence(self, features: dict[str, float]) -> float:
+        return self._calibration_artifact.predict_probability(features)
+
+    def _handwritten_uncertainty_rule_hit(
         self,
         field_path: str,
         *,
@@ -1368,39 +897,35 @@ class MedicalExtractionFusionEngine:
         runner_up: dict[str, Any] | None,
         producer_agreement: float,
         total_runs: int,
-    ) -> tuple[float, str | None]:
+    ) -> str | None:
         if not is_semantic_field_path(field_path):
-            return 0.0, None
+            return None
         if runner_up is None:
-            return 0.0, None
+            return None
         if winner.get("raw_value") in {None, ""} or runner_up.get("raw_value") in {None, ""}:
-            return 0.0, None
+            return None
 
         winner_score = float(winner.get("score", 0.0))
         if winner_score <= 0.0:
-            return 0.0, None
+            return None
 
         margin_ratio = max(
             (winner_score - float(runner_up.get("score", 0.0))) / winner_score,
             0.0,
         )
         if margin_ratio > HANDWRITTEN_UNCERTAINTY_MARGIN_THRESHOLD:
-            return 0.0, None
+            return None
 
         run_support_ratio = int(winner.get("run_count", 0)) / max(total_runs, 1)
         if (
             producer_agreement >= HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD
             and run_support_ratio >= HANDWRITTEN_UNCERTAINTY_SUPPORT_RATIO_THRESHOLD
         ):
-            return 0.0, None
+            return None
 
         if not self._materially_divergent_candidates(ranked):
-            return 0.0, None
-
-        return (
-            HANDWRITTEN_UNCERTAINTY_CONFIDENCE_PENALTY,
-            "applied handwritten uncertainty confidence penalty for divergent low-support semantic candidates",
-        )
+            return None
+        return "flagged handwritten uncertainty for divergent low-support semantic candidates"
 
     async def _fuse_scalar(self, field_path: str, values: list[tuple[SuccessfulProducerInferenceTrace, Any]], images: list[Any], field_confidence: dict[str, Any], judge_invocations: list[dict[str, Any]], *, output_path: str | None = None) -> Any:
         total_runs = len(values)
@@ -1421,7 +946,9 @@ class MedicalExtractionFusionEngine:
         ):
             rule_hits.append("normalized local gender label to canonical enum")
         if runner_up is not None and winner["score"] > 0:
-            close_runner_up = ((winner["score"] - runner_up["score"]) / winner["score"]) < 0.18
+            close_runner_up = (
+                max(int(winner.get("run_count", 0)) - int(runner_up.get("run_count", 0)), 0) / max(total_runs, 1)
+            ) < 0.18
 
         winner, gender_rule_hit = self._apply_conservative_gender_guard(ranked, winner, output_field_path)
         if gender_rule_hit is not None:
@@ -1445,7 +972,7 @@ class MedicalExtractionFusionEngine:
                     rule_hits.append(judge_policy)
                     judge_invocations.append({"field_path": output_field_path, "selected_candidate": winner["raw_value"], "reason": judge_reason})
 
-        raw_confidence, producer_agreement = self._compute_scalar_confidence(
+        consensus_features = self._build_self_consistency_features(
             field_path,
             winner=winner,
             runner_up=runner_up,
@@ -1453,9 +980,10 @@ class MedicalExtractionFusionEngine:
             total_producers=total_producers,
             judge_used=judge_used,
         )
-        penalty_value = 0.0
+        producer_agreement = clamp_confidence(consensus_features["producer_share"])
+        penalty_rule_hit: str | None = None
         if not judge_used:
-            penalty_value, penalty_rule_hit = self._handwritten_uncertainty_penalty(
+            penalty_rule_hit = self._handwritten_uncertainty_rule_hit(
                 output_field_path,
                 ranked=ranked,
                 winner=winner,
@@ -1465,12 +993,11 @@ class MedicalExtractionFusionEngine:
             )
             if penalty_rule_hit is not None:
                 rule_hits.append(penalty_rule_hit)
-        raw_confidence = clamp_confidence(raw_confidence - penalty_value)
-        confidence = self._calibrate_confidence(field_path, raw_confidence)
+        confidence = self._calibrate_self_consistency_confidence(consensus_features)
         review_flags = ["low_confidence"] if confidence < self._threshold_for(field_path) else []
         if judge_used:
             review_flags.append("judge_resolved")
-        if penalty_value > 0:
+        if penalty_rule_hit is not None:
             review_flags.append("handwritten_uncertainty_penalty")
 
         alternate_candidates = [
@@ -1480,7 +1007,6 @@ class MedicalExtractionFusionEngine:
         field_confidence[output_field_path] = {
             "value": winner["raw_value"],
             "confidence": confidence,
-            "raw_confidence": raw_confidence,
             "support": serialize_supported_runs(winner["traces"]),
             "alternates": [
                 {
@@ -1495,10 +1021,12 @@ class MedicalExtractionFusionEngine:
             "judge_reason": judge_reason,
             "rule_hits": rule_hits,
             "review_flags": review_flags,
-            "calibration_version": CALIBRATION_VERSION,
-            "support_count": winner["run_count"],
-            "producer_agreement": producer_agreement,
-            "confidence_penalty": penalty_value,
+            "calibration_version": self._calibration_artifact.calibration_version,
+            "vote_count": winner["run_count"],
+            "vote_share": consensus_features["vote_share"],
+            "producer_count": len(winner["producers"]),
+            "producer_share": consensus_features["producer_share"],
+            "margin": consensus_features["margin"],
         }
         return winner["raw_value"]
 
@@ -1605,14 +1133,14 @@ class MedicalExtractionFusionEngine:
         return list(dict.fromkeys(reasons))
 
     def _compute_overall_confidence(self, field_confidence: dict[str, Any]) -> float | None:
-        weighted = [(float(meta["confidence"]), 2.0 if is_critical_field_path(field_path) else 1.0) for field_path, meta in field_confidence.items() if isinstance(meta, dict) and "confidence" in meta]
-        if not weighted:
+        confidence_values = [
+            float(meta["confidence"])
+            for meta in field_confidence.values()
+            if isinstance(meta, dict) and "confidence" in meta
+        ]
+        if not confidence_values:
             return None
-        return clamp_confidence(sum(score * weight for score, weight in weighted) / sum(weight for _, weight in weighted))
-
-    def _calibrate_confidence(self, field_path: str, raw_confidence: float) -> float:
-        adjusted = raw_confidence + (0.03 if is_critical_field_path(field_path) else 0.0) - (0.04 if is_semantic_field_path(field_path) else 0.0)
-        return clamp_confidence(adjusted)
+        return clamp_confidence(sum(confidence_values) / len(confidence_values))
 
     def _threshold_for(self, field_path: str) -> float:
         if is_critical_field_path(field_path):
@@ -1732,52 +1260,6 @@ class MedicalExtractionFusionEngine:
             if review_flag not in existing_review_flags:
                 existing_review_flags.append(review_flag)
 
-    def _normalize_structured_terms(
-        self,
-        result: AIMedicalScanResponse,
-        field_confidence: dict[str, Any],
-        list_group_meta: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        normalized_terms: list[dict[str, Any]] = []
-        for field_path, meta in field_confidence.items():
-            if not isinstance(meta, dict):
-                continue
-            structured_key = canonical_structured_field_key(field_path)
-            if structured_key is None:
-                continue
-            raw_value = self._get_output_field_value(result, list_group_meta, field_path)
-            if not isinstance(raw_value, str) or not raw_value.strip():
-                continue
-            normalized_value = normalize_comparison_text(raw_value)
-            best_match: str | None = None
-            best_score = 0.0
-            for canonical_value in STRUCTURED_TERM_LEXICON.get(structured_key, ()):
-                score = sequence_similarity(normalized_value, normalize_comparison_text(canonical_value))
-                if score > best_score:
-                    best_score = score
-                    best_match = canonical_value
-            if best_match is None or best_score < 0.85 or normalize_comparison_text(best_match) == normalized_value:
-                continue
-            if not self._set_output_field_value(result, list_group_meta, field_path, best_match):
-                continue
-            self._set_meta_selected_value(
-                meta,
-                field_path,
-                best_match,
-                min_confidence=max(float(meta.get("confidence", 0.0)), 0.72),
-                rule_hit="canonicalized against structured medical lexicon",
-            )
-            self._sync_list_group_representative_field(list_group_meta, field_path, best_match)
-            normalized_terms.append(
-                {
-                    "field_path": field_path,
-                    "raw_value": raw_value,
-                    "canonical_value": best_match,
-                    "similarity": clamp_confidence(best_score),
-                }
-            )
-        return normalized_terms
-
     def _nullify_ambiguous_fields(
         self,
         result: AIMedicalScanResponse,
@@ -1799,7 +1281,7 @@ class MedicalExtractionFusionEngine:
                 continue
             if not self._meta_candidates_materially_divergent(candidates):
                 continue
-            if int(meta.get("support_count", 0)) > 1 and float(meta.get("producer_agreement", 0.0)) >= 0.67:
+            if int(meta.get("vote_count", 0)) > 1 and float(meta.get("producer_share", 0.0)) >= 0.67:
                 continue
             original_value = self._get_output_field_value(result, list_group_meta, field_path)
             if original_value in {None, ""}:
@@ -2078,6 +1560,32 @@ class MedicalExtractionFusionEngine:
                 }
             )
 
+        all_other_charge_groups = cast(
+            list[dict[str, Any]],
+            cast(dict[str, Any], list_group_meta.get("other_charges", {})).get("groups", []),
+        )
+        for group in all_other_charge_groups:
+            if group.get("bucket") != "medicine":
+                continue
+            if group.get("excluded_reason") != "duplicates selected medicine pricing":
+                continue
+            representative_value_raw = group.get("representative_value")
+            representative_value = cast(dict[str, Any], representative_value_raw) if isinstance(representative_value_raw, dict) else {}
+            amount = coerce_numeric_value(representative_value.get("amount"))
+            if amount is None:
+                continue
+            add_candidate(
+                {
+                    "amount": amount,
+                    "source_type": "other_charge",
+                    "source_key": group.get("key"),
+                    "path_prefix": group.get("path_prefix"),
+                    "score": float(group.get("score", 0.0)) + (0.1 * float(group.get("support_count", 0))),
+                    "support_count": int(group.get("support_count", 0)),
+                    "producer_count": int(group.get("producer_count", 0)),
+                }
+            )
+
         selected_medicine_groups = self._selected_list_groups_meta(list_group_meta, "medicines")
         priced_medicine_totals: list[float | int] = []
         priced_medicine_paths: list[str] = []
@@ -2189,8 +1697,8 @@ class MedicalExtractionFusionEngine:
                 continue
             dropped_group = selected_other_charge_groups[dropped_index]
             path_prefix = dropped_group.get("path_prefix")
-            if not isinstance(path_prefix, str):
-                continue
+            if not isinstance(path_prefix, str) or not path_prefix:
+                path_prefix = f"other_charges[{slugify_key(str(dropped_group.get('key', dropped_index)))}]"
             if selected_canonical_path == path_prefix:
                 continue
             rule_hit = "suppressed as financial outlier during ledger reconciliation"
@@ -2264,17 +1772,31 @@ class MedicalExtractionFusionEngine:
                 supported_targets=supported_targets,
             )
         ):
-            best_subset = {
-                **best_subset,
-                "coherent": False,
-                "deferred_by_consensus_guard": True,
-            }
             reconciliation_notes.append(
                 "Deferred coherent reconciliation override because it materially diverged from stronger consensus totals."
             )
             unresolved_conflicts.append(
                 "Financial reconciliation candidate was coherent but materially weaker than the existing consensus totals."
             )
+            current_grand_total = coerce_numeric_value(result.financial_recap.grand_total)
+            preserved_subset = self._choose_best_ledger_subset(
+                selected_groups,
+                medicine_candidates=medicine_ledger_candidates,
+                supported_targets=supported_targets,
+                medicine_line_items_null_dominant=medicine_line_items_null_dominant,
+                preferred_grand_total=current_grand_total,
+            )
+            if preserved_subset is not None and preserved_subset.get("coherent", False):
+                best_subset = {
+                    **preserved_subset,
+                    "deferred_by_consensus_guard": True,
+                }
+            else:
+                best_subset = {
+                    **best_subset,
+                    "coherent": False,
+                    "deferred_by_consensus_guard": True,
+                }
 
         if best_subset is not None and best_subset.get("coherent", False):
             dropped_indices = cast(list[int], best_subset["dropped_group_indices"])
@@ -2665,6 +2187,7 @@ class MedicalExtractionFusionEngine:
         medicine_candidates: list[dict[str, Any]],
         supported_targets: dict[str, list[dict[str, Any]]],
         medicine_line_items_null_dominant: bool,
+        preferred_grand_total: float | int | None = None,
     ) -> dict[str, Any] | None:
         if not selected_groups and not medicine_candidates:
             return None
@@ -2694,6 +2217,9 @@ class MedicalExtractionFusionEngine:
                         [cast(float | int | None, group.get("amount")) for group in subset_groups]
                     )
                     subset_grand_total = self._sum_defined_numbers([subset_medicine_total, subset_other_total])
+                    if preferred_grand_total is not None:
+                        if subset_grand_total is None or abs(float(subset_grand_total) - float(preferred_grand_total)) >= 0.01:
+                            continue
                     output_indices = list(subset_indices)
 
                     total_match, total_match_score = self._score_numeric_match(
@@ -2959,7 +2485,7 @@ class MedicalExtractionFusionEngine:
         target_count: int,
         bucket_targets: dict[str, int],
     ) -> list[dict[str, Any]]:
-        reconciliation_buffer = 3
+        reconciliation_buffer = 8
         selected_groups: list[dict[str, Any]] = []
         selected_keys: set[str] = set()
         for bucket in OTHER_CHARGE_BUCKET_ORDER:
@@ -2976,7 +2502,16 @@ class MedicalExtractionFusionEngine:
         if not selected_groups:
             return self._select_groups_by_stability(ranked_groups, target_count + reconciliation_buffer)
 
-        remaining_groups = [group for group in ranked_groups if group["key"] not in selected_keys]
+        remaining_groups = sorted(
+            [group for group in ranked_groups if group["key"] not in selected_keys],
+            key=lambda group: (
+                group.get("bucket") != "medicine",
+                not bool(group.get("has_primary_support")),
+                -int(group.get("run_count", 0)),
+                -len(cast(set[str], group.get("producers", set()))),
+                cast(str, group["key"]),
+            ),
+        )
         while len(selected_groups) < target_count + reconciliation_buffer and remaining_groups:
             next_group = remaining_groups.pop(0)
             selected_keys.add(next_group["key"])
@@ -3084,6 +2619,10 @@ class MedicalExtractionFusionEngine:
             ),
         )
 
+    def _normalize_detected_document_key(self, label: Any) -> str:
+        normalized = normalize_comparison_text(str(label or ""))
+        return normalized or "__null__"
+
     def _extract_other_charge_raw_kind(self, group_key: str) -> str:
         if ":" not in group_key:
             return "other"
@@ -3105,7 +2644,7 @@ class MedicalExtractionFusionEngine:
         selected_sequence: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
         for position, label in enumerate(selected_trace.payload.summary.detected_documents):
-            normalized_key = normalize_candidate_key("summary.detected_documents", label)
+            normalized_key = self._normalize_detected_document_key(label)
             if normalized_key in seen_keys:
                 continue
             seen_keys.add(normalized_key)
@@ -3127,7 +2666,7 @@ class MedicalExtractionFusionEngine:
         support: dict[str, dict[str, Any]] = {}
         for trace in traces:
             for position, document_label in enumerate(trace.payload.summary.detected_documents):
-                normalized_key = normalize_candidate_key("summary.detected_documents", document_label)
+                normalized_key = self._normalize_detected_document_key(document_label)
                 meta = support.setdefault(
                     normalized_key,
                     {
@@ -3135,17 +2674,16 @@ class MedicalExtractionFusionEngine:
                         "normalized_key": normalized_key,
                         "inferred_type": infer_document_type_from_label(document_label),
                         "producers": set(),
-                        "producer_ranks": {},
                         "run_count": 0,
                         "positions": [],
                     },
                 )
                 meta["producers"].add(trace.producer_id)
-                meta["producer_ranks"][trace.producer_id] = trace.producer_rank
                 meta["run_count"] += 1
                 cast(list[tuple[int, int]], meta["positions"]).append((trace.producer_rank, position))
         for meta in support.values():
-            meta["score"] = score_candidate_group(meta["producer_ranks"], meta["producers"], meta["run_count"])
+            meta["producer_count"] = len(cast(set[str], meta["producers"]))
+            meta["score"] = float(meta["run_count"]) + (0.01 * float(meta["producer_count"]))
         return support
 
     def _compute_detected_document_meta(
@@ -3157,25 +2695,53 @@ class MedicalExtractionFusionEngine:
         review_flags: list[str],
         judge_used: bool,
         judge_reason: str | None,
+        total_runs: int,
         total_producers: int,
     ) -> dict[str, Any]:
         selected_support = [
-            support_by_key[normalize_candidate_key("summary.detected_documents", label)]
+            support_by_key[self._normalize_detected_document_key(label)]
             for label in selected_docs
-            if normalize_candidate_key("summary.detected_documents", label) in support_by_key
+            if self._normalize_detected_document_key(label) in support_by_key
         ]
         if selected_support:
             avg_run_support = sum(int(item["run_count"]) for item in selected_support) / len(selected_support)
-            avg_producer_support = sum(len(cast(set[str], item["producers"])) for item in selected_support) / len(selected_support)
-            run_ratio = avg_run_support / max(len(selected_support), 1)
-            producer_ratio = avg_producer_support / max(total_producers, 1)
-            confidence = clamp_confidence((0.65 * producer_ratio) + (0.20 * run_ratio) + (0.15 * 1.0))
-            support_count = sum(int(item["run_count"]) for item in selected_support)
-            producer_agreement = clamp_confidence(producer_ratio)
+            avg_producer_support = sum(int(item.get("producer_count", len(cast(set[str], item["producers"])))) for item in selected_support) / len(selected_support)
+            vote_count = int(round(avg_run_support))
+            producer_count = int(round(avg_producer_support))
+            runner_up_vote_count = max(
+                (
+                    int(item["run_count"])
+                    for key, item in support_by_key.items()
+                    if key not in {
+                        self._normalize_detected_document_key(label)
+                        for label in selected_docs
+                    }
+                ),
+                default=0,
+            )
+            consensus_features = build_self_consistency_features(
+                "summary.detected_documents",
+                vote_count=vote_count,
+                producer_count=producer_count,
+                runner_up_vote_count=runner_up_vote_count,
+                total_runs=total_runs,
+                total_producers=total_producers,
+                judge_used=judge_used,
+            )
+            confidence = self._calibrate_self_consistency_confidence(consensus_features)
         else:
             confidence = 0.0
-            support_count = 0
-            producer_agreement = 0.0
+            vote_count = 0
+            producer_count = 0
+            consensus_features = build_self_consistency_features(
+                "summary.detected_documents",
+                vote_count=0,
+                producer_count=0,
+                runner_up_vote_count=0,
+                total_runs=total_runs,
+                total_producers=total_producers,
+                judge_used=judge_used,
+            )
         return {
             "value": selected_docs,
             "confidence": confidence,
@@ -3186,9 +2752,12 @@ class MedicalExtractionFusionEngine:
             "judge_reason": judge_reason,
             "rule_hits": rule_hits,
             "review_flags": review_flags,
-            "calibration_version": CALIBRATION_VERSION,
-            "support_count": support_count,
-            "producer_agreement": producer_agreement,
+            "calibration_version": self._calibration_artifact.calibration_version,
+            "vote_count": vote_count,
+            "vote_share": consensus_features["vote_share"],
+            "producer_count": producer_count,
+            "producer_share": consensus_features["producer_share"],
+            "margin": consensus_features["margin"],
         }
 
     async def _fuse_detected_documents(
@@ -3202,6 +2771,7 @@ class MedicalExtractionFusionEngine:
     ) -> tuple[list[str], dict[str, Any]]:
         support_by_key = self._build_detected_document_support(traces)
         primary_sequence = self._select_primary_document_sequence(traces)
+        total_runs = len(traces)
         total_producers = len({trace.producer_id for trace in traces})
         if not primary_sequence:
             return [], self._compute_detected_document_meta(
@@ -3211,6 +2781,7 @@ class MedicalExtractionFusionEngine:
                 review_flags=[],
                 judge_used=False,
                 judge_reason=None,
+                total_runs=total_runs,
                 total_producers=total_producers,
             )
 
@@ -3224,6 +2795,7 @@ class MedicalExtractionFusionEngine:
                 review_flags=[],
                 judge_used=False,
                 judge_reason=None,
+                total_runs=total_runs,
                 total_producers=total_producers,
             )
 
@@ -3244,8 +2816,11 @@ class MedicalExtractionFusionEngine:
         supported_candidates = sorted(
             support_by_key.values(),
             key=lambda item: (
-                -float(item.get("score", 0.0)),
-                -len(cast(set[str], item["producers"])),
+                consensus_sort_tuple(
+                    run_count=int(item.get("run_count", 0)),
+                    producer_count=int(item.get("producer_count", len(cast(set[str], item["producers"])))),
+                    stable_key=min(cast(list[tuple[int, int]], item.get("positions", [(10_000, 10_000)]))),
+                ),
                 min(cast(list[tuple[int, int]], item.get("positions", [(10_000, 10_000)]))),
                 cast(str, item["raw_value"]),
             ),
@@ -3329,6 +2904,7 @@ class MedicalExtractionFusionEngine:
             review_flags=["inventory_advisory_reordered"] if final_docs != base_docs[: len(final_docs)] else [],
             judge_used=judge_used,
             judge_reason=judge_reason,
+            total_runs=total_runs,
             total_producers=total_producers,
         )
 

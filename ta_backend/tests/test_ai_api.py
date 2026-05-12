@@ -15,16 +15,28 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.routes import ai as ai_route
 from app.api.routes.ai import processor
+from app.core.ai_pipeline_logging import (
+    ai_pipeline_log,
+    clear_ai_pipeline_debug_logging_cache,
+    format_ai_pipeline_terminal_line,
+    get_ai_pipeline_logger,
+)
 from app.core.config import Settings, get_settings
 from app.db.base import Base
 from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
 from app.models.ai_model import AIModel
 from app.models.scan_log import AIApiCallLog
-from app.repositories.scan_log_repository import ScanLogRepository
+from app.repositories.scan_log_repository import ScanLogFileCreate, ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services import ai_service as ai_service_module
-from app.services.ai_ensemble import MedicalExtractionFusionEngine, parse_indonesian_amount_words
+from app.services.ai_ensemble import (
+    MedicalExtractionOutcome,
+    MedicalExtractionFusionEngine,
+    ProducerInferenceTrace,
+    clear_self_consistency_calibration_cache,
+    parse_indonesian_amount_words,
+)
 from app.services.ai_service import (
     AIModelSpec,
     DocumentImageInput,
@@ -33,6 +45,11 @@ from app.services.ai_service import (
     matches_any_patient_name_candidate,
 )
 from app.services.image_preprocessing import ProcessedDocumentImage
+from app.services.scan_medicine_prioritization import (
+    ScanMedicineImageInterpretationJudge,
+    prioritize_scan_medicines,
+)
+from app.services import model_invocation_test as model_invocation_test_module
 
 
 def get_message_block(content: Any, index: int) -> dict[str, Any]:
@@ -45,6 +62,16 @@ def get_message_block(content: Any, index: int) -> dict[str, Any]:
 def get_http_exception_detail_dict(exc: HTTPException) -> dict[str, Any]:
     assert isinstance(exc.detail, dict)
     return cast(dict[str, Any], exc.detail)
+
+
+def extract_ai_pipeline_log_lines(raw_output: str) -> list[str]:
+    lines: list[str] = []
+    for line in raw_output.splitlines():
+        normalized = line.strip()
+        if not normalized or not normalized.startswith("[AI]"):
+            continue
+        lines.append(normalized)
+    return lines
 
 SCAN_RESULT = {
     "summary": {
@@ -157,6 +184,18 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database_path = tmp_path / "ai-test.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path.as_posix()}")
     monkeypatch.setenv("APP_ENV", "test")
+    for provider_env_var in (
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OLLAMA_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "COHERE_API_KEY",
+        "CEREBRAS_API_KEY",
+    ):
+        monkeypatch.delenv(provider_env_var, raising=False)
     get_settings.cache_clear()
     clear_database_caches()
 
@@ -192,6 +231,731 @@ def get_scan_log_by_id(scan_log_id: int):
     session_factory = get_session_factory()
     with session_factory() as db:
         return ScanLogRepository(db).get_by_id(scan_log_id)
+
+
+def get_user_id_from_token(client: TestClient, token: str) -> int:
+    response = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    return int(response.json()["id"])
+
+
+def test_ai_pipeline_debug_logging_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+    ai_pipeline_log(event="sample_event", component="test_component", value=1)
+
+    captured = capsys.readouterr()
+    assert extract_ai_pipeline_log_lines(captured.err) == []
+
+
+def test_ai_pipeline_debug_logging_emits_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+
+    ai_pipeline_log(event="sample_event", component="test_component", value=1)
+
+    captured = capsys.readouterr()
+    lines = extract_ai_pipeline_log_lines(captured.err)
+    assert lines == ["[AI] sample_event"]
+    assert not lines[0].startswith("{")
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_ai_pipeline_debug_logging_configures_single_owned_stream_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+
+    logger = get_ai_pipeline_logger()
+    owned_handlers = [
+        handler
+        for handler in logger.handlers
+        if bool(getattr(handler, "_ai_pipeline_owned_handler", False))
+    ]
+    assert logger.level == 20
+    assert logger.propagate is False
+    assert len(owned_handlers) == 1
+
+    logger = get_ai_pipeline_logger()
+    owned_handlers = [
+        handler
+        for handler in logger.handlers
+        if bool(getattr(handler, "_ai_pipeline_owned_handler", False))
+    ]
+    assert len(owned_handlers) == 1
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_format_ai_pipeline_terminal_line_renders_compact_known_events() -> None:
+    assert format_ai_pipeline_terminal_line(
+        "scan_request_started",
+        {"component": "ai_scan_route", "scan_log_id": 51, "upload_count": 4},
+    ) == "[AI][scan:51] SCAN start files=4"
+    assert format_ai_pipeline_terminal_line(
+        "validation_inference_completed",
+        {
+            "component": "document_validation_processor",
+            "scan_log_id": 51,
+            "model": "gemini-3.1-flash-lite-preview",
+            "latency_ms": 14798,
+            "total_tokens": 6723,
+        },
+    ) == "[AI][scan:51] VALIDATE model=gemini-3.1-flash-lite-preview done 14.8s tok=6723"
+    assert format_ai_pipeline_terminal_line(
+        "ensemble_fusion_completed",
+        {
+            "component": "medical_extraction_fusion_engine",
+            "scan_log_id": 51,
+            "judge_invocation_count": 0,
+            "nullified_field_count": 3,
+            "overall_confidence": 0.8965,
+            "review_required": True,
+        },
+    ) == "[AI][scan:51] FUSE done judges=0 nulls=3 conf=0.8965 review=yes"
+    assert format_ai_pipeline_terminal_line(
+        "medicine_prioritization_batch_failed",
+        {
+            "component": "scan_medicine_prioritization",
+            "scan_log_id": 51,
+            "error_message": "Batch medicine interpretation payload is invalid.",
+        },
+    ) == "[AI][scan:51] MEDS batch failed err=Batch medicine interpretation payload is invalid."
+
+
+def test_format_ai_pipeline_terminal_line_truncates_long_error_text() -> None:
+    long_error = (
+        "5 validation errors for BatchMedicineInterpretationResponse judgements.1.name "
+        "Extra inputs are not permitted For further information visit https://errors.pydantic.dev/2.12/v/extra_forbidden "
+        "judgements.2.name Extra inputs are not permitted"
+    )
+    rendered = format_ai_pipeline_terminal_line(
+        "medicine_prompt_failed",
+        {
+            "component": "scan_medicine_prioritization",
+            "scan_log_id": 51,
+            "error_message": long_error,
+        },
+    )
+    assert rendered is not None
+    assert "For further information visit" not in rendered
+    assert len(rendered) < 170
+
+
+def test_medical_document_processor_emits_extraction_and_ensemble_logs_without_pii(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(SCAN_RESULT))
+
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="model-a")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            validation_hints={},
+            ai_call_context={"scan_log_id": 123, "user_id": 456},
+        )
+    )
+
+    captured = capsys.readouterr()
+    lines = extract_ai_pipeline_log_lines(captured.err)
+    assert result.result.patient_info.name == "Budi Saputra"
+    assert any("EXTRACT start" in line for line in lines)
+    assert any("RUN p1r1 model-a start" in line for line in lines)
+    assert any("RUN p1r1 model-a done" in line for line in lines)
+    assert any("FUSE start" in line for line in lines)
+    assert any("FUSE done" in line for line in lines)
+    assert any("EXTRACT done" in line for line in lines)
+    joined_logs = captured.err
+    assert "Budi Saputra" not in joined_logs
+    assert "Influenza" not in joined_logs
+    assert "Demam dua hari" not in joined_logs
+    assert "{" not in joined_logs
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_field_judge_emits_logs_without_candidate_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeJudgeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps({"selected_candidate_index": 0, "reason": "Prefer stronger support"}))
+
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeJudgeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    selected_key, reason = asyncio.run(
+        medical_processor._judge_field_conflict(
+            "patient_info.address",
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            [
+                {"raw_value": "JL. Alpha No.1", "normalized_key": "alpha", "run_count": 2, "producers": {"p1", "p2"}},
+                {"raw_value": "JL. Beta No.2", "normalized_key": "beta", "run_count": 1, "producers": {"p3"}},
+            ],
+            ai_call_context={"scan_log_id": 99, "user_id": 7},
+        )
+    )
+
+    captured = capsys.readouterr()
+    lines = extract_ai_pipeline_log_lines(captured.err)
+    assert selected_key == "alpha"
+    assert reason == "Prefer stronger support"
+    assert not any("field_judge_started" in line for line in lines)
+    assert any("JUDGE done field=patient_info.address candidates=2" in line for line in lines)
+    joined_logs = captured.err
+    assert "JL. Alpha No.1" not in joined_logs
+    assert "JL. Beta No.2" not in joined_logs
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_prioritize_scan_medicines_emits_medicine_prompt_logs_without_pii(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "judgements": [
+                            {
+                                "original_index": 0,
+                                "interpreted_name": None,
+                                "interpretation_confidence": 0.4,
+                                "interpretation_reason": "insufficient evidence",
+                                "relevance": "relevant",
+                                "relevance_confidence": 0.72,
+                                "matched_diagnosis": False,
+                                "matched_anamnesis": False,
+                            },
+                            {
+                                "original_index": 1,
+                                "interpreted_name": None,
+                                "interpretation_confidence": 0.4,
+                                "interpretation_reason": "insufficient evidence",
+                                "relevance": "uncertain",
+                                "relevance_confidence": 0.61,
+                                "matched_diagnosis": False,
+                                "matched_anamnesis": False,
+                            },
+                        ]
+                    }
+                )
+            )
+
+    monkeypatch.setattr(ScanMedicineImageInterpretationJudge, "_create_chat_model", lambda self, model_spec: FakeModel())
+    monkeypatch.setattr(
+        ScanMedicineImageInterpretationJudge,
+        "_get_enabled_model_specs",
+        lambda self: [AIModelSpec(provider="google_genai", model="medicine-judge-model")],
+    )
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    scan_result = AIMedicalScanResponse.model_validate(
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {
+                    "name": "Drug Alpha",
+                    "quantity": 10,
+                    "unit": "TABLET",
+                    "dosage_instruction": "3 x 1",
+                    "unit_price": 1000,
+                    "total_price": 10000,
+                },
+                {
+                    "name": "Drug Beta",
+                    "quantity": 10,
+                    "unit": "TABLET",
+                    "dosage_instruction": "3 x 1",
+                    "unit_price": 1000,
+                    "total_price": 10000,
+                },
+            ],
+        }
+    )
+    extraction_meta_payload = {
+        "list_group_meta": {
+            "medicines": {
+                "selected_groups": [
+                    {"output_index": 0, "key": "drugalpha", "score": 0.81, "support_count": 2, "producer_count": 1},
+                    {"output_index": 1, "key": "drugbeta", "score": 0.79, "support_count": 2, "producer_count": 1},
+                ],
+                "groups": [],
+            }
+        }
+    }
+
+    with session_factory() as db:
+        prioritized_result, log_payload = asyncio.run(
+            prioritize_scan_medicines(
+                db,
+                scan_result,
+                extraction_meta_payload,
+                images=[
+                    DocumentImageInput(
+                        filename="scan.png",
+                        mime_type="image/png",
+                        base64_data="YWJj",
+                    )
+                ],
+                interpretation_mode="suggest_only",
+                scan_log_id=321,
+                user_id=654,
+            )
+        )
+
+    captured = capsys.readouterr()
+    lines = extract_ai_pipeline_log_lines(captured.err)
+    assert [medicine.name for medicine in prioritized_result.medicines] == ["Drug Alpha", "Drug Beta"]
+    assert log_payload["enabled"] is True
+    assert any("MEDS start count=2 mode=suggest_only" in line for line in lines)
+    assert any("MEDS batch ambiguous=2" in line for line in lines)
+    assert any("MEDS prompt model=medicine-judge-model start ambiguous=2" in line for line in lines)
+    assert any("MEDS prompt done judgements=2" in line for line in lines)
+    assert any("MEDS done count=2 ambiguous=2 applied=no batch=yes" in line for line in lines)
+    joined_logs = captured.err
+    assert "Drug Alpha" not in joined_logs
+    assert "Drug Beta" not in joined_logs
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_scan_documents_route_emits_stage_logs_without_pii(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = register_and_login(client, email="scan-logs@example.com", full_name="Budi Saputra")
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        del filename, content
+        return ProcessedDocumentImage(
+            filename="scan.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        del images
+        return DocumentValidationResponse.model_validate(VALIDATION_RESULT)
+
+    async def fake_process(
+        images: list[DocumentImageInput],
+        patient_name_candidates: list[str] | None = None,
+        validation_hints: dict[str, object] | None = None,
+        **_: object,
+    ) -> MedicalExtractionOutcome:
+        del images, patient_name_candidates, validation_hints
+        return MedicalExtractionOutcome(
+            result=AIMedicalScanResponse.model_validate(SCAN_RESULT),
+            overall_confidence=0.91,
+            field_confidence={},
+            review_required=False,
+            review_reasons=[],
+            calibration_version="self_consistency_logistic_v1",
+            ai_execution_mode="ensemble",
+            primary_model_provider="google_genai",
+            primary_model_name="model-a",
+            ai_runs=[],
+            extraction_meta_payload={"review_required": False},
+        )
+
+    async def fake_prioritize_scan_medicines(*args: object, **kwargs: object) -> tuple[AIMedicalScanResponse, dict[str, Any]]:
+        del args, kwargs
+        return AIMedicalScanResponse.model_validate(SCAN_RESULT), {"enabled": True, "applied": False}
+
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+    monkeypatch.setattr(ai_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(ai_route.validation_processor, "process", fake_validation_process)
+    monkeypatch.setattr(ai_route.processor, "process", fake_process)
+    monkeypatch.setattr(ai_route, "prioritize_scan_medicines", fake_prioritize_scan_medicines)
+
+    response = client.post(
+        "/api/ai/scan-documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("scan.png", b"abc", "image/png"))],
+    )
+
+    captured = capsys.readouterr()
+    lines = extract_ai_pipeline_log_lines(captured.err)
+    assert response.status_code == 200
+    assert any("SCAN start files=1" in line for line in lines)
+    assert any("PREP done images=1" in line for line in lines)
+    assert sum(1 for line in lines if "VALIDATE start" in line) == 1
+    assert sum(1 for line in lines if "VALIDATE done status=not_checked review=no" in line) == 1
+    assert not any("text_extraction_started" in line for line in lines)
+    assert not any("text_extraction_completed" in line for line in lines)
+    assert not any("medicine_prioritization_started" in line and "ai_scan_route" in line for line in lines)
+    assert any("SCAN done mode=ensemble runs=0 review=no" in line for line in lines)
+    joined_logs = captured.err
+    assert "Budi Saputra" not in joined_logs
+    assert "Influenza" not in joined_logs
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_invoke_model_route_returns_text_only_response(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_messages: list[list[object]] = []
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            captured_messages.append(messages)
+            return AIMessage(
+                content='{"answer":"ok"}',
+                usage_metadata={"input_tokens": 11, "output_tokens": 5, "total_tokens": 16},
+            )
+
+    monkeypatch.setattr(
+        model_invocation_test_module.ModelInvocationTestService,
+        "_create_chat_model",
+        lambda self, model_spec: FakeModel(),
+    )
+
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello model",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["provider"] == "google_genai"
+    assert payload["model_name"] == "gemini-1.5-flash"
+    assert payload["supports_image_input"] is True
+    assert payload["image_supplied"] is False
+    assert payload["raw_text"] == '{"answer":"ok"}'
+    assert payload["parsed_json"] == {"answer": "ok"}
+    assert payload["prompt_tokens"] == 11
+    assert payload["completion_tokens"] == 5
+    assert payload["total_tokens"] == 16
+    assert len(captured_messages) == 1
+    human_message = captured_messages[0][0]
+    assert getattr(human_message, "content") == "hello model"
+
+
+def test_invoke_model_route_supports_optional_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_messages: list[list[object]] = []
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            captured_messages.append(messages)
+            return AIMessage(content="not json")
+
+    monkeypatch.setattr(
+        model_invocation_test_module.ModelInvocationTestService,
+        "_create_chat_model",
+        lambda self, model_spec: FakeModel(),
+    )
+
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "describe image",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+        files={"image": ("scan.png", b"abc", "image/png")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["image_supplied"] is True
+    assert payload["parsed_json"] is None
+    assert len(captured_messages) == 1
+    human_message = captured_messages[0][0]
+    content = getattr(human_message, "content")
+    assert isinstance(content, list)
+    text_block = get_message_block(content, 0)
+    image_block = get_message_block(content, 1)
+    assert text_block["type"] == "text"
+    assert text_block["text"] == "describe image"
+    assert image_block["type"] == "image_url"
+    image_url = cast(dict[str, Any], image_block["image_url"])
+    assert image_url["url"] == "data:image/png;base64,YWJj"
+
+
+def test_invoke_model_route_uses_google_async_compat_fallback(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_requests: list[dict[str, Any]] = []
+    captured_messages: list[list[object]] = []
+
+    class FakeAsyncClient:
+        async def generate_content(self, **kwargs: Any) -> AIMessage:
+            captured_requests.append(kwargs)
+            return AIMessage(
+                content='{"answer":"compat-ok"}',
+                usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+            )
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.async_client = FakeAsyncClient()
+            self.timeout = 9
+            self.default_metadata = [("x-test-header", "1")]
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            raise TypeError(
+                "GenerativeServiceAsyncClient.generate_content() got an unexpected "
+                "keyword argument 'max_retries'"
+            )
+
+        def _prepare_request(self, messages: list[object]) -> dict[str, Any]:
+            captured_messages.append(messages)
+            return {"messages": messages}
+
+    monkeypatch.setattr(
+        model_invocation_test_module.ModelInvocationTestService,
+        "_create_chat_model",
+        lambda self, model_spec: FakeModel(),
+    )
+
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello model",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["raw_text"] == '{"answer":"compat-ok"}'
+    assert payload["parsed_json"] == {"answer": "compat-ok"}
+    assert payload["total_tokens"] == 10
+    assert len(captured_messages) == 1
+    assert len(captured_requests) == 1
+    assert captured_requests[0]["request"]["messages"] == captured_messages[0]
+    assert captured_requests[0]["timeout"] == 9
+    assert captured_requests[0]["metadata"] == [("x-test-header", "1")]
+    assert "max_retries" not in captured_requests[0]
+
+
+def test_invoke_model_route_rejects_blank_message(client: TestClient) -> None:
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "   ",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "message": "Input validation failed.",
+        "errors": [
+            {
+                "field": "message",
+                "message": "Message must not be empty.",
+            }
+        ],
+    }
+
+
+def test_invoke_model_route_rejects_unknown_provider(client: TestClient) -> None:
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello",
+            "provider": "not_real",
+            "model_name": "whatever",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "message": "Input validation failed.",
+        "errors": [
+            {
+                "field": "provider",
+                "message": "Provider is not registered.",
+            }
+        ],
+    }
+
+
+def test_invoke_model_route_rejects_image_for_non_image_provider(client: TestClient) -> None:
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello",
+            "provider": "mistralai",
+            "model_name": "mistral-small-latest",
+        },
+        files={"image": ("scan.png", b"abc", "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "message": "Input validation failed.",
+        "errors": [
+            {
+                "field": "image",
+                "message": "This provider does not support image input.",
+            }
+        ],
+    }
+
+
+def test_invoke_model_route_surfaces_missing_provider_credential(client: TestClient) -> None:
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "message": "Input validation failed.",
+        "errors": [
+            {
+                "field": "non_field",
+                "message": "GOOGLE_API_KEY is not configured.",
+            }
+        ],
+    }
+
+
+def test_invoke_model_route_returns_null_parsed_json_for_non_json_text(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content="plain text output")
+
+    monkeypatch.setattr(
+        model_invocation_test_module.ModelInvocationTestService,
+        "_create_chat_model",
+        lambda self, model_spec: FakeModel(),
+    )
+
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello model",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["raw_text"] == "plain text output"
+    assert payload["parsed_json"] is None
+
+
+def test_invoke_model_route_returns_clear_provider_runtime_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            raise RuntimeError("provider boom")
+
+    monkeypatch.setattr(
+        model_invocation_test_module.ModelInvocationTestService,
+        "_create_chat_model",
+        lambda self, model_spec: FakeModel(),
+    )
+
+    response = client.post(
+        "/api/test/invoke-model",
+        data={
+            "message": "hello model",
+            "provider": "google_genai",
+            "model_name": "gemini-1.5-flash",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "message": "AI model invocation failed.",
+        "errors": [
+            {
+                "field": "non_field",
+                "message": "provider boom",
+            }
+        ],
+    }
 
 
 def test_scan_documents_returns_validated_ai_payload(
@@ -773,6 +1537,196 @@ def test_scan_documents_rejects_invalid_image_upload(client: TestClient) -> None
     assert scan_log.files[0].processed_content is None
 
 
+def test_start_scan_documents_job_returns_initial_progress_snapshot(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, email="scan-job@example.com", full_name="Siti Aminah")
+
+    async def fake_run_scan_documents_job(scan_log_id: int, user_id: int) -> None:
+        del scan_log_id, user_id
+        return None
+
+    monkeypatch.setattr(ai_route, "run_scan_documents_job", fake_run_scan_documents_job)
+
+    response = client.post(
+        "/api/ai/scan-documents/jobs",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("scan.png", b"abc", "image/png"))],
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scan_log_id"] > 0
+    assert payload["progress"] == {
+        "stage": "queued",
+        "title": "Upload complete",
+        "detail": "Preparing scan job.",
+        "percent": 15,
+        "status": "pending",
+        "image_count": 1,
+        "total_runs": None,
+        "completed_runs": None,
+        "successful_runs": None,
+        "medicine_count": None,
+    }
+
+    scan_log = get_scan_log_by_id(payload["scan_log_id"])
+    assert scan_log is not None
+    assert scan_log.progress_payload == payload["progress"]
+
+
+def test_get_scan_documents_job_status_returns_succeeded_result_for_owner(client: TestClient) -> None:
+    token = register_and_login(client, email="scan-job-status@example.com", full_name="Siti Aminah")
+    user_id = get_user_id_from_token(client, token)
+    session_factory = get_session_factory()
+
+    with session_factory() as db:
+        repository = ScanLogRepository(db)
+        scan_log = repository.create_pending(
+            user_id=user_id,
+            file_records=[
+                ScanLogFileCreate(
+                    original_filename="scan.png",
+                    original_mime_type="image/png",
+                    original_byte_size=3,
+                    original_sha256_hash=hashlib.sha256(b"abc").hexdigest(),
+                    original_content=b"abc",
+                )
+            ],
+            progress_payload={
+                "stage": "prioritizing_medicines",
+                "title": "Prioritizing medicines",
+                "detail": "Finalizing fields.",
+                "percent": 97,
+                "status": "running",
+                "image_count": 1,
+                "total_runs": 4,
+                "completed_runs": 4,
+                "successful_runs": 4,
+                "medicine_count": 1,
+            },
+        )
+        repository.mark_succeeded(
+            scan_log,
+            validation_payload=VALIDATION_RESULT,
+            extraction_payload=SCAN_RESULT,
+            primary_model_provider="google_genai",
+            primary_model_name="gemini-3.1-flash-lite-preview",
+            ai_execution_mode="ensemble",
+            extraction_meta_payload={"review_required": False},
+        )
+        scan_log_id = scan_log.id
+
+    response = client.get(
+        f"/api/ai/scan-documents/jobs/{scan_log_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["scan_log_id"] == scan_log_id
+    assert payload["progress"]["stage"] == "completed"
+    assert payload["progress"]["percent"] == 100
+    assert payload["progress"]["status"] == "succeeded"
+    assert payload["error_message"] is None
+    assert payload["result"]["scan_log_id"] == scan_log_id
+    assert payload["result"]["summary"] == SCAN_RESULT["summary"]
+
+
+def test_get_scan_documents_job_status_requires_owner(client: TestClient) -> None:
+    owner_token = register_and_login(client, email="scan-job-owner@example.com", full_name="Owner User")
+    other_token = register_and_login(client, email="scan-job-other@example.com", full_name="Other User")
+    owner_user_id = get_user_id_from_token(client, owner_token)
+    session_factory = get_session_factory()
+
+    with session_factory() as db:
+        repository = ScanLogRepository(db)
+        scan_log = repository.create_pending(
+            user_id=owner_user_id,
+            file_records=[
+                ScanLogFileCreate(
+                    original_filename="scan.png",
+                    original_mime_type="image/png",
+                    original_byte_size=3,
+                    original_sha256_hash=hashlib.sha256(b"abc").hexdigest(),
+                    original_content=b"abc",
+                )
+            ],
+        )
+        scan_log_id = scan_log.id
+
+    response = client.get(
+        f"/api/ai/scan-documents/jobs/{scan_log_id}",
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_medical_document_processor_reports_progress_during_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    progress_events: list[dict[str, Any]] = []
+
+    async def fake_run_single_inference_trace(**kwargs: object) -> ProducerInferenceTrace:
+        producer_rank = cast(int, kwargs["producer_rank"])
+        run_index = cast(int, kwargs["run_index"])
+        await asyncio.sleep(0.01 if run_index == 0 else 0.02)
+        return ProducerInferenceTrace(
+            producer_id=f"producer-{producer_rank}",
+            provider="google_genai",
+            model=f"model-{producer_rank}",
+            producer_rank=producer_rank,
+            run_index=run_index,
+            temperature=0.2,
+            success=True,
+            call_kind="scan_extraction",
+            payload=AIMedicalScanResponse.model_validate(SCAN_RESULT),
+        )
+
+    async def fake_fuse(self: MedicalExtractionFusionEngine, **kwargs: object) -> MedicalExtractionOutcome:
+        del self
+        all_traces = cast(list[ProducerInferenceTrace], kwargs["all_traces"])
+        return MedicalExtractionOutcome(
+            result=AIMedicalScanResponse.model_validate(SCAN_RESULT),
+            overall_confidence=0.9,
+            field_confidence={},
+            review_required=False,
+            review_reasons=[],
+            calibration_version="test",
+            ai_execution_mode="ensemble",
+            primary_model_provider="google_genai",
+            primary_model_name="gemini-3.1-flash-lite-preview",
+            ai_runs=all_traces,
+            extraction_meta_payload={"review_required": False},
+        )
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="gemini-3.1-flash-lite-preview"),
+            AIModelSpec(provider="google_genai", model="gemini-3-flash-preview"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_run_single_inference_trace", fake_run_single_inference_trace)
+    monkeypatch.setattr(MedicalExtractionFusionEngine, "fuse", fake_fuse)
+
+    asyncio.run(
+        medical_processor.process(
+            images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            progress_callback=lambda payload: progress_events.append(payload),
+        )
+    )
+
+    assert progress_events[0]["event"] == "extraction_started"
+    run_events = [event for event in progress_events if event["event"] == "extraction_run_completed"]
+    assert [event["completed_runs"] for event in run_events] == [1, 2, 3, 4]
+    assert run_events[-1]["successful_runs"] == 4
+    assert progress_events[-2]["event"] == "fusion_started"
+    assert progress_events[-1]["event"] == "fusion_completed"
+
+
 def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:
     medical_processor = MedicalDocumentProcessor(settings=build_settings())
     prompt_bundle = medical_processor._load_prompt_bundle()
@@ -879,9 +1833,201 @@ def test_process_returns_validated_result_from_model_json(monkeypatch: pytest.Mo
         )
     )
 
-    assert result.result.model_dump() == SCAN_RESULT
+    assert result.result.summary.detected_documents == SCAN_RESULT["summary"]["detected_documents"]
+    assert result.result.summary.service_date == SCAN_RESULT["summary"]["service_date"]
+    assert result.result.summary.total_amount == SCAN_RESULT["summary"]["total_amount"]
+    assert result.result.summary.medical_facility_name == "rumah sakit sehat sentosa"
+    assert result.result.patient_info.model_dump() == SCAN_RESULT["patient_info"]
+    assert result.result.medical_context.model_dump() == SCAN_RESULT["medical_context"]
+    assert result.result.financial_recap.model_dump() == SCAN_RESULT["financial_recap"]
     assert result.ai_execution_mode == "ensemble"
     assert result.overall_confidence is not None
+    service_date_meta = result.field_confidence["summary.service_date"]
+    assert service_date_meta["vote_count"] == 2
+    assert service_date_meta["vote_share"] == 1.0
+    assert service_date_meta["producer_count"] == 1
+    assert service_date_meta["producer_share"] == 1.0
+    assert service_date_meta["margin"] == 1.0
+    assert service_date_meta["calibration_version"] == "self_consistency_logistic_v1"
+    assert "raw_confidence" not in service_date_meta
+    assert "support_count" not in service_date_meta
+    assert "producer_agreement" not in service_date_meta
+    assert "consensus_features" not in service_date_meta
+    assert result.extraction_meta_payload["calibration_artifact_status"] == "bootstrap_unfitted"
+    assert result.extraction_meta_payload["calibration_artifact_warning"] is not None
+
+
+def test_process_fails_closed_when_calibration_artifact_override_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(SCAN_RESULT))
+
+    missing_artifact = tmp_path / "missing-artifact.json"
+    monkeypatch.setenv("AI_ENSEMBLE_CALIBRATION_ARTIFACT", str(missing_artifact))
+    clear_self_consistency_calibration_cache()
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    with pytest.raises(RuntimeError, match="calibration artifact is missing"):
+        asyncio.run(
+            medical_processor.process(
+                [
+                    DocumentImageInput(
+                        filename="scan.png",
+                        mime_type="image/png",
+                        base64_data="YWJj",
+                    )
+                ]
+            )
+        )
+
+    monkeypatch.delenv("AI_ENSEMBLE_CALIBRATION_ARTIFACT", raising=False)
+    clear_self_consistency_calibration_cache()
+
+
+def test_process_marks_fitted_calibration_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(SCAN_RESULT))
+
+    fitted_artifact = tmp_path / "fitted-artifact.json"
+    fitted_artifact.write_text(
+        json.dumps(
+            {
+                "calibration_version": "self_consistency_logistic_v1",
+                "feature_names": [
+                    "vote_share",
+                    "margin",
+                    "producer_share",
+                    "judge_used",
+                    "is_critical",
+                    "is_semantic",
+                ],
+                "coefficients": [3.8, 1.6, 1.2, -0.35, 0.15, -0.2],
+                "intercept": -3.0,
+                "training_claim_count": 12,
+                "created_at": "2026-05-05T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("AI_ENSEMBLE_CALIBRATION_ARTIFACT", str(fitted_artifact))
+    clear_self_consistency_calibration_cache()
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.extraction_meta_payload["calibration_artifact_status"] == "fitted"
+    assert result.extraction_meta_payload["calibration_artifact_warning"] is None
+
+    monkeypatch.delenv("AI_ENSEMBLE_CALIBRATION_ARTIFACT", raising=False)
+    clear_self_consistency_calibration_cache()
+
+
+def test_process_uses_producer_count_tiebreak_before_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    call_counts: dict[str, int] = {}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            current = call_counts.get(self.model_name, 0)
+            call_counts[self.model_name] = current + 1
+            address = "JL. Alpha No.1"
+            if self.model_name == "model-a":
+                address = "JL. Alpha No.1"
+            elif self.model_name == "model-b":
+                address = "JL. Beta No.2" if current == 0 else "JL. Gamma No.3"
+            elif self.model_name == "model-c":
+                address = "JL. Beta No.2" if current == 0 else "JL. Delta No.4"
+            payload = {
+                **SCAN_RESULT,
+                "patient_info": {
+                    **SCAN_RESULT["patient_info"],
+                    "address": address,
+                },
+            }
+            return AIMessage(content=json.dumps(payload))
+
+    async def should_not_be_called(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images, candidates
+        raise AssertionError(f"Judge should not run for producer-count tiebreak: {field_path}")
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+            AIModelSpec(provider="google_genai", model="model-c"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", should_not_be_called)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    address_meta = result.field_confidence["patient_info.address"]
+    assert result.result.patient_info.address == "JL. Beta No.2"
+    assert address_meta["judge_used"] is False
+    assert address_meta["vote_count"] == 2
+    assert address_meta["producer_count"] == 2
+    assert address_meta["vote_share"] == pytest.approx(0.3333, rel=1e-6)
 
 
 def test_process_rejects_non_json_model_output(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1031,7 +2177,13 @@ def test_process_uses_first_active_database_model(
         )
     )
 
-    assert result.result.model_dump() == SCAN_RESULT
+    assert result.result.model_dump() == {
+        **SCAN_RESULT,
+        "summary": {
+            **SCAN_RESULT["summary"],
+            "medical_facility_name": "rumah sakit sehat sentosa",
+        },
+    }
     assert selected_models == ["model-b", "model-b", "model-a", "model-a"]
 
 
@@ -1110,6 +2262,69 @@ def test_ainvoke_with_tracking_persists_failure_without_usage(monkeypatch: pytes
         assert rows[0].success is False
         assert rows[0].error_message == "provider boom"
         assert rows[0].prompt_tokens is None
+
+
+def test_ainvoke_with_tracking_uses_google_async_compat_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+    captured_requests: list[dict[str, Any]] = []
+
+    class FakeAsyncClient:
+        async def generate_content(self, **kwargs: Any) -> AIMessage:
+            captured_requests.append(kwargs)
+            return AIMessage(
+                content=json.dumps(SCAN_RESULT),
+                usage_metadata={"input_tokens": 19, "output_tokens": 8, "total_tokens": 27},
+            )
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.async_client = FakeAsyncClient()
+            self.timeout = 5
+            self.default_metadata = [("x-ai-call", "compat")]
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 1
+            raise TypeError(
+                "GenerativeServiceAsyncClient.generate_content() got an unexpected "
+                "keyword argument 'max_retries'"
+            )
+
+        def _prepare_request(self, messages: list[object]) -> dict[str, Any]:
+            return {"messages": messages}
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+
+    response, tracking_payload = asyncio.run(
+        medical_processor._ainvoke_with_tracking(
+            FakeModel(),
+            [object()],
+            provider="google_genai",
+            model_name="gemini-test",
+            call_kind="scan_extraction",
+            success_context={"request_context_payload": {"image_count": 1}},
+        )
+    )
+
+    assert response.content == json.dumps(SCAN_RESULT)
+    assert tracking_payload["prompt_tokens"] == 19
+    assert tracking_payload["completion_tokens"] == 8
+    assert tracking_payload["total_tokens"] == 27
+    assert len(captured_requests) == 1
+    assert captured_requests[0]["timeout"] == 5
+    assert captured_requests[0]["metadata"] == [("x-ai-call", "compat")]
+    assert "max_retries" not in captured_requests[0]
+
+    with session_factory() as db:
+        rows = db.execute(select(AIApiCallLog)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].success is True
+        assert rows[0].provider == "google_genai"
+        assert rows[0].prompt_tokens == 19
+        assert rows[0].completion_tokens == 8
+        assert rows[0].total_tokens == 27
 
 
 def test_process_uses_judge_for_service_date_conflict(
@@ -2922,10 +4137,10 @@ def test_process_nullifies_ambiguous_handwritten_semantic_field_when_judge_canno
 
     assert result.result.medical_context.anamnesis is None
     anamnesis_meta = result.field_confidence["medical_context.anamnesis"]
-    assert anamnesis_meta["confidence_penalty"] > 0
+    assert "confidence_penalty" not in anamnesis_meta
     assert "handwritten_uncertainty_penalty" in anamnesis_meta["review_flags"]
     assert any(
-        "handwritten uncertainty confidence penalty" in hit
+        "handwritten uncertainty" in hit
         for hit in anamnesis_meta["rule_hits"]
     )
     assert result.extraction_meta_payload["nullified_fields"] == [
@@ -2982,7 +4197,7 @@ def test_process_does_not_apply_handwritten_penalty_for_strong_semantic_consensu
     )
 
     anamnesis_meta = result.field_confidence["medical_context.anamnesis"]
-    assert anamnesis_meta["confidence_penalty"] == 0.0
+    assert "confidence_penalty" not in anamnesis_meta
     assert "handwritten_uncertainty_penalty" not in anamnesis_meta["review_flags"]
 
 
@@ -3108,7 +4323,7 @@ def test_process_skips_patient_name_judge_when_consensus_is_strong(
     assert result.field_confidence["patient_info.name"]["judge_used"] is False
 
 
-def test_process_canonicalizes_structured_medical_terms_and_records_metadata(
+def test_process_preserves_raw_structured_medical_terms_without_hardcoded_canonicalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     medical_processor = MedicalDocumentProcessor(settings=build_settings())
@@ -3148,15 +4363,8 @@ def test_process_canonicalizes_structured_medical_terms_and_records_metadata(
         )
     )
 
-    assert result.result.medical_context.diagnoses[0].description == "Pertusis"
-    assert result.extraction_meta_payload["normalized_terms"] == [
-        {
-            "field_path": "diagnoses[pertesis].description",
-            "raw_value": "pertesis",
-            "canonical_value": "Pertusis",
-            "similarity": 0.875,
-        }
-    ]
+    assert result.result.medical_context.diagnoses[0].description == "pertesis"
+    assert result.extraction_meta_payload["normalized_terms"] == []
 
 
 def test_process_requires_minimum_successful_runs(

@@ -50,9 +50,8 @@ AI_PROVIDER_CATALOG: dict[str, AIProviderCatalogEntry] = {
         class_name="ChatGroq",
         credential_env_var="GROQ_API_KEY",
         settings_attr="groq_api_key",
-        supports_image_input=False,
-        is_scan_compatible=False,
-        activation_block_reason=DEFAULT_UNSUPPORTED_SCAN_REASON,
+        supports_image_input=True,
+        is_scan_compatible=True,
     ),
     "mistralai": AIProviderCatalogEntry(
         provider="mistralai",

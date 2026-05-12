@@ -27,6 +27,20 @@ npx tsc --noEmit
 npx expo start
 ```
 
+For Android development:
+
+```bash
+npm run android
+```
+
+Use that command for the Android emulator. It starts Expo in `localhost` mode and points API traffic to `10.0.2.2`, which is the emulator alias for your host machine.
+
+For a physical phone on the same network:
+
+```bash
+npm run android:device
+```
+
 ## Notes
 
 - `app.config.js` wraps `app.json` to inject LAN-friendly local API values during development.

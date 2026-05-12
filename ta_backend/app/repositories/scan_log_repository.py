@@ -68,11 +68,13 @@ class ScanLogRepository:
         user_id: int,
         file_records: list[ScanLogFileCreate],
         ai_execution_mode: str | None = None,
+        progress_payload: dict[str, Any] | None = None,
     ) -> ScanLog:
         scan_log = ScanLog(
             user_id=user_id,
             status="pending",
             ai_execution_mode=ai_execution_mode,
+            progress_payload=progress_payload,
         )
         scan_log.files.extend(
             ScanLogFile(
@@ -90,6 +92,19 @@ class ScanLogRepository:
             for file_record in file_records
         )
         self._db.add(scan_log)
+        self._db.commit()
+        return self.get_by_id(scan_log.id) or scan_log
+
+    def update_progress(
+        self,
+        scan_log: ScanLog,
+        *,
+        progress_payload: dict[str, Any],
+        status: str | None = None,
+    ) -> ScanLog:
+        if status is not None:
+            scan_log.status = status
+        scan_log.progress_payload = progress_payload
         self._db.commit()
         return self.get_by_id(scan_log.id) or scan_log
 
@@ -131,6 +146,15 @@ class ScanLogRepository:
         scan_log.validation_payload = validation_payload
         scan_log.extraction_payload = extraction_payload
         scan_log.extraction_meta_payload = extraction_meta_payload
+        if scan_log.progress_payload is not None:
+            scan_log.progress_payload = {
+                **scan_log.progress_payload,
+                "stage": "completed",
+                "title": "Ready to review",
+                "detail": "Scan finished successfully.",
+                "percent": 100,
+                "status": "succeeded",
+            }
         scan_log.error_payload = None
         if ai_runs:
             self._persist_ai_runs(scan_log, ai_runs)
@@ -158,9 +182,37 @@ class ScanLogRepository:
         scan_log.validation_payload = validation_payload
         scan_log.extraction_payload = extraction_payload
         scan_log.extraction_meta_payload = extraction_meta_payload
+        current_progress = scan_log.progress_payload or {}
+        scan_log.progress_payload = {
+            **current_progress,
+            "stage": "failed",
+            "title": "Scan failed",
+            "detail": _extract_progress_error_message(error_payload),
+            "percent": min(int(current_progress.get("percent") or 0), 97),
+            "status": "failed",
+        }
         scan_log.error_payload = error_payload
         if ai_runs:
             self._persist_ai_runs(scan_log, ai_runs)
+        self._db.commit()
+        return self.get_by_id(scan_log.id) or scan_log
+
+    def mark_cancelled(self, scan_log: ScanLog) -> ScanLog:
+        """Mark a scan as cancelled by the user."""
+        scan_log.status = "cancelled"
+        current_progress = scan_log.progress_payload or {}
+        scan_log.progress_payload = {
+            **current_progress,
+            "stage": "failed",
+            "title": "Scan cancelled",
+            "detail": "Scan was cancelled by the user.",
+            "percent": min(int(current_progress.get("percent") or 0), 97),
+            "status": "failed",
+        }
+        scan_log.error_payload = {
+            "status_code": 499,
+            "detail": {"message": "Scan was cancelled by the user."},
+        }
         self._db.commit()
         return self.get_by_id(scan_log.id) or scan_log
 
@@ -315,3 +367,19 @@ class ScanLogRepository:
             "failed_count": sum(1 for log in scan_logs if log.status not in {"pending", "succeeded"}),
             "unlinked_count": sum(1 for log in scan_logs if len(log.linked_claims) == 0),
         }
+
+
+def _extract_progress_error_message(error_payload: dict[str, Any]) -> str:
+    detail = error_payload.get("detail")
+    if isinstance(detail, dict):
+        raw_errors = detail.get("errors")
+        if isinstance(raw_errors, list):
+            for error in raw_errors:
+                if isinstance(error, dict):
+                    message = str(error.get("message", "")).strip()
+                    if message:
+                        return message
+        message = str(detail.get("message", "")).strip()
+        if message:
+            return message
+    return "Scan did not complete."

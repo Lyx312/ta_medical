@@ -2,6 +2,28 @@ from __future__ import annotations
 import re
 from typing import Any
 
+CANONICAL_DOCUMENT_TYPE_DISPLAY_NAMES = {
+    "receipt": "Kwitansi",
+    "prescription": "Resep",
+    "sales_note": "Nota Penjualan",
+    "payment_receipt": "Tanda Penerimaan Pembayaran",
+    "medical_form": "Formulir Rawat Jalan",
+    "doctor_note": "Doctor Note",
+    "lab_result": "Lab Result",
+    "radiology_result": "Radiology Result",
+    "pharmacy_receipt": "Pharmacy Receipt",
+    "other": "Other",
+}
+
+CANONICAL_OTHER_CHARGE_DISPLAY_NAMES = {
+    "CONSULTATION": "Jasa Konsultasi Dokter",
+    "ADMINISTRATION": "Biaya Administrasi",
+    "SERVICE": "Pelayanan Medis",
+    "LABORATORY": "Pemeriksaan Laboratorium",
+    "ROOM": "Kamar/Ruangan",
+    "OTHER": "Lain-lain",
+}
+
 DOCUMENT_TYPE_KEYWORDS = {
     "RECEIPT": ["kwitansi", "struk", "receipt", "pembayaran", "penjualan"],
     "PRESCRIPTION": ["resep", "salinan resep", "resep obat", "prescription"],
@@ -99,6 +121,10 @@ def _normalize_lower_text(value: str | None) -> str:
     return value.strip().lower() if value else ""
 
 
+def _normalize_spaced_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", _normalize_lower_text(value)).strip()
+
+
 def _match_keyword_groups(value: str, mapping: dict[str, list[str]]) -> str | None:
     hits: list[str] = []
     for key, keywords in mapping.items():
@@ -124,6 +150,51 @@ def normalize_to_standard_document_type_strict(value: str | None) -> str | None:
     if not value:
         return None
     return _match_keyword_groups(_normalize_lower_text(value), STRICT_DOCUMENT_TYPE_KEYWORDS)
+
+
+def normalize_to_evaluation_document_type(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    normalized = _normalize_spaced_text(value)
+    compact = normalized.replace("-", "_").replace(" ", "_")
+    if compact in CANONICAL_DOCUMENT_TYPE_DISPLAY_NAMES:
+        return compact
+
+    alias_map = {
+        "salesnote": "sales_note",
+        "paymentreceipt": "payment_receipt",
+        "medicalrecord": "medical_form",
+        "medicalform": "medical_form",
+        "doctornote": "doctor_note",
+        "labresult": "lab_result",
+        "radiologyresult": "radiology_result",
+        "pharmacyreceipt": "pharmacy_receipt",
+    }
+    if compact in alias_map:
+        return alias_map[compact]
+
+    if any(keyword in normalized for keyword in ("apotek", "apotik", "pharmacy", "farmasi")) and any(
+        keyword in normalized for keyword in ("kwitansi", "struk", "receipt")
+    ):
+        return "pharmacy_receipt"
+    if any(keyword in normalized for keyword in ("tanda penerimaan pembayaran", "payment receipt", "tanda terima pembayaran")):
+        return "payment_receipt"
+    if any(keyword in normalized for keyword in ("nota penjualan resep", "nota penjualan", "sales note", "faktur")):
+        return "sales_note"
+    if any(keyword in normalized for keyword in ("salinan resep", "resep obat", "prescription", "resep")):
+        return "prescription"
+    if any(keyword in normalized for keyword in ("formulir rawat jalan", "medical form", "medical record", "formulir rawat")):
+        return "medical_form"
+    if any(keyword in normalized for keyword in ("doctor note", "catatan dokter", "surat dokter")):
+        return "doctor_note"
+    if any(keyword in normalized for keyword in ("lab result", "hasil lab", "hasil laboratorium", "laboratorium")):
+        return "lab_result"
+    if any(keyword in normalized for keyword in ("radiology result", "hasil radiologi", "radiologi", "x ray", "xray", "rontgen")):
+        return "radiology_result"
+    if any(keyword in normalized for keyword in ("kwitansi", "struk", "receipt")):
+        return "receipt"
+    return "other"
 
 
 def normalize_facility_name(value: str | None) -> str | None:
@@ -156,6 +227,34 @@ def map_category_to_standard_strict(value: str | None) -> str | None:
     return _match_keyword_groups(_normalize_lower_text(value), STRICT_OTHER_CHARGE_CATEGORIES)
 
 
+def normalize_to_evaluation_other_charge_category(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    normalized = _normalize_spaced_text(value)
+    compact = normalized.replace("-", "_").replace(" ", "_")
+    if compact in CANONICAL_OTHER_CHARGE_DISPLAY_NAMES:
+        return compact
+    if compact == "medicine_administration":
+        return "SERVICE"
+    if compact == "equipment":
+        return "OTHER"
+
+    if any(keyword in normalized for keyword in ("konsultasi", "consultation", "consult", "jasa dokter", "fee dokter", "jasa medik dokter", "visit dokter")):
+        return "CONSULTATION"
+    if any(keyword in normalized for keyword in ("administrasi", "admin")):
+        return "ADMINISTRATION"
+    if any(keyword in normalized for keyword in ("laboratorium", "lab test", "pemeriksaan lab")):
+        return "LABORATORY"
+    if any(keyword in normalized for keyword in ("rawat inap", "kamar", "ruangan", "akomodasi")):
+        return "ROOM"
+    if any(keyword in normalized for keyword in ("pelayanan", "tindakan", "procedure", "treatment", "perawatan", "medical service", "jasa medis", "pelayanan medis", "medis")):
+        return "SERVICE"
+    if any(keyword in normalized for keyword in ("lain", "lainnya", "other", "misc")):
+        return "OTHER"
+    return None
+
+
 def map_description_to_category(description: str | None) -> str | None:
     if not description:
         return None
@@ -171,6 +270,8 @@ def map_description_to_category_strict(description: str | None) -> str | None:
 def get_category_display_name(category: str | None) -> str | None:
     if not category:
         return None
+    if category in CANONICAL_OTHER_CHARGE_DISPLAY_NAMES:
+        return CANONICAL_OTHER_CHARGE_DISPLAY_NAMES[category]
     if category in OTHER_CHARGE_CATEGORIES:
         return OTHER_CHARGE_CATEGORIES[category]["description_templates"][0]
     return category
@@ -179,6 +280,8 @@ def get_category_display_name(category: str | None) -> str | None:
 def get_document_type_display_name(doc_type: str | None) -> str | None:
     if not doc_type:
         return None
+    if doc_type in CANONICAL_DOCUMENT_TYPE_DISPLAY_NAMES:
+        return CANONICAL_DOCUMENT_TYPE_DISPLAY_NAMES[doc_type]
     if doc_type in STANDARD_DOCUMENT_TYPES:
         return STANDARD_DOCUMENT_TYPES[doc_type]["display"]
     return doc_type

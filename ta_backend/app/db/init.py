@@ -149,6 +149,10 @@ def ensure_scan_log_schema() -> None:
     is_legacy = "ai_model_provider" in column_names
     has_new_schema = "primary_model_provider" in column_names
 
+    with engine.begin() as connection:
+        if "progress_payload" not in column_names:
+            connection.execute(text("ALTER TABLE scan_logs ADD COLUMN progress_payload JSON"))
+
     if has_new_schema and not is_legacy:
         _ensure_scan_log_ai_runs_table(engine, inspector)
         return

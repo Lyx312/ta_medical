@@ -90,7 +90,7 @@ def main() -> None:
         "--output",
         type=str,
         default=None,
-        help="Output path for ground_truth.json (default: <folder>/ground_truth.json)",
+        help="Output path for the ground-truth file (default: <folder>/<folder>.json)",
     )
     parser.add_argument("--db-url", type=str, default=None, help="Database URL (default: use app config)")
     args = parser.parse_args()
@@ -121,12 +121,12 @@ def main() -> None:
         template = asyncio.run(generate_template_for_folder(folder, client, token, args.candidates))
         print("done")
 
-    output_path = Path(args.output) if args.output else folder / f"{folder.name}_ground_truth.json"
+    output_path = Path(args.output) if args.output else folder / f"{folder.name}.json"
     with open(output_path, "w", encoding="utf-8") as file_handle:
         json.dump(template, file_handle, indent=2, ensure_ascii=False)
 
     print(f"\nTemplate written to {output_path}")
-    print("Fill in the 'expected' values in the ground_truth.json to create a proper test case.")
+    print("Fill in the 'expected' values in the ground-truth file to create a proper test case.")
     print("The '_predicted' field contains the raw model output for reference only.")
     print("Remove the '_predicted' field before using the file for evaluation.")
 

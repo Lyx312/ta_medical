@@ -86,7 +86,7 @@ export function AdminSettingsScreen() {
         <ScreenHeader
           title="AI Configuration"
           subtitle="Choose which seeded AI models are active for backend inference."
-          helperText="Multiple models can be active, but the backend currently uses the first active scan-compatible model by priority."
+          helperText="Models are listed in order of priority for selection in scan pipelines. Incompatible models cannot be activated until they are updated to meet current scan pipeline requirements."
         />
 
         {isLoading ? (

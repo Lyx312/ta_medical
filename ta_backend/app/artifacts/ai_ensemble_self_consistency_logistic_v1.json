@@ -1,0 +1,23 @@
+{
+  "calibration_version": "self_consistency_logistic_v1",
+  "feature_names": [
+    "vote_share",
+    "margin",
+    "producer_share",
+    "judge_used",
+    "is_critical",
+    "is_semantic"
+  ],
+  "coefficients": [
+    3.8,
+    1.6,
+    1.2,
+    -0.35,
+    0.15,
+    -0.2
+  ],
+  "intercept": -3.0,
+  "training_claim_count": 0,
+  "created_at": "2026-05-04T00:00:00Z",
+  "notes": "Bootstrap artifact. Regenerate with eval/self_consistency_calibration.py after labeled dataset expansion."
+}

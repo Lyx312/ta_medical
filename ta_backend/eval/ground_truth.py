@@ -7,11 +7,25 @@ class GroundTruthError(Exception):
     pass
 
 
+def resolve_ground_truth_path(folder_path: str | Path) -> Path:
+    folder = Path(folder_path)
+    preferred_path = folder / f"{folder.name}.json"
+    if preferred_path.exists():
+        return preferred_path
+
+    legacy_path = folder / f"{folder.name}_ground_truth.json"
+    if legacy_path.exists():
+        return legacy_path
+
+    raise GroundTruthError(
+        f"No {folder.name}.json found in {folder}"
+        f" (legacy fallback {folder.name}_ground_truth.json also not found)"
+    )
+
+
 def load_ground_truth(folder_path: str | Path) -> tuple[dict[str, Any], list[Path]]:
     folder = Path(folder_path)
-    gt_path = folder / f"{folder.name}_ground_truth.json"
-    if not gt_path.exists():
-        raise GroundTruthError(f"No {folder.name}_ground_truth.json found in {folder}")
+    gt_path = resolve_ground_truth_path(folder)
 
     try:
         with open(gt_path, "r", encoding="utf-8") as f:

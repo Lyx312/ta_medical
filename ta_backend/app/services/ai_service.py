@@ -4,7 +4,8 @@ from importlib import import_module
 from dataclasses import dataclass, replace
 from pathlib import Path
 import time
-from typing import Any, cast
+from typing import Any, Awaitable, Callable, cast
+from httpx import Timeout
 
 import yaml
 from fastapi import HTTPException, status
@@ -12,6 +13,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from pydantic import ValidationError
 
+from app.core.ai_pipeline_logging import (
+    ai_pipeline_context_fields,
+    ai_pipeline_exception_fields,
+    ai_pipeline_log,
+)
 from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
@@ -41,6 +47,7 @@ from app.services.ai_provider_catalog import (
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
 VALIDATION_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_validation.yaml"
 FIELD_JUDGE_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_field_judge.yaml"
+AI_MODEL_REQUEST_TIMEOUT_SECONDS = 180  # 3-minute timeout per AI request
 STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"medical_form", "doctor_note", "prescription"}
 STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"receipt", "lab_result", "radiology_result"}
 SUPPORTED_MEDICAL_DOCUMENT_TYPES = STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES | STAMP_OR_SIGNATURE_OPTIONAL_TYPES
@@ -217,6 +224,21 @@ class BaseDocumentAIProcessor:
         self._settings = settings
         self._prompt_file_path = prompt_file_path or PROMPT_FILE_PATH
 
+    def _log_pipeline_event(
+        self,
+        event: str,
+        component: str,
+        *,
+        ai_call_context: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        ai_pipeline_log(
+            event=event,
+            component=component,
+            **ai_pipeline_context_fields(ai_call_context),
+            **fields,
+        )
+
     def _load_prompt_bundle(self, prompt_file_path: Path | None = None) -> PromptBundle:
         target_path = prompt_file_path or self._prompt_file_path
         try:
@@ -312,6 +334,7 @@ class BaseDocumentAIProcessor:
         kwargs: dict[str, Any] = {
             "model": model_spec.model,
             "temperature": model_spec.temperature,
+            "timeout": AI_MODEL_REQUEST_TIMEOUT_SECONDS,
         }
 
         if model_spec.provider == "google_genai":
@@ -329,6 +352,7 @@ class BaseDocumentAIProcessor:
                 "headers": {
                     "Authorization": f"Bearer {credential}",
                 },
+                "timeout": Timeout(timeout=AI_MODEL_REQUEST_TIMEOUT_SECONDS),
             }
         elif model_spec.provider == "groq":
             kwargs["api_key"] = credential
@@ -499,7 +523,7 @@ class BaseDocumentAIProcessor:
         error_message: str | None = None
         success = False
         try:
-            response = await model.ainvoke(messages)
+            response = await self._ainvoke_model(model, messages, provider=provider)
             success = True
             return response, self._build_ai_call_tracking_payload(
                 response=response,
@@ -528,6 +552,138 @@ class BaseDocumentAIProcessor:
         finally:
             if success and response is not None:
                 pass
+
+    async def _ainvoke_model(
+        self,
+        model: Any,
+        messages: list[Any],
+        *,
+        provider: str,
+    ) -> Any:
+        try:
+            # Wrap with asyncio timeout as second safety layer (2 min + buffer)
+            return await asyncio.wait_for(
+                self._ainvoke_model_impl(model, messages, provider=provider),
+                timeout=AI_MODEL_REQUEST_TIMEOUT_SECONDS + 10
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=f"AI model inference timed out after {AI_MODEL_REQUEST_TIMEOUT_SECONDS} seconds. The AI service may be experiencing delays.",
+            )
+
+    async def _ainvoke_model_impl(
+        self,
+        model: Any,
+        messages: list[Any],
+        *,
+        provider: str,
+    ) -> Any:
+        try:
+            return await model.ainvoke(messages)
+        except TypeError as exc:
+            if not self._should_use_google_async_compat(provider, exc):
+                raise
+            return await self._ainvoke_google_async_compat(model, messages)
+
+    def _should_use_google_async_compat(self, provider: str, exc: TypeError) -> bool:
+        if provider != "google_genai":
+            return False
+
+        error_message = str(exc)
+        return (
+            "generate_content()" in error_message
+            and "unexpected keyword argument 'max_retries'" in error_message
+        )
+
+    async def _ainvoke_google_async_compat(self, model: Any, messages: list[Any]) -> Any:
+        async_client = getattr(model, "async_client", None)
+        prepare_request = getattr(model, "_prepare_request", None)
+        if async_client is None or not callable(prepare_request):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "AI model invocation failed.",
+                    "errors": [
+                        {
+                            "field": "non_field",
+                            "message": (
+                                "Google model async client compatibility fallback is unavailable "
+                                "for the installed provider integration."
+                            ),
+                        }
+                    ],
+                },
+            )
+
+        request = prepare_request(messages)
+        invocation_kwargs: dict[str, Any] = {
+            "request": request,
+        }
+        timeout = getattr(model, "timeout", None)
+        if timeout is not None:
+            invocation_kwargs["timeout"] = timeout
+        default_metadata = getattr(model, "default_metadata", None)
+        if default_metadata is not None:
+            invocation_kwargs["metadata"] = default_metadata
+
+        raw_response = await async_client.generate_content(**invocation_kwargs)
+        return self._coerce_google_async_compat_response(model, raw_response)
+
+    def _coerce_google_async_compat_response(self, model: Any, raw_response: Any) -> Any:
+        if hasattr(raw_response, "content"):
+            return raw_response
+
+        provider_module = import_module(model.__class__.__module__)
+        response_to_result = getattr(provider_module, "_response_to_result", None)
+        if not callable(response_to_result):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "AI model invocation failed.",
+                    "errors": [
+                        {
+                            "field": "non_field",
+                            "message": (
+                                "Google model response could not be converted by the installed "
+                                "provider integration."
+                            ),
+                        }
+                    ],
+                },
+            )
+
+        chat_result = response_to_result(raw_response)
+        generations = getattr(chat_result, "generations", None)
+        if not isinstance(generations, list) or not generations:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "AI model invocation failed.",
+                    "errors": [
+                        {
+                            "field": "non_field",
+                            "message": "Google model returned an empty response.",
+                        }
+                    ],
+                },
+            )
+
+        message = getattr(generations[0], "message", None)
+        if message is None:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "message": "AI model invocation failed.",
+                    "errors": [
+                        {
+                            "field": "non_field",
+                            "message": "Google model response did not include a chat message.",
+                        }
+                    ],
+                },
+            )
+        return message
 
     def _build_ai_call_tracking_payload(
         self,
@@ -578,6 +734,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         patient_name_candidates: list[str] | None = None,
         validation_hints: dict[str, Any] | None = None,
         ai_call_context: dict[str, Any] | None = None,
+        progress_callback: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     ) -> MedicalExtractionOutcome:
         if not images:
             raise HTTPException(
@@ -588,10 +745,34 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         prompt_bundle = self._load_prompt_bundle()
         model_specs = self._get_enabled_model_specs()[:AI_EXTRACTION_MAX_PRODUCERS]
         execution_mode = "ensemble" if len(model_specs) > 1 or AI_EXTRACTION_RUNS_PER_MODEL > 1 else "single_model"
+        self._log_pipeline_event(
+            "medical_document_process_started",
+            "medical_document_processor",
+            ai_call_context=ai_call_context,
+            image_count=len(images),
+            producer_count=len(model_specs),
+            runs_per_model=AI_EXTRACTION_RUNS_PER_MODEL,
+            execution_mode=execution_mode,
+        )
+        total_run_count = len(model_specs) * AI_EXTRACTION_RUNS_PER_MODEL
 
-        traces = await asyncio.gather(
-            *[
-                self._run_single_inference_trace(
+        async def report_progress(event: str, **payload: Any) -> None:
+            if progress_callback is None:
+                return
+            callback_result = progress_callback({"event": event, **payload})
+            if asyncio.iscoroutine(callback_result):
+                await callback_result
+
+        async def run_indexed_trace(
+            trace_index: int,
+            *,
+            model_spec: AIModelSpec,
+            producer_rank: int,
+            run_index: int,
+        ) -> tuple[int, ProducerInferenceTrace]:
+            return (
+                trace_index,
+                await self._run_single_inference_trace(
                     model_spec=replace(model_spec, temperature=AI_EXTRACTION_TEMPERATURE),
                     producer_rank=producer_rank,
                     run_index=run_index,
@@ -600,59 +781,152 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                     validation_hints=validation_hints or {},
                     prompt_bundle=prompt_bundle,
                     ai_call_context=ai_call_context,
+                ),
+            )
+
+        try:
+            await report_progress(
+                "extraction_started",
+                total_runs=total_run_count,
+                completed_runs=0,
+                successful_runs=0,
+            )
+
+            scheduled_tasks = [
+                asyncio.create_task(
+                    run_indexed_trace(
+                        trace_index,
+                        model_spec=model_spec,
+                        producer_rank=producer_rank,
+                        run_index=run_index,
+                    )
                 )
-                for producer_rank, model_spec in enumerate(model_specs)
-                for run_index in range(AI_EXTRACTION_RUNS_PER_MODEL)
+                for trace_index, (producer_rank, model_spec, run_index) in enumerate(
+                    (
+                        (producer_rank, model_spec, run_index)
+                        for producer_rank, model_spec in enumerate(model_specs)
+                        for run_index in range(AI_EXTRACTION_RUNS_PER_MODEL)
+                    )
+                )
             ]
-        )
-
-        successful_traces = [
-            to_successful_trace(trace)
-            for trace in traces
-            if trace.success and trace.payload is not None
-        ]
-        if len(successful_traces) < AI_EXTRACTION_MIN_SUCCESSFUL_RUNS:
-            error = HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="AI ensemble failed to produce enough valid outputs.",
-            )
-            setattr(error, "ai_execution_mode", execution_mode)
-            setattr(error, "ai_runs", list(traces))
-            setattr(error, "primary_model_provider", model_specs[0].provider if model_specs else None)
-            setattr(error, "primary_model_name", model_specs[0].model if model_specs else None)
-            setattr(
-                error,
-                "extraction_meta_payload",
-                {
-                    "fusion_version": FUSION_VERSION,
-                    "calibration_version": CALIBRATION_VERSION,
-                    "review_required": True,
-                    "review_reasons": ["AI ensemble did not produce enough successful runs."],
-                },
-            )
-            raise error
-
-        async def judge_field(field_path: str, judge_images: list[Any], candidates: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-            try:
-                return await self._judge_field_conflict(
-                    field_path,
-                    judge_images,
-                    candidates,
-                    ai_call_context=ai_call_context,
+            ordered_traces: list[ProducerInferenceTrace | None] = [None] * len(scheduled_tasks)
+            completed_run_count = 0
+            successful_run_count = 0
+            for completed_task in asyncio.as_completed(scheduled_tasks):
+                trace_index, trace = await completed_task
+                ordered_traces[trace_index] = trace
+                completed_run_count += 1
+                if trace.success and trace.payload is not None:
+                    successful_run_count += 1
+                await report_progress(
+                    "extraction_run_completed",
+                    total_runs=total_run_count,
+                    completed_runs=completed_run_count,
+                    successful_runs=successful_run_count,
                 )
-            except TypeError:
-                return await self._judge_field_conflict(field_path, judge_images, candidates)
 
-        fusion_engine = MedicalExtractionFusionEngine(judge_field=judge_field)
-        return await fusion_engine.fuse(
-            successful_traces=successful_traces,
-            all_traces=list(traces),
-            images=images,
-            validation_hints=validation_hints or {},
-            execution_mode=execution_mode,
-            primary_model_provider=model_specs[0].provider if model_specs else None,
-            primary_model_name=model_specs[0].model if model_specs else None,
-        )
+            traces = [cast(ProducerInferenceTrace, trace) for trace in ordered_traces]
+
+            successful_traces = [
+                to_successful_trace(trace)
+                for trace in traces
+                if trace.success and trace.payload is not None
+            ]
+            self._log_pipeline_event(
+                "medical_document_inference_runs_completed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                total_run_count=len(traces),
+                successful_run_count=len(successful_traces),
+                execution_mode=execution_mode,
+            )
+            if len(successful_traces) < AI_EXTRACTION_MIN_SUCCESSFUL_RUNS:
+                self._log_pipeline_event(
+                    "medical_document_process_failed",
+                    "medical_document_processor",
+                    ai_call_context=ai_call_context,
+                    successful_run_count=len(successful_traces),
+                    required_successful_run_count=AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
+                    success=False,
+                )
+                error = HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="AI ensemble failed to produce enough valid outputs.",
+                )
+                setattr(error, "ai_execution_mode", execution_mode)
+                setattr(error, "ai_runs", list(traces))
+                setattr(error, "primary_model_provider", model_specs[0].provider if model_specs else None)
+                setattr(error, "primary_model_name", model_specs[0].model if model_specs else None)
+                setattr(
+                    error,
+                    "extraction_meta_payload",
+                    {
+                        "fusion_version": FUSION_VERSION,
+                        "calibration_version": CALIBRATION_VERSION,
+                        "review_required": True,
+                        "review_reasons": ["AI ensemble did not produce enough successful runs."],
+                    },
+                )
+                raise error
+
+            async def judge_field(field_path: str, judge_images: list[Any], candidates: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+                try:
+                    return await self._judge_field_conflict(
+                        field_path,
+                        judge_images,
+                        candidates,
+                        ai_call_context=ai_call_context,
+                    )
+                except TypeError:
+                    return await self._judge_field_conflict(field_path, judge_images, candidates)
+
+            await report_progress(
+                "fusion_started",
+                total_runs=total_run_count,
+                completed_runs=len(traces),
+                successful_runs=len(successful_traces),
+            )
+            fusion_engine = MedicalExtractionFusionEngine(judge_field=judge_field)
+            outcome = await fusion_engine.fuse(
+                successful_traces=successful_traces,
+                all_traces=list(traces),
+                images=images,
+                validation_hints=validation_hints or {},
+                execution_mode=execution_mode,
+                primary_model_provider=model_specs[0].provider if model_specs else None,
+                primary_model_name=model_specs[0].model if model_specs else None,
+                ai_call_context=ai_call_context,
+            )
+            await report_progress(
+                "fusion_completed",
+                total_runs=total_run_count,
+                completed_runs=len(traces),
+                successful_runs=len(successful_traces),
+                review_required=outcome.review_required,
+                overall_confidence=outcome.overall_confidence,
+            )
+            self._log_pipeline_event(
+                "medical_document_process_completed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                successful_run_count=len(successful_traces),
+                total_run_count=len(traces),
+                review_required=outcome.review_required,
+                overall_confidence=outcome.overall_confidence,
+                success=True,
+            )
+            return outcome
+        except Exception as exc:
+            if isinstance(exc, HTTPException) and isinstance(exc.detail, str) and exc.detail == "AI ensemble failed to produce enough valid outputs.":
+                raise
+            self._log_pipeline_event(
+                "medical_document_process_failed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
+            raise
 
     async def _run_single_inference_trace(
         self,
@@ -667,6 +941,18 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         ai_call_context: dict[str, Any] | None,
     ) -> ProducerInferenceTrace:
         producer_id = f"{model_spec.provider}:{model_spec.model}"
+        self._log_pipeline_event(
+            "extraction_inference_started",
+            "medical_document_processor",
+            ai_call_context=ai_call_context,
+            provider=model_spec.provider,
+            model=model_spec.model,
+            producer_id=producer_id,
+            producer_rank=producer_rank,
+            run_index=run_index,
+            call_kind="scan_extraction",
+            image_count=len(images),
+        )
         try:
             payload, tracking_payload = await self._run_model_inference(
                 model_spec=model_spec,
@@ -687,6 +973,22 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                     },
                 },
             )
+            self._log_pipeline_event(
+                "extraction_inference_completed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                producer_id=producer_id,
+                producer_rank=producer_rank,
+                run_index=run_index,
+                call_kind="scan_extraction",
+                latency_ms=tracking_payload.get("latency_ms"),
+                prompt_tokens=tracking_payload.get("prompt_tokens"),
+                completion_tokens=tracking_payload.get("completion_tokens"),
+                total_tokens=tracking_payload.get("total_tokens"),
+                success=True,
+            )
             return ProducerInferenceTrace(
                 producer_id=producer_id,
                 provider=model_spec.provider,
@@ -704,6 +1006,19 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 payload=payload,
             )
         except Exception as exc:  # noqa: BLE001
+            self._log_pipeline_event(
+                "extraction_inference_failed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                producer_id=producer_id,
+                producer_rank=producer_rank,
+                run_index=run_index,
+                call_kind="scan_extraction",
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
             return ProducerInferenceTrace(
                 producer_id=producer_id,
                 provider=model_spec.provider,
@@ -748,7 +1063,16 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         try:
             return AIMedicalScanResponse.model_validate(payload), tracking_payload
         except ValidationError as exc:
-            print(f"AI response validation error: {exc}")
+            self._log_pipeline_event(
+                "extraction_response_validation_failed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                call_kind="scan_extraction",
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="AI model returned invalid response shape.",
@@ -789,52 +1113,121 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
     ) -> tuple[str | None, str | None]:
         judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
         prompt_bundle = self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
-        template_input = {
-            "field_path": field_path,
-            "candidates_json": json.dumps(
-                [
-                    {
-                        "index": index,
-                        "value": candidate["raw_value"],
-                        "support_count": candidate["run_count"],
-                        "producer_count": len(candidate["producers"]),
-                    }
-                    for index, candidate in enumerate(candidates)
-                ],
-                ensure_ascii=False,
-                indent=2,
-            ),
-            "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
-        }
-        system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
-        user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
-        model = self._create_chat_model(judge_model_spec)
-        response, _tracking_payload = await self._ainvoke_with_tracking(
-            model,
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=self._build_image_messages(user_prompt, cast(list[DocumentImageInput], images))),
-            ],
+        self._log_pipeline_event(
+            "field_judge_started",
+            "medical_document_processor",
+            ai_call_context=ai_call_context,
             provider=judge_model_spec.provider,
-            model_name=judge_model_spec.model,
+            model=judge_model_spec.model,
             call_kind="field_judge",
-            success_context={
-                **(ai_call_context or {}),
-                "temperature": judge_model_spec.temperature,
-                "request_context_payload": {
-                    "field_path": field_path,
-                    "candidate_count": len(candidates),
-                    "image_count": len(images),
-                },
-            },
+            field_path=field_path,
+            candidate_count=len(candidates),
+            image_count=len(images),
         )
-        payload = self._parse_ai_response_to_json(response.content)
-        selected_index = payload.get("selected_candidate_index")
-        if selected_index is None or not isinstance(selected_index, int):
-            return None, cast(str | None, payload.get("reason"))
-        if selected_index < 0 or selected_index >= len(candidates):
-            return None, cast(str | None, payload.get("reason"))
-        return cast(str, candidates[selected_index]["normalized_key"]), cast(str | None, payload.get("reason"))
+        try:
+            template_input = {
+                "field_path": field_path,
+                "candidates_json": json.dumps(
+                    [
+                        {
+                            "index": index,
+                            "value": candidate["raw_value"],
+                            "support_count": candidate["run_count"],
+                            "producer_count": len(candidate["producers"]),
+                        }
+                        for index, candidate in enumerate(candidates)
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+            }
+            system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
+            user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
+            model = self._create_chat_model(judge_model_spec)
+            response, _tracking_payload = await self._ainvoke_with_tracking(
+                model,
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=self._build_image_messages(user_prompt, cast(list[DocumentImageInput], images))),
+                ],
+                provider=judge_model_spec.provider,
+                model_name=judge_model_spec.model,
+                call_kind="field_judge",
+                success_context={
+                    **(ai_call_context or {}),
+                    "temperature": judge_model_spec.temperature,
+                    "request_context_payload": {
+                        "field_path": field_path,
+                        "candidate_count": len(candidates),
+                        "image_count": len(images),
+                    },
+                },
+            )
+            payload = self._parse_ai_response_to_json(response.content)
+            selected_index = payload.get("selected_candidate_index")
+            judge_reason = cast(str | None, payload.get("reason"))
+            if selected_index is None or not isinstance(selected_index, int):
+                self._log_pipeline_event(
+                    "field_judge_completed",
+                    "medical_document_processor",
+                    ai_call_context=ai_call_context,
+                    provider=judge_model_spec.provider,
+                    model=judge_model_spec.model,
+                    call_kind="field_judge",
+                    field_path=field_path,
+                    candidate_count=len(candidates),
+                    image_count=len(images),
+                    success=True,
+                    selected_candidate_index=None,
+                )
+                return None, judge_reason
+            if selected_index < 0 or selected_index >= len(candidates):
+                self._log_pipeline_event(
+                    "field_judge_completed",
+                    "medical_document_processor",
+                    ai_call_context=ai_call_context,
+                    provider=judge_model_spec.provider,
+                    model=judge_model_spec.model,
+                    call_kind="field_judge",
+                    field_path=field_path,
+                    candidate_count=len(candidates),
+                    image_count=len(images),
+                    success=True,
+                    selected_candidate_index=selected_index,
+                    selected_candidate_valid=False,
+                )
+                return None, judge_reason
+            self._log_pipeline_event(
+                "field_judge_completed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=judge_model_spec.provider,
+                model=judge_model_spec.model,
+                call_kind="field_judge",
+                field_path=field_path,
+                candidate_count=len(candidates),
+                image_count=len(images),
+                success=True,
+                selected_candidate_index=selected_index,
+                selected_candidate_valid=True,
+            )
+            return cast(str, candidates[selected_index]["normalized_key"]), judge_reason
+        except Exception as exc:
+            self._log_pipeline_event(
+                "field_judge_failed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=judge_model_spec.provider,
+                model=judge_model_spec.model,
+                call_kind="field_judge",
+                field_path=field_path,
+                candidate_count=len(candidates),
+                image_count=len(images),
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
+            raise
 
     def _describe_exception(self, exc: Exception) -> str:
         if isinstance(exc, HTTPException):
@@ -867,35 +1260,65 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
 
         prompt_bundle = self._load_prompt_bundle()
         model_specs = self._get_enabled_model_specs()
-
-        inference_results: list[DocumentValidationResponse] = []
-        for model_spec in model_specs[:1]:
-            inference_results.append(
-                await self._run_model_inference(
-                    model_spec=model_spec,
-                    images=images,
-                    prompt_bundle=prompt_bundle,
-                    patient_name_candidates=patient_name_candidates or [],
-                    expected_patient_name=expected_patient_name,
-                    ai_call_context={
-                        **(ai_call_context or {}),
-                        "temperature": model_spec.temperature,
-                        "request_context_payload": {
-                            "image_count": len(images),
-                            "patient_name_candidate_count": len(patient_name_candidates or []),
-                            "has_expected_patient_name": expected_patient_name is not None,
-                        },
-                    },
-                )
-            )
-
-        validation_result = self.combine_inference_results(inference_results)
-        self._enforce_validation_rules(
-            validation_result,
-            patient_name_candidates=patient_name_candidates or [],
-            expected_patient_name=expected_patient_name,
+        self._log_pipeline_event(
+            "document_validation_started",
+            "document_validation_processor",
+            ai_call_context=ai_call_context,
+            image_count=len(images),
+            model_count=min(len(model_specs), 1),
+            has_expected_patient_name=expected_patient_name is not None,
+            patient_name_candidate_count=len(patient_name_candidates or []),
         )
-        return validation_result
+
+        try:
+            inference_results: list[DocumentValidationResponse] = []
+            for model_spec in model_specs[:1]:
+                inference_results.append(
+                    await self._run_model_inference(
+                        model_spec=model_spec,
+                        images=images,
+                        prompt_bundle=prompt_bundle,
+                        patient_name_candidates=patient_name_candidates or [],
+                        expected_patient_name=expected_patient_name,
+                        ai_call_context={
+                            **(ai_call_context or {}),
+                            "temperature": model_spec.temperature,
+                            "request_context_payload": {
+                                "image_count": len(images),
+                                "patient_name_candidate_count": len(patient_name_candidates or []),
+                                "has_expected_patient_name": expected_patient_name is not None,
+                            },
+                        },
+                    )
+                )
+
+            validation_result = self.combine_inference_results(inference_results)
+            self._enforce_validation_rules(
+                validation_result,
+                patient_name_candidates=patient_name_candidates or [],
+                expected_patient_name=expected_patient_name,
+            )
+            self._log_pipeline_event(
+                "document_validation_completed",
+                "document_validation_processor",
+                ai_call_context=ai_call_context,
+                image_count=len(images),
+                review_required=validation_result.review_required,
+                review_reason_count=len(validation_result.review_reasons),
+                patient_name_match_status=validation_result.patient_name_match_status,
+                success=True,
+            )
+            return validation_result
+        except Exception as exc:
+            self._log_pipeline_event(
+                "document_validation_failed",
+                "document_validation_processor",
+                ai_call_context=ai_call_context,
+                image_count=len(images),
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
+            raise
 
     def combine_inference_results(
         self,
@@ -917,26 +1340,58 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
         expected_patient_name: str | None,
         ai_call_context: dict[str, Any] | None = None,
     ) -> DocumentValidationResponse:
-        model = self._create_chat_model(model_spec)
-        messages = self._build_messages(
-            images=images,
-            prompt_bundle=prompt_bundle,
-            patient_name_candidates=patient_name_candidates,
-            expected_patient_name=expected_patient_name,
-        )
-        response, _tracking_payload = await self._ainvoke_with_tracking(
-            model,
-            messages,
+        self._log_pipeline_event(
+            "validation_inference_started",
+            "document_validation_processor",
+            ai_call_context=ai_call_context,
             provider=model_spec.provider,
-            model_name=model_spec.model,
+            model=model_spec.model,
             call_kind="scan_validation",
-            success_context=ai_call_context,
+            image_count=len(images),
         )
-        payload = self._parse_ai_response_to_json(response.content)
-
         try:
-            return DocumentValidationResponse.model_validate(payload)
-        except ValidationError as exc:
+            model = self._create_chat_model(model_spec)
+            messages = self._build_messages(
+                images=images,
+                prompt_bundle=prompt_bundle,
+                patient_name_candidates=patient_name_candidates,
+                expected_patient_name=expected_patient_name,
+            )
+            response, _tracking_payload = await self._ainvoke_with_tracking(
+                model,
+                messages,
+                provider=model_spec.provider,
+                model_name=model_spec.model,
+                call_kind="scan_validation",
+                success_context=ai_call_context,
+            )
+            payload = self._parse_ai_response_to_json(response.content)
+            result = DocumentValidationResponse.model_validate(payload)
+            self._log_pipeline_event(
+                "validation_inference_completed",
+                "document_validation_processor",
+                ai_call_context=ai_call_context,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                call_kind="scan_validation",
+                latency_ms=_tracking_payload.get("latency_ms"),
+                prompt_tokens=_tracking_payload.get("prompt_tokens"),
+                completion_tokens=_tracking_payload.get("completion_tokens"),
+                total_tokens=_tracking_payload.get("total_tokens"),
+                success=True,
+            )
+            return result
+        except Exception as exc:
+            self._log_pipeline_event(
+                "validation_inference_failed",
+                "document_validation_processor",
+                ai_call_context=ai_call_context,
+                provider=model_spec.provider,
+                model=model_spec.model,
+                call_kind="scan_validation",
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="AI model returned invalid validation response shape.",

@@ -2,7 +2,15 @@ from __future__ import annotations
 
 # Execution and metadata constants shared by orchestration and fusion.
 FUSION_VERSION = "ensemble-fusion-v3"
-CALIBRATION_VERSION = "heuristic-v1"
+CALIBRATION_VERSION = "self_consistency_logistic_v1"
+SELF_CONSISTENCY_CALIBRATION_FEATURES = (
+    "vote_share",
+    "margin",
+    "producer_share",
+    "judge_used",
+    "is_critical",
+    "is_semantic",
+)
 RECONCILIATION_VERSION = "financial-reconciliation-v2"
 AI_EXTRACTION_MAX_PRODUCERS = 3
 AI_EXTRACTION_RUNS_PER_MODEL = 2
@@ -108,23 +116,3 @@ SERVICE_KEYWORDS = (
 )
 
 OTHER_CHARGE_BUCKET_ORDER = ("consultation", "service", "other", "medicine")
-
-STRUCTURED_TERM_LEXICON = {
-    "diagnoses.description": (
-        "Pertusis",
-        "Influenza",
-        "Pharyngitis",
-        "Asthma",
-        "Asma",
-    ),
-    "medicines.name": (
-        "Mucopret",
-        "Microcet",
-        "Tritone",
-        "Equal",
-        "Lasal",
-        "Ibramax",
-        "Fibramax",
-        "Prover",
-    ),
-}

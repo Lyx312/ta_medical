@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   FlatList,
@@ -24,11 +24,18 @@ import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
 import { Colors, Opacity, Radii, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/contexts/auth-context';
+import { ClaimScanProgressCard } from '@/features/claims/components/claim-scan-progress-card';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { scanDocuments } from '@/services/api/ai';
-import { createClaim } from '@/services/api/claims';
+import { getScanDocumentsJob, startScanDocumentsJob, cancelScanDocumentsJob } from '@/services/api/ai';
+import { createClaimWithProgress } from '@/services/api/claims';
 import { getFamilyMembers } from '@/services/api/family-members';
-import type { AIMedicalScanResult, ApiError, ClaimMedicineInput, FamilyMember } from '@/services/api/types';
+import type {
+  AIMedicalScanResult,
+  ApiError,
+  ClaimMedicineInput,
+  FamilyMember,
+  ScanProgressPayload,
+} from '@/services/api/types';
 
 const BENEFIT_TYPES = [
   { value: 'rawat_jalan', label: 'Rawat Jalan' },
@@ -48,6 +55,8 @@ type ClaimMedicineDraft = {
   name: string;
   source: ClaimMedicineInput['source'];
 };
+
+type ScanUiState = 'idle' | 'uploading' | 'processing' | 'succeeded' | 'failed';
 
 function normalizePatientName(name: string) {
   return name.trim().toLocaleLowerCase();
@@ -123,36 +132,69 @@ export function NewClaimScreen() {
   const [medicines, setMedicines] = useState<ClaimMedicineDraft[]>([]);
   const [chronology, setChronology] = useState('');
   const [sourceScanLogId, setSourceScanLogId] = useState<number | undefined>(undefined);
-  const [isScanning, setIsScanning] = useState(false);
+  const [scanState, setScanState] = useState<ScanUiState>('idle');
+  const [scanProgress, setScanProgress] = useState<ScanProgressPayload | null>(null);
+  const [scanErrorMessage, setScanErrorMessage] = useState('');
+  const [currentScanLogId, setCurrentScanLogId] = useState<number | undefined>(undefined);
+  const [isCancellingScan, setIsCancellingScan] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitStatusText, setSubmitStatusText] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const scanPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const patientOptions: PatientOption[] = [];
-  if (user?.full_name) {
-    patientOptions.push({
-      key: `self:${user.id}`,
-      name: user.full_name,
-      relation: 'Saya',
-    });
-  }
-  for (const familyMember of familyMembers) {
-    patientOptions.push({
-      key: `family:${familyMember.id}`,
-      name: familyMember.name,
-      relation: familyMember.relation,
-    });
-  }
+  const clearScanPoll = useCallback(() => {
+    if (scanPollTimeoutRef.current) {
+      clearTimeout(scanPollTimeoutRef.current);
+      scanPollTimeoutRef.current = null;
+    }
+  }, []);
+
+  const resetScanFeedback = useCallback(() => {
+    clearScanPoll();
+    setScanState('idle');
+    setScanProgress(null);
+    setScanErrorMessage('');
+    setCurrentScanLogId(undefined);
+    setIsCancellingScan(false);
+  }, [clearScanPoll]);
+
+  useEffect(() => () => clearScanPoll(), [clearScanPoll]);
+
+  const patientOptions: PatientOption[] = useMemo(() => {
+    const options: PatientOption[] = [];
+
+    if (user?.full_name) {
+      options.push({
+        key: `self:${user.id}`,
+        name: user.full_name,
+        relation: 'Saya',
+      });
+    }
+
+    for (const familyMember of familyMembers) {
+      options.push({
+        key: `family:${familyMember.id}`,
+        name: familyMember.name,
+        relation: familyMember.relation,
+      });
+    }
+
+    return options;
+  }, [familyMembers, user?.full_name, user?.id]);
 
   const getSelectedPatientOption = () => patientOptions.find((option) => option.key === selectedPatientKey);
 
-  const findMatchingPatientOption = (name: string) => {
-    const normalizedName = normalizePatientName(name);
-    if (!normalizedName) {
-      return undefined;
-    }
+  const findMatchingPatientOption = useCallback(
+    (name: string) => {
+      const normalizedName = normalizePatientName(name);
+      if (!normalizedName) {
+        return undefined;
+      }
 
-    return patientOptions.find((option) => normalizePatientName(option.name) === normalizedName);
-  };
+      return patientOptions.find((option) => normalizePatientName(option.name) === normalizedName);
+    },
+    [patientOptions],
+  );
 
   const loadFamilyMembers = useCallback(async () => {
     setIsLoadingFamilyMembers(true);
@@ -185,6 +227,7 @@ export function NewClaimScreen() {
       const newUris = result.assets.map((asset) => asset.uri);
       setImageUris((prev) => [...prev, ...newUris]);
       setSourceScanLogId(undefined);
+      resetScanFeedback();
       setErrors((prev) => ({ ...prev, images: '' }));
     }
   };
@@ -205,12 +248,14 @@ export function NewClaimScreen() {
       const newUris = result.assets.map((asset) => asset.uri);
       setImageUris((prev) => [...prev, ...newUris]);
       setSourceScanLogId(undefined);
+      resetScanFeedback();
       setErrors((prev) => ({ ...prev, images: '' }));
     }
   };
 
   const removeImage = (index: number) => {
     setSourceScanLogId(undefined);
+    resetScanFeedback();
     setImageUris((prev) => prev.filter((_, currentIndex) => currentIndex !== index));
   };
 
@@ -258,8 +303,22 @@ export function NewClaimScreen() {
   };
 
   const displayedClaimAmount = formatClaimAmountForDisplay(claimAmount);
+  const scanBusy = scanState === 'uploading' || scanState === 'processing';
 
-  const applyAIScanData = (data: AIMedicalScanResult) => {
+  const buildUploadProgressPayload = (uploadPercent: number): ScanProgressPayload => ({
+    stage: 'queued',
+    title: 'Uploading files',
+    detail: 'Sending document images to server.',
+    percent: Math.max(0, Math.min(15, Math.round(uploadPercent * 0.15))),
+    status: 'pending',
+    image_count: imageUris.length,
+    total_runs: null,
+    completed_runs: null,
+    successful_runs: null,
+    medicine_count: null,
+  });
+
+  const applyAIScanData = useCallback((data: AIMedicalScanResult) => {
     if (data.patient_info.name) {
       const matchedPatientOption = findMatchingPatientOption(data.patient_info.name);
       if (matchedPatientOption) {
@@ -297,7 +356,7 @@ export function NewClaimScreen() {
     }
 
     setMedicines(mapAIMedicinesToDrafts(data.medicines));
-  };
+  }, [findMatchingPatientOption]);
 
   const updateMedicineDraft = (
     localId: string,
@@ -324,26 +383,88 @@ export function NewClaimScreen() {
     setMedicines((prev) => prev.filter((medicine) => medicine.localId !== localId));
   };
 
+  const pollScanJob = useCallback(
+    (scanLogId: number, retryCount: number = 0) => {
+      clearScanPoll();
+      scanPollTimeoutRef.current = setTimeout(async () => {
+        try {
+          const status = await getScanDocumentsJob(scanLogId);
+          setScanProgress(status.progress);
+          if (status.result) {
+            applyAIScanData(status.result);
+            setSourceScanLogId(status.scan_log_id);
+            setScanErrorMessage('');
+            setScanState('succeeded');
+            clearScanPoll();
+            return;
+          }
+          if (status.progress.status === 'failed') {
+            setScanErrorMessage(status.error_message ?? 'Unable to scan documents.');
+            setScanState('failed');
+            clearScanPoll();
+            return;
+          }
+          setScanState('processing');
+          pollScanJob(scanLogId, 0);
+        } catch (err) {
+          if (retryCount < 3) {
+            pollScanJob(scanLogId, retryCount + 1);
+            return;
+          }
+          const apiError = err as ApiError;
+          setScanErrorMessage(apiError.message ?? 'Unable to refresh scan progress.');
+          setScanState('failed');
+          clearScanPoll();
+        }
+      }, 1000);
+    },
+      [clearScanPoll, applyAIScanData],
+  );
+
   const handleAIScan = async () => {
     if (imageUris.length === 0) {
       Alert.alert('No Images', 'Please upload or take photos of your medical documents first.');
       return;
     }
 
-    setIsScanning(true);
+    clearScanPoll();
+    setScanState('uploading');
+    setScanErrorMessage('');
+    setScanProgress(buildUploadProgressPayload(0));
     setSourceScanLogId(undefined);
     setErrors({});
 
     try {
-      const result = await scanDocuments(imageUris);
-      applyAIScanData(result);
-      setSourceScanLogId(result.scan_log_id);
-      Alert.alert('Success', 'Documents scanned and fields auto-filled. Please review the data.');
+      const job = await startScanDocumentsJob(imageUris, (uploadPercent) => {
+        setScanProgress(buildUploadProgressPayload(uploadPercent));
+      });
+      setCurrentScanLogId(job.scan_log_id);
+      setScanProgress(job.progress);
+      setScanState('processing');
+      pollScanJob(job.scan_log_id);
     } catch (err) {
       const apiError = err as ApiError;
-      Alert.alert('Scan Failed', apiError.message ?? 'Unable to scan documents.');
+      setScanErrorMessage(apiError.message ?? 'Unable to scan documents.');
+      setScanState('failed');
+    }
+  };
+
+  const handleCancelScan = async () => {
+    if (!currentScanLogId) return;
+    
+    setIsCancellingScan(true);
+    try {
+      const response = await cancelScanDocumentsJob(currentScanLogId);
+      setScanProgress(response.progress);
+      setScanState('failed');
+      setScanErrorMessage('Scan was cancelled by the user.');
+      clearScanPoll();
+    } catch (err) {
+      const apiError = err as ApiError;
+      setScanErrorMessage(apiError.message ?? 'Failed to cancel scan.');
     } finally {
-      setIsScanning(false);
+      setIsCancellingScan(false);
+      setCurrentScanLogId(undefined);
     }
   };
 
@@ -394,6 +515,8 @@ export function NewClaimScreen() {
     setMedicines([]);
     setChronology('');
     setSourceScanLogId(undefined);
+    resetScanFeedback();
+    setSubmitStatusText('');
     setErrors({});
   };
 
@@ -409,21 +532,31 @@ export function NewClaimScreen() {
 
     setIsSubmitting(true);
     setErrors({});
+    setSubmitStatusText('Uploading claim files');
 
     try {
       const medicinesInput = toClaimMedicineInputList(medicines);
-      await createClaim({
-        nama_pasien: selectedPatient.name,
-        tanggal_pelayanan: formatDateForSubmission(serviceDate),
-        fasilitas_kesehatan: healthFacility.trim(),
-        jenis_manfaat: benefitType,
-        nominal_klaim: parseFloat(claimAmount),
-        keterangan_penyakit: diseaseDescription.trim(),
-        kronologi: chronology.trim(),
-        medicines: medicinesInput,
-        fileUris: imageUris,
-        source_scan_log_id: sourceScanLogId,
-      });
+      await createClaimWithProgress(
+        {
+          nama_pasien: selectedPatient.name,
+          tanggal_pelayanan: formatDateForSubmission(serviceDate),
+          fasilitas_kesehatan: healthFacility.trim(),
+          jenis_manfaat: benefitType,
+          nominal_klaim: parseFloat(claimAmount),
+          keterangan_penyakit: diseaseDescription.trim(),
+          kronologi: chronology.trim(),
+          medicines: medicinesInput,
+          fileUris: imageUris,
+          source_scan_log_id: sourceScanLogId,
+        },
+        (progressPercent) => {
+          if (progressPercent >= 100) {
+            setSubmitStatusText('Saving claim');
+            return;
+          }
+          setSubmitStatusText(`Uploading claim files (${progressPercent}%)`);
+        },
+      );
 
       Alert.alert('Success', 'Claim submitted successfully.', [{ text: 'OK', onPress: resetForm }]);
     } catch (err) {
@@ -431,6 +564,7 @@ export function NewClaimScreen() {
       Alert.alert('Submission Failed', apiError.message ?? 'Unable to submit claim.');
     } finally {
       setIsSubmitting(false);
+      setSubmitStatusText('');
     }
   };
 
@@ -457,11 +591,17 @@ export function NewClaimScreen() {
                 </ThemedText>
 
                 <View style={viewStyles.imageActions}>
-                  <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={pickImages}>
+                  <Pressable
+                    style={[viewStyles.imageButton, { borderColor: colors.divider }, scanBusy && viewStyles.disabledBlock]}
+                    onPress={pickImages}
+                    disabled={scanBusy}>
                     <Ionicons name="image-outline" size={20} color={colors.primary} />
                     <ThemedText style={textStyles.imageButtonText}>Gallery</ThemedText>
                   </Pressable>
-                  <Pressable style={[viewStyles.imageButton, { borderColor: colors.divider }]} onPress={takePhoto}>
+                  <Pressable
+                    style={[viewStyles.imageButton, { borderColor: colors.divider }, scanBusy && viewStyles.disabledBlock]}
+                    onPress={takePhoto}
+                    disabled={scanBusy}>
                     <Ionicons name="camera-outline" size={20} color={colors.primary} />
                     <ThemedText style={textStyles.imageButtonText}>Camera</ThemedText>
                   </Pressable>
@@ -474,7 +614,7 @@ export function NewClaimScreen() {
                     {imageUris.map((uri, index) => (
                       <View key={`${uri}-${index}`} style={viewStyles.imageThumbContainer}>
                         <Image source={{ uri }} style={imageStyles.imageThumb} />
-                        <Pressable style={viewStyles.removeImageButton} onPress={() => removeImage(index)}>
+                        <Pressable style={viewStyles.removeImageButton} onPress={() => removeImage(index)} disabled={scanBusy}>
                           <Ionicons name="close-circle" size={22} color={colors.error} />
                         </Pressable>
                       </View>
@@ -482,11 +622,38 @@ export function NewClaimScreen() {
                   </View>
                 ) : null}
 
+                {scanProgress && scanBusy ? (
+                  <ClaimScanProgressCard 
+                    progress={scanProgress}
+                    onCancel={handleCancelScan}
+                    isCancelling={isCancellingScan}
+                  />
+                ) : null}
+
+                {scanState === 'succeeded' ? (
+                  <SurfaceCard style={[viewStyles.feedbackCard, { borderColor: colors.divider }]}>
+                    <ThemedText style={[textStyles.successTitle, { color: colors.cta }]}>AI review ready</ThemedText>
+                    <ThemedText style={textStyles.feedbackText}>
+                      AI review ready. Please check extracted fields before submitting claim.
+                    </ThemedText>
+                  </SurfaceCard>
+                ) : null}
+
+                {scanState === 'failed' ? (
+                  <SurfaceCard style={[viewStyles.feedbackCard, { borderColor: colors.error }]}>
+                    <ThemedText style={[textStyles.errorTitle, { color: colors.error }]}>Scan failed</ThemedText>
+                    <ThemedText style={textStyles.feedbackText}>
+                      {scanErrorMessage || 'Unable to scan documents.'}
+                    </ThemedText>
+                    <AppButton label="Try scan again" tone="error" variant="outline" onPress={handleAIScan} />
+                  </SurfaceCard>
+                ) : null}
+
                 {imageUris.length > 0 ? (
                   <AppButton
-                    label="Scan with AI"
+                    label={scanBusy ? 'Scanning in progress' : 'Scan with AI'}
                     tone="secondary"
-                    loading={isScanning}
+                    disabled={scanBusy}
                     leftIcon={<Ionicons name="scan-outline" size={20} color={colors.cardBackground} />}
                     onPress={handleAIScan}
                   />
@@ -644,8 +811,12 @@ export function NewClaimScreen() {
                   label="Submit Claim"
                   tone="cta"
                   loading={isSubmitting}
+                  disabled={scanBusy}
                   onPress={handleSubmit}
                 />
+                {isSubmitting && submitStatusText ? (
+                  <ThemedText style={textStyles.submitStatusText}>{submitStatusText}</ThemedText>
+                ) : null}
               </SurfaceCard>
             </View>
           </ScrollView>
@@ -768,8 +939,15 @@ const viewStyles = StyleSheet.create({
     padding: Spacing.xl,
     paddingBottom: 120,
   },
+  disabledBlock: {
+    opacity: 0.5,
+  },
   fieldGroup: {
     gap: 6,
+  },
+  feedbackCard: {
+    borderWidth: 1,
+    gap: Spacing.sm,
   },
   imageActions: {
     flexDirection: 'row',
@@ -850,6 +1028,12 @@ const textStyles = StyleSheet.create({
   benefitOptionText: {
     fontSize: 16,
   },
+  errorTitle: {
+    ...Typography.sectionTitle,
+  },
+  feedbackText: {
+    ...Typography.helper,
+  },
   imageButtonText: {
     fontSize: 14,
     fontWeight: '600',
@@ -875,6 +1059,13 @@ const textStyles = StyleSheet.create({
     opacity: Opacity.muted,
   },
   sectionTitle: {
+    ...Typography.sectionTitle,
+  },
+  submitStatusText: {
+    ...Typography.helper,
+    textAlign: 'center',
+  },
+  successTitle: {
     ...Typography.sectionTitle,
   },
   uploadHint: {

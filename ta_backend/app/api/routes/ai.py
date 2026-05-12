@@ -4,16 +4,26 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user_dependency
+from app.core.ai_pipeline_logging import ai_pipeline_exception_fields, ai_pipeline_log
 from app.core.config import get_settings
-from app.db.session import get_db_session
+from app.db.session import get_db_session, get_session_factory
+from app.models.scan_log import ScanLog
 from app.repositories.family_member_repository import FamilyMemberRepository
 from app.repositories.scan_log_repository import ScanLogAIRunCreate, ScanLogFileCreate, ScanLogRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.ai import AIMedicalScanResponse, AIScanDocumentsResponse
+from app.schemas.ai import (
+    AIMedicalScanResponse,
+    AIScanDocumentsResponse,
+    AIScanJobStartResponse,
+    AIScanJobStatusResponse,
+    ScanJobStage,
+    ScanJobStatus,
+    ScanProgressPayload,
+)
 from app.schemas.auth import TokenData
 from app.services.ai_ensemble import MedicalExtractionOutcome, ProducerInferenceTrace
 from app.services.ai_service import (
@@ -26,6 +36,7 @@ from app.services.ai_service import (
 )
 from app.services.scan_medicine_prioritization import prioritize_scan_medicines
 from app.services.image_preprocessing import preprocess_document_image
+from app.services.scan_progress import ScanProgressReporter, ScanStageProgress
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 processor = MedicalDocumentProcessor(settings=get_settings())
@@ -204,11 +215,104 @@ async def read_uploaded_files(files: list[UploadFile]) -> list[BufferedUpload]:
         )
     return buffered_uploads
 
-@router.post("/scan-documents", response_model=AIScanDocumentsResponse)
-async def scan_documents(
-    token_data: TokenData = Depends(get_current_user_dependency),
-    db: Session = Depends(get_db_session),
-    files: list[UploadFile] = File(...),
+
+def build_scan_progress(
+    *,
+    stage: ScanJobStage,
+    title: str,
+    percent: int,
+    status_value: ScanJobStatus,
+    detail: str | None = None,
+    image_count: int | None = None,
+    total_runs: int | None = None,
+    completed_runs: int | None = None,
+    successful_runs: int | None = None,
+    medicine_count: int | None = None,
+) -> dict[str, Any]:
+    return ScanProgressPayload(
+        stage=stage,
+        title=title,
+        detail=detail,
+        percent=percent,
+        status=status_value,
+        image_count=image_count,
+        total_runs=total_runs,
+        completed_runs=completed_runs,
+        successful_runs=successful_runs,
+        medicine_count=medicine_count,
+    ).model_dump()
+
+
+def build_default_progress_for_scan_log(scan_log: ScanLog) -> dict[str, Any]:
+    if isinstance(scan_log.progress_payload, dict):
+        return scan_log.progress_payload
+    if scan_log.status == "succeeded":
+        return build_scan_progress(
+            stage="completed",
+            title="Ready to review",
+            detail="Scan finished successfully.",
+            percent=100,
+            status_value="succeeded",
+        )
+    if scan_log.status != "pending":
+        return build_scan_progress(
+            stage="failed",
+            title="Scan failed",
+            detail=extract_error_message_from_scan_log(scan_log),
+            percent=97,
+            status_value="failed",
+        )
+    return build_scan_progress(
+        stage="queued",
+        title="Preparing scan",
+        detail="Waiting for scan job to start.",
+        percent=0,
+        status_value="pending",
+    )
+
+
+def extract_error_message_from_scan_log(scan_log: ScanLog) -> str:
+    payload = scan_log.error_payload
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, dict):
+            errors = detail.get("errors")
+            if isinstance(errors, list):
+                for error in errors:
+                    if isinstance(error, dict):
+                        message = str(error.get("message", "")).strip()
+                        if message:
+                            return message
+            message = str(detail.get("message", "")).strip()
+            if message:
+                return message
+    return "Scan did not complete."
+
+
+def build_user_scan_documents_response(scan_log: ScanLog) -> AIScanDocumentsResponse | None:
+    if not isinstance(scan_log.extraction_payload, dict):
+        return None
+    payload = AIMedicalScanResponse.model_validate(scan_log.extraction_payload)
+    return AIScanDocumentsResponse(scan_log_id=scan_log.id, **payload.model_dump())
+
+
+def build_scan_job_status_response(scan_log: ScanLog) -> AIScanJobStatusResponse:
+    progress = ScanProgressPayload.model_validate(build_default_progress_for_scan_log(scan_log))
+    return AIScanJobStatusResponse(
+        scan_log_id=scan_log.id,
+        progress=progress,
+        result=build_user_scan_documents_response(scan_log) if scan_log.status == "succeeded" else None,
+        error_message=extract_error_message_from_scan_log(scan_log) if progress.status == "failed" else None,
+    )
+
+
+async def execute_scan_documents_pipeline(
+    *,
+    db: Session,
+    token_data: TokenData,
+    buffered_uploads: list[BufferedUpload],
+    scan_log: ScanLog,
+    progress_reporter: ScanProgressReporter | None = None,
 ) -> AIScanDocumentsResponse:
     user_repository = UserRepository(db)
     family_member_repository = FamilyMemberRepository(db)
@@ -221,21 +325,6 @@ async def scan_documents(
         )
 
     family_members = family_member_repository.get_by_user_id(token_data.user_id)
-    buffered_uploads = await read_uploaded_files(files)
-    scan_log = scan_log_repository.create_pending(
-        user_id=token_data.user_id,
-        file_records=[
-            ScanLogFileCreate(
-                original_filename=upload.filename,
-                original_mime_type=upload.mime_type,
-                original_byte_size=upload.byte_size,
-                original_sha256_hash=upload.sha256_hash,
-                original_content=upload.content,
-            )
-            for upload in buffered_uploads
-        ],
-    )
-
     validation_payload: dict[str, Any] | None = None
     extraction_payload: dict[str, Any] | None = None
     extraction_meta_payload: dict[str, Any] | None = None
@@ -244,7 +333,104 @@ async def scan_documents(
     primary_model_name: str | None = None
     ai_execution_mode: str | None = None
 
+    def set_progress(
+        *,
+        stage: ScanJobStage,
+        title: str,
+        percent: int,
+        detail: str | None = None,
+        status_value: ScanJobStatus = "running",
+        image_count: int | None = None,
+        total_runs: int | None = None,
+        completed_runs: int | None = None,
+        successful_runs: int | None = None,
+        medicine_count: int | None = None,
+    ) -> None:
+        if progress_reporter is None:
+            return
+        progress_reporter.set(
+            ScanStageProgress(
+                stage=stage,
+                title=title,
+                detail=detail,
+                percent=percent,
+                status=status_value,
+                image_count=image_count,
+                total_runs=total_runs,
+                completed_runs=completed_runs,
+                successful_runs=successful_runs,
+                medicine_count=medicine_count,
+            )
+        )
+
+    async def handle_processor_progress(payload: dict[str, Any]) -> None:
+        event = str(payload.get("event", "")).strip()
+        total_runs = cast(int | None, payload.get("total_runs"))
+        completed_runs = cast(int | None, payload.get("completed_runs"))
+        successful_runs = cast(int | None, payload.get("successful_runs"))
+        if event == "extraction_started":
+            set_progress(
+                stage="extracting",
+                title="Extracting medical data",
+                detail=f"0 of {total_runs or 0} AI passes completed.",
+                percent=40,
+                total_runs=total_runs,
+                completed_runs=0,
+                successful_runs=0,
+            )
+            return
+        if event == "extraction_run_completed":
+            completed = completed_runs or 0
+            total = max(total_runs or 1, 1)
+            percent = 40 + int(round((completed / total) * 40))
+            set_progress(
+                stage="extracting",
+                title="Extracting medical data",
+                detail=f"{completed} of {total} AI passes completed.",
+                percent=min(percent, 80),
+                total_runs=total_runs,
+                completed_runs=completed_runs,
+                successful_runs=successful_runs,
+            )
+            return
+        if event == "fusion_started":
+            set_progress(
+                stage="fusing",
+                title="Combining AI results",
+                detail="Selecting most consistent fields.",
+                percent=80,
+                total_runs=total_runs,
+                completed_runs=completed_runs,
+                successful_runs=successful_runs,
+            )
+            return
+        if event == "fusion_completed":
+            set_progress(
+                stage="fusing",
+                title="Combining AI results",
+                detail="Fusion complete. Preparing medicines review.",
+                percent=90,
+                total_runs=total_runs,
+                completed_runs=completed_runs,
+                successful_runs=successful_runs,
+            )
+
     try:
+        ai_pipeline_log(
+            event="scan_request_started",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            upload_count=len(buffered_uploads),
+        )
+        set_progress(
+            stage="preprocessing",
+            title="Checking documents",
+            detail="Normalizing uploaded images.",
+            percent=15,
+            status_value="running",
+            image_count=len(buffered_uploads),
+        )
         images: list[DocumentImageInput] = []
         for upload, scan_log_file in zip(buffered_uploads, scan_log.files):
             processed_image = preprocess_document_image(
@@ -266,10 +452,33 @@ async def scan_documents(
                     base64_data=base64.b64encode(processed_image.content).decode("utf-8"),
                 )
             )
+        ai_pipeline_log(
+            event="image_preprocessing_completed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            image_count=len(images),
+            success=True,
+        )
 
         patient_name_candidates = build_patient_name_candidates(
             user_full_name=user.full_name,
             family_member_names=[family_member.name for family_member in family_members],
+        )
+        set_progress(
+            stage="validating",
+            title="Checking documents",
+            detail="Validating document type and patient match.",
+            percent=25,
+            image_count=len(images),
+        )
+        ai_pipeline_log(
+            event="document_validation_started",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            image_count=len(images),
+            patient_name_candidate_count=len(patient_name_candidates),
         )
         try:
             validation_result = await validation_processor.process(
@@ -287,6 +496,23 @@ async def scan_documents(
             )
         validation_payload = validation_result.model_dump()
         validation_hints = build_validation_packet_hints(validation_result)
+        ai_pipeline_log(
+            event="document_validation_completed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            review_required=validation_result.review_required,
+            review_reason_count=len(validation_result.review_reasons),
+            patient_name_match_status=validation_result.patient_name_match_status,
+            success=True,
+        )
+        set_progress(
+            stage="validating",
+            title="Checking documents",
+            detail="Validation complete. Starting extraction.",
+            percent=40,
+            image_count=len(images),
+        )
         if validation_result.patient_name_match_status == "mismatched":
             patient_name_error = build_patient_name_verification_error(
                 "Extracted patient name does not match the user or any saved family member. Please review your family members or rescan the document."
@@ -303,11 +529,20 @@ async def scan_documents(
                 primary_model_provider=primary_model_provider,
                 primary_model_name=primary_model_name,
             )
+            if progress_reporter is not None:
+                progress_reporter.replace_scan_log(scan_log)
             raise patient_name_error
 
         fallback_model_spec = processor.get_primary_enabled_model_spec()
         primary_model_provider = fallback_model_spec.provider
         primary_model_name = fallback_model_spec.model
+        ai_pipeline_log(
+            event="text_extraction_started",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            image_count=len(images),
+        )
         try:
             raw_extraction_result = await processor.process(
                 images,
@@ -317,6 +552,7 @@ async def scan_documents(
                     "scan_log_id": scan_log.id,
                     "user_id": token_data.user_id,
                 },
+                progress_callback=handle_processor_progress,
             )
         except TypeError:
             raw_extraction_result = await processor.process(
@@ -328,6 +564,16 @@ async def scan_documents(
             raw_extraction_result,
             fallback_provider=primary_model_provider,
             fallback_model=primary_model_name,
+        )
+        ai_pipeline_log(
+            event="text_extraction_completed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            ai_execution_mode=extraction_result.ai_execution_mode,
+            ai_run_count=len(extraction_result.ai_runs),
+            review_required=extraction_result.review_required,
+            success=True,
         )
         merged_review_reasons = merge_review_reasons(
             validation_result.review_reasons,
@@ -348,6 +594,20 @@ async def scan_documents(
         extraction_payload = cast(dict[str, Any], sanitize_json_compatible(extraction_result.result.model_dump()))
         extraction_result_payload = AIMedicalScanResponse.model_validate(extraction_payload)
         extraction_meta_payload = extraction_result.extraction_meta_payload
+        set_progress(
+            stage="prioritizing_medicines",
+            title="Prioritizing medicines",
+            detail="Reviewing medicine ordering and ambiguity.",
+            percent=90,
+            medicine_count=len(extraction_result_payload.medicines),
+        )
+        ai_pipeline_log(
+            event="medicine_prioritization_started",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            medicine_count=len(extraction_result_payload.medicines),
+        )
         try:
             try:
                 prioritized_result, prioritization_log = await prioritize_scan_medicines(
@@ -372,6 +632,15 @@ async def scan_documents(
             if extraction_meta_payload is None:
                 extraction_meta_payload = {}
             extraction_meta_payload["medicine_postprocess"] = prioritization_log
+            ai_pipeline_log(
+                event="medicine_prioritization_completed",
+                component="ai_scan_route",
+                scan_log_id=scan_log.id,
+                user_id=token_data.user_id,
+                medicine_count=len(prioritized_result.medicines),
+                applied=bool(prioritization_log.get("applied")),
+                success=True,
+            )
         except Exception as prioritization_exc:  # noqa: BLE001
             if extraction_meta_payload is None:
                 extraction_meta_payload = {}
@@ -380,6 +649,22 @@ async def scan_documents(
                 "applied": False,
                 "error": str(prioritization_exc) or prioritization_exc.__class__.__name__,
             }
+            ai_pipeline_log(
+                event="medicine_prioritization_failed",
+                component="ai_scan_route",
+                scan_log_id=scan_log.id,
+                user_id=token_data.user_id,
+                medicine_count=len(extraction_result_payload.medicines),
+                success=False,
+                **ai_pipeline_exception_fields(prioritization_exc),
+            )
+        set_progress(
+            stage="prioritizing_medicines",
+            title="Ready to review",
+            detail="Finalizing extracted fields.",
+            percent=97,
+            medicine_count=len(extraction_result_payload.medicines),
+        )
         ai_runs = extraction_result.ai_runs
         primary_model_provider = extraction_result.primary_model_provider
         primary_model_name = extraction_result.primary_model_name
@@ -406,6 +691,8 @@ async def scan_documents(
                 primary_model_provider=primary_model_provider,
                 primary_model_name=primary_model_name,
             )
+            if progress_reporter is not None:
+                progress_reporter.replace_scan_log(scan_log)
             raise patient_name_error
 
         scan_log = scan_log_repository.mark_succeeded(
@@ -417,6 +704,18 @@ async def scan_documents(
             extraction_meta_payload=extraction_meta_payload,
             primary_model_provider=primary_model_provider,
             primary_model_name=primary_model_name,
+        )
+        if progress_reporter is not None:
+            progress_reporter.replace_scan_log(scan_log)
+        ai_pipeline_log(
+            event="scan_request_completed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            ai_execution_mode=ai_execution_mode,
+            ai_run_count=len(ai_runs or []),
+            review_required=bool(extraction_meta_payload and extraction_meta_payload.get("review_required")),
+            success=True,
         )
         return AIScanDocumentsResponse(
             scan_log_id=scan_log.id,
@@ -430,8 +729,8 @@ async def scan_documents(
         extraction_meta_payload = cast(dict[str, Any] | None, getattr(exc, "extraction_meta_payload", extraction_meta_payload))
         primary_model_provider = cast(str | None, getattr(exc, "primary_model_provider", primary_model_provider))
         primary_model_name = cast(str | None, getattr(exc, "primary_model_name", primary_model_name))
-        if scan_log.status == "pending":
-            scan_log_repository.mark_failed(
+        if scan_log.status in {"pending", "running"}:
+            scan_log = scan_log_repository.mark_failed(
                 scan_log,
                 status=resolve_scan_failure_status(exc, validation_payload=validation_payload),
                 error_payload=build_scan_log_error_payload(exc),
@@ -443,10 +742,21 @@ async def scan_documents(
                 primary_model_provider=primary_model_provider,
                 primary_model_name=primary_model_name,
             )
+            if progress_reporter is not None:
+                progress_reporter.replace_scan_log(scan_log)
+        ai_pipeline_log(
+            event="scan_request_failed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            ai_execution_mode=ai_execution_mode,
+            success=False,
+            **ai_pipeline_exception_fields(exc),
+        )
         raise
     except Exception as exc:
-        if scan_log.status == "pending":
-            scan_log_repository.mark_failed(
+        if scan_log.status in {"pending", "running"}:
+            scan_log = scan_log_repository.mark_failed(
                 scan_log,
                 status="scan_failed",
                 error_payload={
@@ -461,4 +771,171 @@ async def scan_documents(
                 primary_model_provider=primary_model_provider,
                 primary_model_name=primary_model_name,
             )
+            if progress_reporter is not None:
+                progress_reporter.replace_scan_log(scan_log)
+        ai_pipeline_log(
+            event="scan_request_failed",
+            component="ai_scan_route",
+            scan_log_id=scan_log.id,
+            user_id=token_data.user_id,
+            ai_execution_mode=ai_execution_mode,
+            success=False,
+            **ai_pipeline_exception_fields(exc),
+        )
         raise
+
+
+async def run_scan_documents_job(scan_log_id: int, user_id: int) -> None:
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        scan_log_repository = ScanLogRepository(db)
+        scan_log = scan_log_repository.get_by_id_and_user_id(scan_log_id, user_id)
+        user = UserRepository(db).get_by_id(user_id)
+        if scan_log is None or user is None:
+            return
+        buffered_uploads = [
+            BufferedUpload(
+                filename=scan_file.original_filename,
+                mime_type=scan_file.original_mime_type,
+                content=scan_file.original_content,
+                byte_size=scan_file.original_byte_size,
+                sha256_hash=scan_file.original_sha256_hash,
+            )
+            for scan_file in scan_log.files
+        ]
+        progress_reporter = ScanProgressReporter(db, scan_log)
+        token_data = TokenData(user_id=user.id, email=user.email, role=user.role)
+        try:
+            await execute_scan_documents_pipeline(
+                db=db,
+                token_data=token_data,
+                buffered_uploads=buffered_uploads,
+                scan_log=scan_log,
+                progress_reporter=progress_reporter,
+            )
+        except Exception:
+            return
+
+
+@router.post("/scan-documents/jobs", response_model=AIScanJobStartResponse)
+async def start_scan_documents_job(
+    background_tasks: BackgroundTasks,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+    files: list[UploadFile] = File(...),
+) -> AIScanJobStartResponse:
+    buffered_uploads = await read_uploaded_files(files)
+    scan_log_repository = ScanLogRepository(db)
+    initial_progress = build_scan_progress(
+        stage="queued",
+        title="Upload complete",
+        detail="Preparing scan job.",
+        percent=15,
+        status_value="pending",
+        image_count=len(buffered_uploads),
+    )
+    scan_log = scan_log_repository.create_pending(
+        user_id=token_data.user_id,
+        file_records=[
+            ScanLogFileCreate(
+                original_filename=upload.filename,
+                original_mime_type=upload.mime_type,
+                original_byte_size=upload.byte_size,
+                original_sha256_hash=upload.sha256_hash,
+                original_content=upload.content,
+            )
+            for upload in buffered_uploads
+        ],
+        progress_payload=initial_progress,
+    )
+    background_tasks.add_task(run_scan_documents_job, scan_log.id, token_data.user_id)
+    return AIScanJobStartResponse(
+        scan_log_id=scan_log.id,
+        progress=ScanProgressPayload.model_validate(initial_progress),
+    )
+
+
+@router.get("/scan-documents/jobs/{scan_log_id}", response_model=AIScanJobStatusResponse)
+async def get_scan_documents_job_status(
+    scan_log_id: int,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> AIScanJobStatusResponse:
+    scan_log_repository = ScanLogRepository(db)
+    scan_log = scan_log_repository.get_by_id_and_user_id(scan_log_id, token_data.user_id)
+    if scan_log is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scan log not found.",
+        )
+    return build_scan_job_status_response(scan_log)
+
+
+@router.post("/scan-documents/jobs/{scan_log_id}/cancel", response_model=AIScanJobStatusResponse)
+async def cancel_scan_documents_job(
+    scan_log_id: int,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> AIScanJobStatusResponse:
+    """Cancel a running or pending scan job."""
+    scan_log_repository = ScanLogRepository(db)
+    scan_log = scan_log_repository.get_by_id_and_user_id(scan_log_id, token_data.user_id)
+    if scan_log is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scan log not found.",
+        )
+    
+    # Only allow cancellation of pending or running scans
+    if scan_log.status not in {"pending", "running"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel a scan with status '{scan_log.status}'. Only pending or running scans can be cancelled.",
+        )
+    
+    scan_log = scan_log_repository.mark_cancelled(scan_log)
+    ai_pipeline_log(
+        event="scan_cancelled",
+        component="ai_scan_route",
+        scan_log_id=scan_log.id,
+        user_id=token_data.user_id,
+    )
+    return build_scan_job_status_response(scan_log)
+
+@router.post("/scan-documents", response_model=AIScanDocumentsResponse)
+async def scan_documents(
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+    files: list[UploadFile] = File(...),
+) -> AIScanDocumentsResponse:
+    scan_log_repository = ScanLogRepository(db)
+    buffered_uploads = await read_uploaded_files(files)
+    scan_log = scan_log_repository.create_pending(
+        user_id=token_data.user_id,
+        file_records=[
+            ScanLogFileCreate(
+                original_filename=upload.filename,
+                original_mime_type=upload.mime_type,
+                original_byte_size=upload.byte_size,
+                original_sha256_hash=upload.sha256_hash,
+                original_content=upload.content,
+            )
+            for upload in buffered_uploads
+        ],
+        progress_payload=build_scan_progress(
+            stage="queued",
+            title="Preparing scan",
+            detail="Starting synchronous scan.",
+            percent=0,
+            status_value="pending",
+            image_count=len(buffered_uploads),
+        ),
+    )
+    progress_reporter = ScanProgressReporter(db, scan_log)
+    return await execute_scan_documents_pipeline(
+        db=db,
+        token_data=token_data,
+        buffered_uploads=buffered_uploads,
+        scan_log=scan_log,
+        progress_reporter=progress_reporter,
+    )

@@ -17,7 +17,7 @@ from app.repositories.scan_log_repository import ScanLogRepository
 from app.repositories.user_repository import UserRepository
 from eval.cli_utils import ensure_family_candidates, guess_mime_type, register_test_user
 from eval.config import DEFAULT_THRESHOLDS
-from eval.evaluator import MedicalClaimEvaluator
+from eval.evaluator import EVALUATOR_SCHEMA_VERSION, PRIMARY_METRIC, MedicalClaimEvaluator
 from eval.ground_truth import GroundTruthError, load_ground_truth
 from eval.result_store import (
     ClaimFingerprintInput,
@@ -72,6 +72,190 @@ def _truncate_str(val: Any, max_len: int = 15) -> str:
     return s if s else "-"
 
 
+def _zero_metric() -> dict[str, Any]:
+    return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "tp": 0.0, "fp": 0.0, "fn": 0.0, "applicable": False}
+
+
+def _metric_from_counts(tp: float, fp: float, fn: float) -> dict[str, Any]:
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "tp": round(tp, 4),
+        "fp": round(fp, 4),
+        "fn": round(fn, 4),
+        "applicable": (tp + fp + fn) > 0,
+    }
+
+
+def _aggregate_metric_counts(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    tp = sum(float(metric.get("tp", 0.0)) for metric in metrics)
+    fp = sum(float(metric.get("fp", 0.0)) for metric in metrics)
+    fn = sum(float(metric.get("fn", 0.0)) for metric in metrics)
+    return _metric_from_counts(tp, fp, fn)
+
+
+def _mean(values: list[float]) -> float:
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
+def _applicable_metrics(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    applicable = [metric for metric in metrics if metric.get("applicable", True)]
+    return applicable or metrics
+
+
+def _get_primary_metric(score: dict[str, Any]) -> dict[str, Any]:
+    metric = score.get("strict_kie_micro")
+    return metric if isinstance(metric, dict) else _zero_metric()
+
+
+def _get_usability_diagnostics(score: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = score.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        return {}
+    usability = diagnostics.get("usability", {})
+    return usability if isinstance(usability, dict) else {}
+
+
+def _aggregate_accuracy(scores: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    correct = 0
+    total = 0
+    incorrect_fields: set[str] = set()
+    for score in scores:
+        accuracy = score.get(key, {})
+        if not isinstance(accuracy, dict):
+            continue
+        correct += int(accuracy.get("correct", 0))
+        total += int(accuracy.get("total", 0))
+        incorrect_fields.update(str(field) for field in accuracy.get("incorrect_fields", []))
+    return {
+        "accuracy": round(correct / total, 4) if total else 0.0,
+        "correct": correct,
+        "total": total,
+        "incorrect_fields": sorted(incorrect_fields),
+    }
+
+
+def _aggregate_relaxed_text(scores: list[dict[str, Any]]) -> dict[str, Any]:
+    total_count = 0
+    weighted_anls = 0.0
+    weighted_cer = 0.0
+    for score in scores:
+        relaxed = score.get("relaxed_text", {})
+        if not isinstance(relaxed, dict):
+            continue
+        count = int(relaxed.get("count", 0))
+        total_count += count
+        weighted_anls += float(relaxed.get("average_anls", 0.0)) * count
+        weighted_cer += float(relaxed.get("average_cer", 0.0)) * count
+    return {
+        "average_anls": round(weighted_anls / total_count, 4) if total_count else 0.0,
+        "average_cer": round(weighted_cer / total_count, 4) if total_count else 0.0,
+        "count": total_count,
+    }
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_ai_api_calls(result: dict[str, Any]) -> list[dict[str, Any]]:
+    run_record = result.get("run_record")
+    if not isinstance(run_record, dict):
+        return []
+
+    scan_log = run_record.get("scan_log")
+    if not isinstance(scan_log, dict):
+        return []
+
+    calls = scan_log.get("ai_api_calls")
+    if not isinstance(calls, list):
+        return []
+
+    return [call for call in calls if isinstance(call, dict)]
+
+
+def _aggregate_token_usage(results: list[dict[str, Any]]) -> dict[str, Any]:
+    claims_with_usage = 0
+    call_count = 0
+    successful_call_count = 0
+    failed_call_count = 0
+    prompt_total = 0.0
+    completion_total = 0.0
+    total_token_total = 0.0
+    latency_total = 0.0
+    latency_count = 0
+
+    for result in results:
+        claim_prompt_total = 0.0
+        claim_completion_total = 0.0
+        claim_total_token_total = 0.0
+        claim_has_usage = False
+
+        for call in _extract_ai_api_calls(result):
+            prompt_tokens = _safe_float(call.get("prompt_tokens"))
+            completion_tokens = _safe_float(call.get("completion_tokens"))
+            total_tokens = _safe_float(call.get("total_tokens"))
+            latency_ms = _safe_float(call.get("latency_ms"))
+
+            has_token_usage = prompt_tokens is not None or completion_tokens is not None or total_tokens is not None
+            if has_token_usage:
+                call_count += 1
+                if call.get("success") is False:
+                    failed_call_count += 1
+                else:
+                    successful_call_count += 1
+
+            if prompt_tokens is not None:
+                claim_prompt_total += prompt_tokens
+                claim_has_usage = True
+            if completion_tokens is not None:
+                claim_completion_total += completion_tokens
+                claim_has_usage = True
+            if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+                total_tokens = prompt_tokens + completion_tokens
+            if total_tokens is not None:
+                claim_total_token_total += total_tokens
+                claim_has_usage = True
+
+            if latency_ms is not None:
+                latency_total += latency_ms
+                latency_count += 1
+
+        if not claim_has_usage:
+            continue
+
+        claims_with_usage += 1
+        prompt_total += claim_prompt_total
+        completion_total += claim_completion_total
+        total_token_total += claim_total_token_total
+
+    return {
+        "claims_with_usage": claims_with_usage,
+        "api_call_count": call_count,
+        "successful_api_call_count": successful_call_count,
+        "failed_api_call_count": failed_call_count,
+        "total_input_tokens": int(prompt_total),
+        "total_output_tokens": int(completion_total),
+        "total_tokens": int(total_token_total),
+        "average_input_tokens": round(prompt_total / claims_with_usage, 4) if claims_with_usage else 0.0,
+        "average_output_tokens": round(completion_total / claims_with_usage, 4) if claims_with_usage else 0.0,
+        "average_total_tokens": round(total_token_total / claims_with_usage, 4) if claims_with_usage else 0.0,
+        "average_input_tokens_per_call": round(prompt_total / call_count, 4) if call_count else 0.0,
+        "average_output_tokens_per_call": round(completion_total / call_count, 4) if call_count else 0.0,
+        "average_total_tokens_per_call": round(total_token_total / call_count, 4) if call_count else 0.0,
+        "average_latency_ms_per_call": round(latency_total / latency_count, 4) if latency_count else 0.0,
+    }
+
+
 def _format_html_cell(val: Any) -> str:
     """Format value for HTML without truncation."""
     if val is None:
@@ -106,8 +290,15 @@ def _extract_list_item_name(val: Any, section: str) -> str:
 
 def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: dict[str, Any], score: dict[str, Any], medicine_matches: list, other_charges_matches: list) -> list[str]:
     per_field = score.get("per_field", {})
-    critical_fail_reasons = score.get("critical_fail_reasons", [])
-    critical_fail_text = "\n".join(critical_fail_reasons) if critical_fail_reasons else "None"
+    primary = _get_primary_metric(score)
+    field_exact = score.get("field_exact_accuracy", {})
+    financial_exact = score.get("financial_exact_accuracy", {})
+    relaxed_text = score.get("relaxed_text", {})
+    usability = _get_usability_diagnostics(score)
+    blocking_fail_reasons = usability.get("blocking_fail_reasons", usability.get("critical_fail_reasons", []))
+    advisory_fail_reasons = usability.get("advisory_fail_reasons", [])
+    blocking_fail_text = "\n".join(blocking_fail_reasons) if blocking_fail_reasons else "None"
+    advisory_fail_text = "\n".join(advisory_fail_reasons) if advisory_fail_reasons else "None"
     html = [
         "<!DOCTYPE html>",
         "<html><head><meta charset='utf-8'><title>Claim Diff Report</title>",
@@ -129,12 +320,18 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
         "</style></head><body>",
         f"<h2>Claim Diff: {claim_id}</h2>",
         "<div class='summary-card'>",
-        f"<div>Soft F1: <span class='b'>{score.get('soft_f1', score.get('overall_f1', 0)):.4f}</span></div>",
-        f"<div>Strict F1: <span class='b'>{score.get('strict_f1', 0):.4f}</span></div>",
-        f"<div>Edit Burden Score: <span class='b'>{score.get('edit_burden_score', 0):.4f}</span></div>",
-        f"<div>Pass Verify Only: <span class='{'g' if score.get('pass_verify_only', False) else 'r'}'>{score.get('pass_verify_only', False)}</span></div>",
-        "<div>Critical Fail Reasons:</div>",
-        f"<pre>{critical_fail_text}</pre>",
+        f"<div>Primary Metric: <span class='b'>{score.get('primary_metric', PRIMARY_METRIC)}</span></div>",
+        f"<div>Strict KIE Micro F1: <span class='b'>{primary.get('f1', 0):.4f}</span></div>",
+        f"<div>Precision / Recall: <span class='b'>{primary.get('precision', 0):.4f} / {primary.get('recall', 0):.4f}</span></div>",
+        f"<div>Critical Exact Accuracy: <span class='b'>{field_exact.get('accuracy', 0):.4f}</span></div>",
+        f"<div>Financial Exact Accuracy: <span class='b'>{financial_exact.get('accuracy', 0):.4f}</span></div>",
+        f"<div>Relaxed Text ANLS / CER: <span class='b'>{relaxed_text.get('average_anls', 0):.4f} / {relaxed_text.get('average_cer', 0):.4f}</span></div>",
+        f"<div>Edit Burden Score: <span class='b'>{usability.get('edit_burden_score', 0):.4f}</span></div>",
+        f"<div>Pass Verify Only: <span class='{'g' if usability.get('pass_verify_only', False) else 'r'}'>{usability.get('pass_verify_only', False)}</span></div>",
+        "<div>Blocking Fail Reasons:</div>",
+        f"<pre>{blocking_fail_text}</pre>",
+        "<div>Advisory Review Reasons:</div>",
+        f"<pre>{advisory_fail_text}</pre>",
         "</div>",
     ]
 
@@ -213,6 +410,8 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                 for m in matches:
                     gt_cat = m.get("ground_truth", {}).get("category", "?")
                     pred_cat = m.get("predicted", {}).get("category", "?")
+                    gt_canon = m.get("ground_truth_category_canonical")
+                    pred_canon = m.get("predicted_category_canonical")
                     sim = m.get("similarity", 0.0)
                     strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
@@ -221,7 +420,9 @@ def _generate_html_diff(claim_id: str, predicted: dict[str, Any], ground_truth: 
                         stat, cls = "~", "y"
                     else:
                         stat, cls = "✗", "r"
-                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_cat)}</td><td>{_format_html_cell(pred_cat)}</td><td class='{cls}'>{stat} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})</td></tr>")
+                    gt_label = f"{gt_cat} (canon: {gt_canon})" if gt_canon else gt_cat
+                    pred_label = f"{pred_cat} (canon: {pred_canon})" if pred_canon else pred_cat
+                    html.append(f"<tr><td>[{idx}]</td><td>{_format_html_cell(gt_label)}</td><td>{_format_html_cell(pred_label)}</td><td class='{cls}'>{stat} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})</td></tr>")
                     idx += 1
                 for m in unmatched_pred:
                     html.append(f"<tr><td>[{idx}]</td><td>-</td><td>{_format_html_cell(m.get('category', '?'))}</td><td class='r'>extra</td></tr>")
@@ -325,6 +526,28 @@ def export_scan_log(scan_log_id: int | None) -> dict[str, Any] | None:
                     "created_at": run.created_at.isoformat() if run.created_at else None,
                 }
                 for run in scan_log.ai_runs
+            ],
+            "ai_api_calls": [
+                {
+                    "provider": call.provider,
+                    "model_name": call.model_name,
+                    "call_kind": call.call_kind,
+                    "producer_id": call.producer_id,
+                    "producer_rank": call.producer_rank,
+                    "run_index": call.run_index,
+                    "temperature": call.temperature,
+                    "success": call.success,
+                    "error_message": call.error_message,
+                    "prompt_tokens": call.prompt_tokens,
+                    "completion_tokens": call.completion_tokens,
+                    "total_tokens": call.total_tokens,
+                    "latency_ms": call.latency_ms,
+                    "usage_payload": call.usage_payload,
+                    "prompt_file_path": call.prompt_file_path,
+                    "response_validation_error": call.response_validation_error,
+                    "created_at": call.created_at.isoformat() if call.created_at else None,
+                }
+                for call in scan_log.ai_api_call_logs
             ],
         }
 
@@ -627,12 +850,14 @@ async def run_single_evaluation(
             "run_record_path": run_record_path,
             "scan_log_id": predicted.get("scan_log_id") if isinstance(predicted, dict) else None,
             "status": "scan_saved",
+            "run_record": run_record,
         }
 
     evaluator = MedicalClaimEvaluator(DEFAULT_THRESHOLDS)
     score_result = evaluator.evaluate(predicted, gt_data["expected"])
     if logger is not None:
-        logger("debug", f"evaluation complete: overall_f1={score_result.get('overall_f1', 0):.4f}")
+        primary = _get_primary_metric(score_result)
+        logger("debug", f"evaluation complete: strict_kie_micro_f1={primary.get('f1', 0.0):.4f}")
     return {
         "claim_id": claim_id,
         "elapsed_seconds": round(elapsed_seconds, 2),
@@ -652,98 +877,102 @@ def build_aggregate_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     if not successful:
         return {
-            "overall_macro_f1": 0.0,
-            "overall_macro_soft_f1": 0.0,
-            "overall_macro_strict_f1": 0.0,
-            "overall_macro_precision": 0.0,
-            "overall_macro_recall": 0.0,
-            "overall_macro_edit_burden_score": 0.0,
+            "schema_version": EVALUATOR_SCHEMA_VERSION,
+            "primary_metric": PRIMARY_METRIC,
+            "strict_kie_micro": _zero_metric(),
+            "strict_kie_macro_f1": 0.0,
+            "strict_kie_section_macro_f1": 0.0,
             "successful_claims": 0,
             "failed_claims": len(results),
             "claims_from_cache": claims_from_cache,
             "claims_from_fresh_scan": claims_from_fresh_scan,
+            "per_section_micro": {},
             "per_section_macro_f1": {},
-            "per_section_macro_strict_f1": {},
-            "per_section_macro_precision": {},
-            "per_section_macro_recall": {},
             "per_field_macro_f1": {},
-            "per_field_macro_strict_f1": {},
-            "per_field_macro_precision": {},
-            "per_field_macro_recall": {},
+            "per_field_micro": {},
+            "field_exact_accuracy": _aggregate_accuracy([], "field_exact_accuracy"),
+            "financial_exact_accuracy": _aggregate_accuracy([], "financial_exact_accuracy"),
+            "relaxed_text": _aggregate_relaxed_text([]),
+            "token_usage": _aggregate_token_usage(results),
+            "diagnostics": {
+                "average_edit_burden_score": 0.0,
+                "pass_verify_only_rate": 0.0,
+            },
         }
 
-    section_names = {section for result in successful for section in result["score"]["per_section"].keys()}
+    scores = [result["score"] for result in successful]
+    primary_metrics = [_get_primary_metric(score) for score in scores]
+    primary_micro = _aggregate_metric_counts(primary_metrics)
+    strict_kie_macro_f1 = _mean([float(metric.get("f1", 0.0)) for metric in _applicable_metrics(primary_metrics)])
+    section_macro_values = [
+        float(score.get("strict_kie_section_macro_f1", 0.0))
+        for score in scores
+        if isinstance(score.get("strict_kie_section_macro_f1", 0.0), (int, float))
+    ]
+
+    section_names = {section for score in scores for section in score.get("per_section", {}).keys()}
+    per_section_micro: dict[str, dict[str, Any]] = {}
     per_section_macro_f1: dict[str, float] = {}
-    per_section_macro_strict_f1: dict[str, float] = {}
-    per_section_macro_precision: dict[str, float] = {}
-    per_section_macro_recall: dict[str, float] = {}
     for section in sorted(section_names):
-        precisions = [result["score"]["per_section"].get(section, {}).get("precision", 0.0) for result in successful]
-        recalls = [result["score"]["per_section"].get(section, {}).get("recall", 0.0) for result in successful]
-        f1s = [result["score"]["per_section"].get(section, {}).get("f1", 0.0) for result in successful]
-        strict_f1s = [result["score"]["per_section"].get(section, {}).get("strict_f1", result["score"]["per_section"].get(section, {}).get("f1", 0.0)) for result in successful]
-        per_section_macro_precision[section] = round(sum(precisions) / len(precisions), 4)
-        per_section_macro_recall[section] = round(sum(recalls) / len(recalls), 4)
-        per_section_macro_f1[section] = round(sum(f1s) / len(f1s), 4)
-        per_section_macro_strict_f1[section] = round(sum(strict_f1s) / len(strict_f1s), 4)
+        metrics = [
+            score.get("per_section", {}).get(section, _zero_metric())
+            for score in scores
+            if isinstance(score.get("per_section", {}).get(section, _zero_metric()), dict)
+        ]
+        per_section_micro[section] = _aggregate_metric_counts(metrics)
+        per_section_macro_f1[section] = _mean([float(metric.get("f1", 0.0)) for metric in _applicable_metrics(metrics)])
 
-    field_names = {field for result in successful for field in result["score"].get("per_field", {}).keys()}
+    field_names = {field for score in scores for field in score.get("per_field", {}).keys()}
+    per_field_micro: dict[str, dict[str, Any]] = {}
     per_field_macro_f1: dict[str, float] = {}
-    per_field_macro_strict_f1: dict[str, float] = {}
-    per_field_macro_precision: dict[str, float] = {}
-    per_field_macro_recall: dict[str, float] = {}
     for field in sorted(field_names):
-        precisions = [result["score"].get("per_field", {}).get(field, {}).get("precision", 0.0) for result in successful]
-        recalls = [result["score"].get("per_field", {}).get(field, {}).get("recall", 0.0) for result in successful]
-        f1s = [result["score"].get("per_field", {}).get(field, {}).get("f1", 0.0) for result in successful]
-        strict_f1s = [result["score"].get("per_field", {}).get(field, {}).get("strict_f1", result["score"].get("per_field", {}).get(field, {}).get("f1", 0.0)) for result in successful]
-        per_field_macro_precision[field] = round(sum(precisions) / len(precisions), 4)
-        per_field_macro_recall[field] = round(sum(recalls) / len(recalls), 4)
-        per_field_macro_f1[field] = round(sum(f1s) / len(f1s), 4)
-        per_field_macro_strict_f1[field] = round(sum(strict_f1s) / len(strict_f1s), 4)
+        metrics = [
+            score.get("per_field", {}).get(field, _zero_metric())
+            for score in scores
+            if isinstance(score.get("per_field", {}).get(field, _zero_metric()), dict)
+        ]
+        per_field_micro[field] = _aggregate_metric_counts(metrics)
+        per_field_macro_f1[field] = _mean([float(metric.get("f1", 0.0)) for metric in _applicable_metrics(metrics)])
 
-    overall_precisions = [result["score"].get("overall_precision", result["score"]["overall_f1"]) for result in successful]
-    overall_recalls = [result["score"].get("overall_recall", result["score"]["overall_f1"]) for result in successful]
-    overall_f1s = [result["score"]["overall_f1"] for result in successful]
-    overall_soft_f1s = [result["score"].get("soft_f1", result["score"]["overall_f1"]) for result in successful]
-    overall_strict_f1s = [result["score"].get("strict_f1", 0.0) for result in successful]
-    edit_burden_scores = [result["score"].get("edit_burden_score", 0.0) for result in successful]
-    overall_macro_precision = round(sum(overall_precisions) / len(overall_precisions), 4)
-    overall_macro_recall = round(sum(overall_recalls) / len(overall_recalls), 4)
-    overall_macro_f1 = round(sum(overall_f1s) / len(overall_f1s), 4)
-    overall_macro_soft_f1 = round(sum(overall_soft_f1s) / len(overall_soft_f1s), 4)
-    overall_macro_strict_f1 = round(sum(overall_strict_f1s) / len(overall_strict_f1s), 4)
-    overall_macro_edit_burden_score = round(sum(edit_burden_scores) / len(edit_burden_scores), 4)
+    usability_diagnostics = [_get_usability_diagnostics(score) for score in scores]
+    edit_burden_scores = [
+        float(diagnostic.get("edit_burden_score", 0.0))
+        for diagnostic in usability_diagnostics
+        if isinstance(diagnostic.get("edit_burden_score", 0.0), (int, float))
+    ]
+    pass_verify_count = sum(1 for diagnostic in usability_diagnostics if diagnostic.get("pass_verify_only") is True)
+
     return {
-        "overall_macro_f1": overall_macro_f1,
-        "overall_macro_soft_f1": overall_macro_soft_f1,
-        "overall_macro_strict_f1": overall_macro_strict_f1,
-        "overall_macro_precision": overall_macro_precision,
-        "overall_macro_recall": overall_macro_recall,
-        "overall_macro_edit_burden_score": overall_macro_edit_burden_score,
+        "schema_version": EVALUATOR_SCHEMA_VERSION,
+        "primary_metric": PRIMARY_METRIC,
+        "strict_kie_micro": primary_micro,
+        "strict_kie_macro_f1": strict_kie_macro_f1,
+        "strict_kie_section_macro_f1": _mean(section_macro_values),
         "successful_claims": len(successful),
         "failed_claims": len(results) - len(successful),
         "claims_from_cache": claims_from_cache,
         "claims_from_fresh_scan": claims_from_fresh_scan,
+        "per_section_micro": per_section_micro,
         "per_section_macro_f1": per_section_macro_f1,
-        "per_section_macro_strict_f1": per_section_macro_strict_f1,
-        "per_section_macro_precision": per_section_macro_precision,
-        "per_section_macro_recall": per_section_macro_recall,
+        "per_field_micro": per_field_micro,
         "per_field_macro_f1": per_field_macro_f1,
-        "per_field_macro_strict_f1": per_field_macro_strict_f1,
-        "per_field_macro_precision": per_field_macro_precision,
-        "per_field_macro_recall": per_field_macro_recall,
+        "field_exact_accuracy": _aggregate_accuracy(scores, "field_exact_accuracy"),
+        "financial_exact_accuracy": _aggregate_accuracy(scores, "financial_exact_accuracy"),
+        "relaxed_text": _aggregate_relaxed_text(scores),
+        "token_usage": _aggregate_token_usage(successful),
+        "diagnostics": {
+            "average_edit_burden_score": _mean(edit_burden_scores),
+            "pass_verify_only_rate": round(pass_verify_count / len(successful), 4) if successful else 0.0,
+        },
     }
 
 
 def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
     print("\n" + "=" * 132)
-    print(f"{'CLAIM':<25} {'SOFT':>7} {'STRICT':>7} {'PREC':>7} {'REC':>7} {'CER':>7} {'SRC':>10} {'ELAPSED':>8}  STATUS")
+    print(f"{'CLAIM':<25} {'KIE_F1':>7} {'PREC':>7} {'REC':>7} {'ANLS':>7} {'CER':>7} {'SRC':>10} {'ELAPSED':>8}  STATUS")
     print("-" * 132)
 
-    total_f1 = 0.0
-    total_prec = 0.0
-    total_rec = 0.0
+    f1_values: list[float] = []
     count = 0
     for result in results:
         source = str(result.get("scan_source", "-"))
@@ -762,41 +991,27 @@ def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
             continue
 
         score = result["score"]
-        claim_f1 = score.get("overall_f1", 0.0)
-        claim_strict_f1 = score.get("strict_f1", 0.0)
-        claim_prec = score.get("overall_precision", claim_f1)
-        claim_rec = score.get("overall_recall", claim_f1)
+        primary = _get_primary_metric(score)
+        relaxed = score.get("relaxed_text", {})
+        claim_f1 = float(primary.get("f1", 0.0))
+        claim_prec = float(primary.get("precision", 0.0))
+        claim_rec = float(primary.get("recall", 0.0))
+        anls = relaxed.get("average_anls") if isinstance(relaxed, dict) else None
+        cer = relaxed.get("average_cer") if isinstance(relaxed, dict) else None
+        anls_str = f"{anls:.4f}" if isinstance(anls, (int, float)) else "-"
+        cer_str = f"{cer:.4f}" if isinstance(cer, (int, float)) else "-"
 
-        anam_cer = score.get("per_field", {}).get("medical_context.anamnesis", {}).get("cer")
-        therapy_cer = score.get("per_field", {}).get("medical_context.therapy_note", {}).get("cer")
-        if anam_cer is not None or therapy_cer is not None:
-            cer_values = [v for v in [anam_cer, therapy_cer] if v is not None]
-            avg_cer = sum(cer_values) / len(cer_values) if cer_values else None
-            cer_str = f"{avg_cer:.4f}" if avg_cer is not None else "-"
-        else:
-            cer_str = "-"
-
-        claim_f1_str = f"{claim_f1:.4f}"
-        claim_strict_f1_str = f"{claim_strict_f1:.4f}"
-        claim_prec_str = f"{claim_prec:.4f}"
-        claim_rec_str = f"{claim_rec:.4f}"
-
-        total_f1 += claim_f1
-        total_prec += claim_prec
-        total_rec += claim_rec
+        f1_values.append(claim_f1)
         count += 1
         print(
-            f"{result['claim_id']:<25} {claim_f1_str:>7} {claim_strict_f1_str:>7} {claim_prec_str:>7} {claim_rec_str:>7} {cer_str:>7} {source:>10} "
+            f"{result['claim_id']:<25} {claim_f1:>7.4f} {claim_prec:>7.4f} {claim_rec:>7.4f} "
+            f"{anls_str:>7} {cer_str:>7} {source:>10} "
             f"{result.get('elapsed_seconds', 0):>8}s  evaluated"
         )
 
     print("-" * 132)
     if count > 0:
-        macro_f1 = total_f1 / count
-        macro_strict_f1 = sum(result.get("score", {}).get("strict_f1", 0.0) for result in results if "error" not in result and "score" in result) / count
-        macro_prec = total_prec / count
-        macro_rec = total_rec / count
-        print(f"\nOverall Macro: soft_f1={macro_f1:.4f}  strict_f1={macro_strict_f1:.4f}  P={macro_prec:.4f}  R={macro_rec:.4f}  ({count} claims evaluated)")
+        print(f"\nStrict KIE Macro F1={_mean(f1_values):.4f}  ({count} claims evaluated)")
 
     summary = build_aggregate_summary(results)
     print(
@@ -811,38 +1026,66 @@ def print_results(results: list[dict[str, Any]], mode: EvalMode) -> None:
 def print_evaluation_summary(summary: dict[str, Any]) -> None:
     print(f"\n{C_BOLD}EVALUATION SUMMARY{C_RESET}")
     print("=" * 80)
-    overall_f1 = summary.get("overall_macro_f1", 0.0)
-    overall_soft_f1 = summary.get("overall_macro_soft_f1", overall_f1)
-    overall_strict_f1 = summary.get("overall_macro_strict_f1", 0.0)
-    overall_prec = summary.get("overall_macro_precision", 0.0)
-    overall_rec = summary.get("overall_macro_recall", 0.0)
-    overall_edit_burden = summary.get("overall_macro_edit_burden_score", 0.0)
-    print(f"Overall Macro:  {C_BOLD}soft_f1={overall_soft_f1:.4f}{C_RESET}  {C_BOLD}strict_f1={overall_strict_f1:.4f}{C_RESET}  {C_BOLD}P={overall_prec:.4f}{C_RESET}  {C_BOLD}R={overall_rec:.4f}{C_RESET}  {C_BOLD}EBS={overall_edit_burden:.4f}{C_RESET}")
+    primary = summary.get("strict_kie_micro", {})
+    field_exact = summary.get("field_exact_accuracy", {})
+    financial_exact = summary.get("financial_exact_accuracy", {})
+    relaxed = summary.get("relaxed_text", {})
+    token_usage = summary.get("token_usage", {})
+    diagnostics = summary.get("diagnostics", {})
+    print(f"Schema: {summary.get('schema_version', EVALUATOR_SCHEMA_VERSION)}")
+    print(
+        f"Primary: {C_BOLD}{summary.get('primary_metric', PRIMARY_METRIC)}={primary.get('f1', 0.0):.4f}{C_RESET}  "
+        f"{C_BOLD}P={primary.get('precision', 0.0):.4f}{C_RESET}  "
+        f"{C_BOLD}R={primary.get('recall', 0.0):.4f}{C_RESET}"
+    )
+    print(
+        f"Claim Macro F1={summary.get('strict_kie_macro_f1', 0.0):.4f}  "
+        f"Section Macro F1={summary.get('strict_kie_section_macro_f1', 0.0):.4f}"
+    )
+    print(
+        f"Critical Exact={field_exact.get('accuracy', 0.0):.4f} "
+        f"({field_exact.get('correct', 0)}/{field_exact.get('total', 0)})  "
+        f"Financial Exact={financial_exact.get('accuracy', 0.0):.4f} "
+        f"({financial_exact.get('correct', 0)}/{financial_exact.get('total', 0)})"
+    )
+    print(
+        f"Relaxed Text: ANLS={relaxed.get('average_anls', 0.0):.4f}  "
+        f"CER={relaxed.get('average_cer', 0.0):.4f}  "
+        f"n={relaxed.get('count', 0)}"
+    )
+    print(
+        "Token Usage: "
+        f"avg_input={token_usage.get('average_input_tokens', 0.0):.2f}  "
+        f"avg_output={token_usage.get('average_output_tokens', 0.0):.2f}  "
+        f"avg_total={token_usage.get('average_total_tokens', 0.0):.2f}  "
+        f"claims_with_usage={token_usage.get('claims_with_usage', 0)}  "
+        f"api_calls={token_usage.get('api_call_count', 0)}"
+    )
+    print(
+        f"Usability Diagnostics: avg_edit_burden={diagnostics.get('average_edit_burden_score', 0.0):.4f}  "
+        f"pass_verify_only_rate={diagnostics.get('pass_verify_only_rate', 0.0):.4f}"
+    )
 
-    print(f"\n{C_BOLD}SECTION BREAKDOWN (Macro Avg):{C_RESET}")
-    print(f"{'SECTION':<20} {'SOFT':>8} {'STRICT':>8} {'PREC':>8} {'REC':>8}")
+    print(f"\n{C_BOLD}SECTION BREAKDOWN:{C_RESET}")
+    print(f"{'SECTION':<20} {'MICRO_F1':>8} {'MACRO_F1':>8} {'PREC':>8} {'REC':>8}")
     print("-" * 60)
-    sections = summary.get("per_section_macro_f1", {})
-    strict_sections = summary.get("per_section_macro_strict_f1", {})
-    prec_dict = summary.get("per_section_macro_precision", {})
-    rec_dict = summary.get("per_section_macro_recall", {})
-    for section in sorted(sections.keys()):
-        f1 = sections.get(section, 0.0)
-        strict_f1 = strict_sections.get(section, 0.0)
-        p = prec_dict.get(section, 0.0)
-        r = rec_dict.get(section, 0.0)
-        print(f"{section:<20} {f1:>8.4f} {strict_f1:>8.4f} {p:>8.4f} {r:>8.4f}")
+    section_micro = summary.get("per_section_micro", {})
+    section_macro = summary.get("per_section_macro_f1", {})
+    for section in sorted(section_micro.keys()):
+        metric = section_micro.get(section, {})
+        print(
+            f"{section:<20} {metric.get('f1', 0.0):>8.4f} {section_macro.get(section, 0.0):>8.4f} "
+            f"{metric.get('precision', 0.0):>8.4f} {metric.get('recall', 0.0):>8.4f}"
+        )
 
     field_f1s = summary.get("per_field_macro_f1", {})
-    field_strict_f1s = summary.get("per_field_macro_strict_f1", {})
     if field_f1s:
         sorted_fields = sorted(field_f1s.items(), key=lambda x: x[1])
         bottom_fields = sorted_fields[:5]
-        print(f"\n{C_BOLD}FIELDS NEEDING ATTENTION (lowest soft F1):{C_RESET}")
+        print(f"\n{C_BOLD}FIELDS NEEDING ATTENTION (lowest strict KIE F1):{C_RESET}")
         for i, (field, f1) in enumerate(bottom_fields, 1):
             color = C_RED if f1 < 0.5 else C_YELLOW if f1 < 0.8 else C_RESET
-            strict_f1 = field_strict_f1s.get(field, 0.0)
-            print(f"  {i}. {field:<40} soft={color}{f1:.4f}{C_RESET} strict={strict_f1:.4f}")
+            print(f"  {i}. {field:<40} F1={color}{f1:.4f}{C_RESET}")
 
 
 def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
@@ -851,44 +1094,65 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
     per_field = score.get("per_field", {})
 
     print(f"\n{C_BOLD}CLAIM SUMMARY:{C_RESET}")
-    print(f"  soft_f1: {score.get('soft_f1', score.get('overall_f1', 0.0)):.4f}")
-    print(f"  strict_f1: {score.get('strict_f1', 0.0):.4f}")
-    print(f"  edit_burden_score: {score.get('edit_burden_score', 0.0):.4f}")
-    print(f"  pass_verify_only: {score.get('pass_verify_only', False)}")
-    critical_fail_reasons = score.get("critical_fail_reasons", [])
-    if critical_fail_reasons:
-        print("  critical_fail_reasons:")
-        for reason in critical_fail_reasons:
+    primary = _get_primary_metric(score)
+    field_exact = score.get("field_exact_accuracy", {})
+    financial_exact = score.get("financial_exact_accuracy", {})
+    relaxed = score.get("relaxed_text", {})
+    usability = _get_usability_diagnostics(score)
+    print(f"  schema_version: {score.get('schema_version', EVALUATOR_SCHEMA_VERSION)}")
+    print(f"  primary_metric: {score.get('primary_metric', PRIMARY_METRIC)}")
+    print(
+        f"  strict_kie_micro: f1={primary.get('f1', 0.0):.4f} "
+        f"precision={primary.get('precision', 0.0):.4f} recall={primary.get('recall', 0.0):.4f}"
+    )
+    print(f"  strict_kie_section_macro_f1: {score.get('strict_kie_section_macro_f1', 0.0):.4f}")
+    print(
+        f"  critical_exact_accuracy: {field_exact.get('accuracy', 0.0):.4f} "
+        f"({field_exact.get('correct', 0)}/{field_exact.get('total', 0)})"
+    )
+    print(
+        f"  financial_exact_accuracy: {financial_exact.get('accuracy', 0.0):.4f} "
+        f"({financial_exact.get('correct', 0)}/{financial_exact.get('total', 0)})"
+    )
+    print(
+        f"  relaxed_text: ANLS={relaxed.get('average_anls', 0.0):.4f} "
+        f"CER={relaxed.get('average_cer', 0.0):.4f} n={relaxed.get('count', 0)}"
+    )
+    print(f"  edit_burden_score: {usability.get('edit_burden_score', 0.0):.4f}")
+    print(f"  pass_verify_only: {usability.get('pass_verify_only', False)}")
+    blocking_fail_reasons = usability.get("blocking_fail_reasons", usability.get("critical_fail_reasons", []))
+    advisory_fail_reasons = usability.get("advisory_fail_reasons", [])
+    if blocking_fail_reasons:
+        print("  blocking_fail_reasons:")
+        for reason in blocking_fail_reasons:
+            print(f"    - {reason}")
+    if advisory_fail_reasons:
+        print("  advisory_fail_reasons:")
+        for reason in advisory_fail_reasons:
             print(f"    - {reason}")
 
     print(f"\n{C_BOLD}SECTION BREAKDOWN:{C_RESET}")
-    print(f"{'SECTION':<20} {'SOFT':>8} {'STRICT':>8} {'SIM':>8} {'S_TP':>8} {'X_FP':>6} {'X_FN':>6}")
+    print(f"{'SECTION':<20} {'F1':>8} {'PREC':>8} {'REC':>8} {'TP':>8} {'FP':>6} {'FN':>6}")
     print("-" * 80)
     for section in sorted(per_section.keys()):
         s = per_section[section]
-        soft_f1 = s.get("soft_f1", s.get("f1", 0.0))
-        strict_f1 = s.get("strict_f1", s.get("f1", 0.0))
-        avg_similarity = s.get("avg_similarity")
-        sim_str = f"{avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else "-"
-        strict_tp = s.get("strict_tp", s.get("tp", 0))
-        strict_fp = s.get("strict_fp", s.get("fp", 0))
-        strict_fn = s.get("strict_fn", s.get("fn", 0))
-        print(f"{section:<20} {soft_f1:>8.4f} {strict_f1:>8.4f} {sim_str:>8} {strict_tp:>8} {strict_fp:>6} {strict_fn:>6}")
+        print(
+            f"{section:<20} {s.get('f1', 0.0):>8.4f} {s.get('precision', 0.0):>8.4f} "
+            f"{s.get('recall', 0.0):>8.4f} {s.get('tp', 0):>8} {s.get('fp', 0):>6} {s.get('fn', 0):>6}"
+        )
 
     print(f"\n{C_BOLD}PER-FIELD BREAKDOWN:{C_RESET}")
     for field, metrics in sorted(per_field.items()):
         f1 = metrics.get("f1", 0.0)
-        strict_f1 = metrics.get("strict_f1")
+        precision = metrics.get("precision", 0.0)
+        recall = metrics.get("recall", 0.0)
         cer = metrics.get("cer")
-        avg_similarity = metrics.get("avg_similarity") or metrics.get("similarity")
+        anls = metrics.get("anls")
         if cer is not None:
-            extra = f"  strict={strict_f1:.4f}" if isinstance(strict_f1, (int, float)) else ""
-            sim_extra = f"  sim={avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else ""
-            print(f"  {field:<40} soft={f1:.4f}{extra}{sim_extra}  CER={cer:.4f}")
+            anls_extra = f"  ANLS={anls:.4f}" if isinstance(anls, (int, float)) else ""
+            print(f"  {field:<40} F1={f1:.4f} P={precision:.4f} R={recall:.4f}{anls_extra}  CER={cer:.4f}")
         else:
-            extra = f"  strict={strict_f1:.4f}" if isinstance(strict_f1, (int, float)) else ""
-            sim_extra = f"  sim={avg_similarity:.4f}" if isinstance(avg_similarity, (int, float)) else ""
-            print(f"  {field:<40} soft={f1:.4f}{extra}{sim_extra}")
+            print(f"  {field:<40} F1={f1:.4f} P={precision:.4f} R={recall:.4f}")
 
     med_details = score.get("medicine_details", {})
     if med_details:
@@ -937,11 +1201,14 @@ def print_claim_detail(result: dict[str, Any], gt_data: dict[str, Any]) -> None:
         for m in oc_matches:
             gt_cat = m.get("ground_truth", {}).get("category", "?")
             pred_cat = m.get("predicted", {}).get("category", "?")
+            gt_canon = m.get("ground_truth_category_canonical")
+            pred_canon = m.get("predicted_category_canonical")
             sim = m.get("similarity", 0.0)
             desc_sim = m.get("description_similarity")
             status = f"{C_GREEN}✓{C_RESET}" if sim >= 0.8 else f"{C_YELLOW}~{C_RESET}"
             desc_extra = f", desc={desc_sim:.2f}" if isinstance(desc_sim, (int, float)) else ""
-            print(f"  {status} GT: {gt_cat} → PRED: {pred_cat} (sim={sim:.2f}{desc_extra})")
+            canon_extra = f", canon={gt_canon}->{pred_canon}" if gt_canon or pred_canon else ""
+            print(f"  {status} GT: {gt_cat} → PRED: {pred_cat} (sim={sim:.2f}{desc_extra}{canon_extra})")
 
 
 def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], score: dict[str, Any], html_file: Path | None = None, claim_id: str | None = None) -> None:
@@ -972,7 +1239,6 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
 
                 metrics = per_field.get(field_path, {})
                 f1 = metrics.get("f1", 0.0)
-                strict_f1 = metrics.get("strict_f1")
                 cer = metrics.get("cer")
 
                 if gt_val is None and pred_val is None:
@@ -983,12 +1249,10 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                     status = f"{C_RED}missing{C_RESET}"
                 elif cer is not None:
                     status = f"{C_YELLOW}CER={cer:.2f}{C_RESET}"
-                elif isinstance(strict_f1, (int, float)) and strict_f1 < 1.0:
-                    status = f"{C_YELLOW}soft={f1:.2f} strict={strict_f1:.2f}{C_RESET}"
                 elif f1 >= 1.0:
                     status = f"{C_GREEN}✓{C_RESET}"
                 elif f1 >= 0.5:
-                    status = f"{C_YELLOW}~{C_RESET}"
+                    status = f"{C_YELLOW}F1={f1:.2f}{C_RESET}"
                 else:
                     status = f"{C_RED}✗{C_RESET}"
 
@@ -1035,6 +1299,8 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                 for m in matches:
                     gt_cat = m.get("ground_truth", {}).get("category", "?")
                     pred_cat = m.get("predicted", {}).get("category", "?")
+                    gt_canon = m.get("ground_truth_category_canonical")
+                    pred_canon = m.get("predicted_category_canonical")
                     sim = m.get("similarity", 0.0)
                     strict_pass = any(sm.get("predicted") == m.get("predicted") and sm.get("ground_truth") == m.get("ground_truth") for sm in strict_matches)
                     if sim >= 0.8:
@@ -1043,7 +1309,8 @@ def print_claim_diff(predicted: dict[str, Any], ground_truth: dict[str, Any], sc
                         status = f"{C_YELLOW}~{C_RESET}"
                     else:
                         status = f"{C_RED}✗{C_RESET}"
-                    print(f"  [{status}] GT: {gt_cat:<15} PRED: {pred_cat:<15} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'})")
+                    canon_extra = f", canon={gt_canon}->{pred_canon}" if gt_canon or pred_canon else ""
+                    print(f"  [{status}] GT: {gt_cat:<15} PRED: {pred_cat:<15} (sim={sim:.2f}, strict={'pass' if strict_pass else 'fail'}{canon_extra})")
                 for m in unmatched_pred:
                     print(f"  [{C_RED}EXTRA{C_RESET}] PRED: {m.get('category', '?')}")
                 for m in unmatched_gt:
@@ -1156,13 +1423,23 @@ def main() -> None:
         if "error" in result:
             _emit_log(f"ERROR: {result['error'][:80]}", configured_level=args.log_level, level="info", claim_id=folder.name, claim_index=index, total_claims=total_claims, force=True)
         else:
-            _emit_log(f"F1={result['score']['overall_f1']:.4f}", configured_level=args.log_level, level="info", claim_id=folder.name, claim_index=index, total_claims=total_claims)
+            primary = _get_primary_metric(result.get("score", {}))
+            _emit_log(f"KIE_F1={primary.get('f1', 0.0):.4f}", configured_level=args.log_level, level="info", claim_id=folder.name, claim_index=index, total_claims=total_claims)
             _emit_log(f"saved ({result.get('scan_source')}, {result.get('elapsed_seconds', 0):.1f}s)", configured_level=args.log_level, level="info", claim_id=folder.name, claim_index=index, total_claims=total_claims)
 
     if args.log_level != "quiet":
         print_results(results, args.mode)
 
-    output_data = {"evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "total_claims": len(claim_folders), "mode": args.mode, "results_dir": str(results_dir), "aggregate_summary": build_aggregate_summary(results), "results": results}
+    output_data = {
+        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_claims": len(claim_folders),
+        "mode": args.mode,
+        "results_dir": str(results_dir),
+        "evaluation_schema": EVALUATOR_SCHEMA_VERSION,
+        "primary_metric": PRIMARY_METRIC,
+        "aggregate_summary": build_aggregate_summary(results),
+        "results": results,
+    }
     output_path = Path(args.output) if args.output else root_folder / "eval_results.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)

@@ -1,11 +1,12 @@
 import { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { BackHandler, Image, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
-import { router, useLocalSearchParams } from 'expo-router';
+import { router, useLocalSearchParams, type Href } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
 import { CenteredState } from '@/components/ui/centered-state';
+import { ImageViewer } from '@/components/ui/image-viewer';
 import { ScreenHeader } from '@/components/ui/screen-header';
 import { StatusBadge } from '@/components/ui/status-badge';
 import { SurfaceCard } from '@/components/ui/surface-card';
@@ -30,6 +31,23 @@ function DetailRow({ label, value }: { label: string; value: string }) {
       <ThemedText style={styles.detailValue}>{value}</ThemedText>
     </View>
   );
+}
+
+function formatByteSize(byteSize: number) {
+  if (byteSize < 1024) {
+    return `${byteSize} B`;
+  }
+
+  const units = ['KB', 'MB', 'GB'];
+  let value = byteSize / 1024;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 function formatMedicineItemValue(claimMedicine: ClaimDetailResponse['medicines'][number]) {
@@ -70,6 +88,12 @@ export function ClaimDetailScreen() {
   const [claim, setClaim] = useState<ClaimDetailResponse | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [viewerImageUri, setViewerImageUri] = useState<string | null>(null);
+  const [viewerImageTitle, setViewerImageTitle] = useState('');
+
+  const goToClaimHistory = useCallback(() => {
+    router.replace('/user/claim-history' as Href);
+  }, []);
 
   const loadClaim = useCallback(async () => {
     if (!params.claimId) {
@@ -95,6 +119,23 @@ export function ClaimDetailScreen() {
     useCallback(() => {
       void loadClaim();
     }, [loadClaim]),
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+        if (viewerImageUri !== null) {
+          setViewerImageUri(null);
+          setViewerImageTitle('');
+          return true;
+        }
+
+        goToClaimHistory();
+        return true;
+      });
+
+      return () => subscription.remove();
+    }, [goToClaimHistory, viewerImageUri]),
   );
 
   const content = useMemo(() => {
@@ -169,6 +210,37 @@ export function ClaimDetailScreen() {
         </SurfaceCard>
 
         <SurfaceCard style={styles.sectionCard}>
+          <ThemedText style={styles.sectionTitle}>Documents</ThemedText>
+          {claim.files.length > 0 ? (
+            <View style={styles.documentList}>
+              {claim.files.map((file) => (
+                <View
+                  key={file.id}
+                  style={[
+                    styles.documentCard,
+                    { backgroundColor: colors.background, borderColor: colors.divider },
+                  ]}>
+                  <ThemedText style={styles.documentFilename}>{file.filename}</ThemedText>
+                  <Pressable
+                    onPress={() => {
+                      setViewerImageUri(file.file_data_url);
+                      setViewerImageTitle(file.filename);
+                    }}>
+                    <Image source={{ uri: file.file_data_url }} style={styles.documentPreview} />
+                  </Pressable>
+                  <View style={styles.documentMeta}>
+                    <ThemedText style={styles.documentMetaText}>{formatByteSize(file.byte_size)}</ThemedText>
+                    <ThemedText style={styles.documentMetaText}>{file.mime_type}</ThemedText>
+                  </View>
+                </View>
+              ))}
+            </View>
+          ) : (
+            <ThemedText style={styles.emptyDocumentText}>No documents were uploaded for this claim.</ThemedText>
+          )}
+        </SurfaceCard>
+
+        <SurfaceCard style={styles.sectionCard}>
           <ThemedText style={styles.sectionTitle}>Submission Info</ThemedText>
           <DetailRow label="Submitted At" value={formatClaimTimestamp(claim.created_at)} />
           <DetailRow label="Files Uploaded" value={`${claim.file_count}`} />
@@ -178,17 +250,26 @@ export function ClaimDetailScreen() {
         </SurfaceCard>
       </ScrollView>
     );
-  }, [claim, colors.text, error, isLoading, loadClaim]);
+  }, [claim, colors, error, isLoading, loadClaim]);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
       <View style={[styles.header, { backgroundColor: colors.background }]}>
-        <Pressable style={styles.backButton} onPress={() => router.back()}>
+        <Pressable style={styles.backButton} onPress={goToClaimHistory}>
           <Ionicons name="arrow-back" size={18} color={colors.primary} />
           <ThemedText style={[styles.backButtonText, { color: colors.primary }]}>Back</ThemedText>
         </Pressable>
       </View>
       {content}
+      <ImageViewer
+        visible={viewerImageUri !== null}
+        uri={viewerImageUri}
+        title={viewerImageTitle}
+        onClose={() => {
+          setViewerImageUri(null);
+          setViewerImageTitle('');
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -211,6 +292,33 @@ const styles = StyleSheet.create({
     padding: Spacing.xl,
     paddingBottom: Spacing.xxxl,
   },
+  documentCard: {
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: Spacing.sm,
+    overflow: 'hidden',
+    padding: Spacing.sm,
+  },
+  documentFilename: {
+    ...Typography.bodyStrong,
+    fontSize: 14,
+  },
+  documentList: {
+    gap: Spacing.sm,
+  },
+  documentMeta: {
+    gap: 2,
+  },
+  documentMetaText: {
+    ...Typography.meta,
+    opacity: Opacity.subtle,
+  },
+  documentPreview: {
+    borderRadius: 8,
+    height: 180,
+    resizeMode: 'cover',
+    width: '100%',
+  },
   detailLabel: {
     ...Typography.meta,
     flex: 0.95,
@@ -225,6 +333,10 @@ const styles = StyleSheet.create({
     flex: 1.45,
     fontSize: 14,
     lineHeight: 20,
+  },
+  emptyDocumentText: {
+    ...Typography.helper,
+    opacity: Opacity.subtle,
   },
   header: {
     paddingHorizontal: Spacing.xl,

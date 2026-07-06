@@ -67,6 +67,8 @@ class UserPublic(BaseModel):
 
 class RegisterResponse(BaseModel):
     message: str
+    access_token: str
+    token_type: str = "bearer"
     user: UserPublic
 
 

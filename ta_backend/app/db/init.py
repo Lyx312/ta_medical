@@ -10,17 +10,10 @@ from app.repositories.ai_model_repository import AIModelRepository, SeedAIModelR
 
 DEFAULT_AI_MODEL_CATALOG = [
     SeedAIModelRecord(
-        display_name="Gemini 3.1 Flash Lite Preview",
-        model_name="gemini-3.1-flash-lite-preview",
+        display_name="Gemini 3.1 Flash Lite",
+        model_name="gemini-3.1-flash-lite",
         provider="google_genai",
         priority=10,
-        is_active=True,
-    ),
-    SeedAIModelRecord(
-        display_name="Gemini 3 Flash Preview",
-        model_name="gemini-3-flash-preview",
-        provider="google_genai",
-        priority=20,
         is_active=True,
     ),
     SeedAIModelRecord(
@@ -300,6 +293,7 @@ def ensure_ai_api_call_log_schema() -> None:
 def _ensure_ai_api_call_logs_table(engine: Any, inspector: Any) -> None:
     tables = set(inspector.get_table_names())
     if "ai_api_call_logs" in tables:
+        _ensure_ai_api_call_logs_columns(engine, inspector)
         return
 
     with engine.begin() as connection:
@@ -325,6 +319,13 @@ def _ensure_ai_api_call_logs_table(engine: Any, inspector: Any) -> None:
                     latency_ms INTEGER,
                     usage_payload JSON,
                     request_context_payload JSON,
+                    prompt_file_path VARCHAR(500),
+                    prompt_payload JSON,
+                    raw_response_text TEXT,
+                    response_content_payload JSON,
+                    parsed_response_payload JSON,
+                    response_validation_error TEXT,
+                    result_context_payload JSON,
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -333,6 +334,31 @@ def _ensure_ai_api_call_logs_table(engine: Any, inspector: Any) -> None:
         connection.execute(text("CREATE INDEX ix_ai_api_call_logs_scan_log_id ON ai_api_call_logs(scan_log_id)"))
         connection.execute(text("CREATE INDEX ix_ai_api_call_logs_user_id ON ai_api_call_logs(user_id)"))
         connection.execute(text("CREATE INDEX ix_ai_api_call_logs_call_kind ON ai_api_call_logs(call_kind)"))
+
+
+def _ensure_ai_api_call_logs_columns(engine: Any, inspector: Any) -> None:
+    existing_columns = {column["name"] for column in inspector.get_columns("ai_api_call_logs")}
+    desired_columns = {
+        "prompt_file_path": "ALTER TABLE ai_api_call_logs ADD COLUMN prompt_file_path VARCHAR(500)",
+        "prompt_payload": "ALTER TABLE ai_api_call_logs ADD COLUMN prompt_payload JSON",
+        "raw_response_text": "ALTER TABLE ai_api_call_logs ADD COLUMN raw_response_text TEXT",
+        "response_content_payload": "ALTER TABLE ai_api_call_logs ADD COLUMN response_content_payload JSON",
+        "parsed_response_payload": "ALTER TABLE ai_api_call_logs ADD COLUMN parsed_response_payload JSON",
+        "response_validation_error": "ALTER TABLE ai_api_call_logs ADD COLUMN response_validation_error TEXT",
+        "result_context_payload": "ALTER TABLE ai_api_call_logs ADD COLUMN result_context_payload JSON",
+    }
+
+    missing_column_ddls = [
+        ddl
+        for column_name, ddl in desired_columns.items()
+        if column_name not in existing_columns
+    ]
+    if not missing_column_ddls:
+        return
+
+    with engine.begin() as connection:
+        for ddl in missing_column_ddls:
+            connection.execute(text(ddl))
 
 
 def _migrate_scan_logs_to_new_schema(engine: Any) -> None:

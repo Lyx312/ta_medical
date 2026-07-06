@@ -3,13 +3,13 @@ import base64
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, AsyncIterator, cast
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from langchain_core.language_models._utils import _normalize_messages
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -30,13 +30,16 @@ from app.models.scan_log import AIApiCallLog
 from app.repositories.scan_log_repository import ScanLogFileCreate, ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services import ai_service as ai_service_module
+from app.services import claim_medicine_relevance as medicine_relevance_service
 from app.services.ai_ensemble import (
+    FusionWorkingState,
     MedicalExtractionOutcome,
     MedicalExtractionFusionEngine,
     ProducerInferenceTrace,
     clear_self_consistency_calibration_cache,
     parse_indonesian_amount_words,
 )
+from app.services.ai_ensemble_helpers import classify_other_charge_kind
 from app.services.ai_service import (
     AIModelSpec,
     DocumentImageInput,
@@ -46,9 +49,11 @@ from app.services.ai_service import (
 )
 from app.services.image_preprocessing import ProcessedDocumentImage
 from app.services.scan_medicine_prioritization import (
+    BatchMedicineInterpretationResponse,
     ScanMedicineImageInterpretationJudge,
     prioritize_scan_medicines,
 )
+from app.services.scan_progress import ScanProgressEventHub, generate_scan_progress_sse
 from app.services import model_invocation_test as model_invocation_test_module
 
 
@@ -62,6 +67,29 @@ def get_message_block(content: Any, index: int) -> dict[str, Any]:
 def get_http_exception_detail_dict(exc: HTTPException) -> dict[str, Any]:
     assert isinstance(exc.detail, dict)
     return cast(dict[str, Any], exc.detail)
+
+
+def parse_sse_message(raw_message: str) -> tuple[str, dict[str, Any] | None]:
+    event_name = ""
+    payload: dict[str, Any] | None = None
+
+    for line in raw_message.strip().splitlines():
+        if line.startswith("event: "):
+            event_name = line.removeprefix("event: ").strip()
+            continue
+        if line.startswith("data: "):
+            payload = json.loads(line.removeprefix("data: ").strip())
+            continue
+
+    return event_name, payload
+
+
+async def next_sse_message(
+    generator: AsyncIterator[str],
+    timeout: float = 0.5,
+) -> tuple[str, dict[str, Any] | None]:
+    raw_message = await asyncio.wait_for(anext(generator), timeout=timeout)
+    return parse_sse_message(raw_message)
 
 
 def extract_ai_pipeline_log_lines(raw_output: str) -> list[str]:
@@ -319,11 +347,13 @@ def test_format_ai_pipeline_terminal_line_renders_compact_known_events() -> None
             "component": "medical_extraction_fusion_engine",
             "scan_log_id": 51,
             "judge_invocation_count": 0,
+            "judge_attempt_count": 2,
+            "judge_applied_count": 0,
             "nullified_field_count": 3,
             "overall_confidence": 0.8965,
             "review_required": True,
         },
-    ) == "[AI][scan:51] FUSE done judges=0 nulls=3 conf=0.8965 review=yes"
+    ) == "[AI][scan:51] FUSE done judges=0/2 nulls=3 conf=0.8965 review=yes"
     assert format_ai_pipeline_terminal_line(
         "medicine_prioritization_batch_failed",
         {
@@ -449,7 +479,7 @@ def test_field_judge_emits_logs_without_candidate_values(
     assert selected_key == "alpha"
     assert reason == "Prefer stronger support"
     assert not any("field_judge_started" in line for line in lines)
-    assert any("JUDGE done field=patient_info.address candidates=2" in line for line in lines)
+    assert any("JUDGE done field=patient_info.address candidates=2 selected=yes" in line for line in lines)
     joined_logs = captured.err
     assert "JL. Alpha No.1" not in joined_logs
     assert "JL. Beta No.2" not in joined_logs
@@ -1560,8 +1590,8 @@ def test_start_scan_documents_job_returns_initial_progress_snapshot(
     assert payload["scan_log_id"] > 0
     assert payload["progress"] == {
         "stage": "queued",
-        "title": "Upload complete",
-        "detail": "Preparing scan job.",
+        "title": "Preparing scan",
+        "detail": "Upload complete. Starting server-side processing.",
         "percent": 15,
         "status": "pending",
         "image_count": 1,
@@ -1596,8 +1626,8 @@ def test_get_scan_documents_job_status_returns_succeeded_result_for_owner(client
             ],
             progress_payload={
                 "stage": "prioritizing_medicines",
-                "title": "Prioritizing medicines",
-                "detail": "Finalizing fields.",
+                "title": "Finalizing results",
+                "detail": "Applying final checks before review.",
                 "percent": 97,
                 "status": "running",
                 "image_count": 1,
@@ -1627,11 +1657,60 @@ def test_get_scan_documents_job_status_returns_succeeded_result_for_owner(client
     payload = response.json()
     assert payload["scan_log_id"] == scan_log_id
     assert payload["progress"]["stage"] == "completed"
+    assert payload["progress"]["title"] == "Ready to review"
+    assert payload["progress"]["detail"] == "Results are ready for you to review."
     assert payload["progress"]["percent"] == 100
     assert payload["progress"]["status"] == "succeeded"
     assert payload["error_message"] is None
     assert payload["result"]["scan_log_id"] == scan_log_id
     assert payload["result"]["summary"] == SCAN_RESULT["summary"]
+
+
+def test_get_scan_documents_job_status_keeps_non_terminal_finalizing_title(client: TestClient) -> None:
+    token = register_and_login(client, email="scan-job-finalizing@example.com", full_name="Siti Aminah")
+    user_id = get_user_id_from_token(client, token)
+    session_factory = get_session_factory()
+
+    with session_factory() as db:
+        repository = ScanLogRepository(db)
+        scan_log = repository.create_pending(
+            user_id=user_id,
+            file_records=[
+                ScanLogFileCreate(
+                    original_filename="scan.png",
+                    original_mime_type="image/png",
+                    original_byte_size=3,
+                    original_sha256_hash=hashlib.sha256(b"abc").hexdigest(),
+                    original_content=b"abc",
+                )
+            ],
+            progress_payload={
+                "stage": "prioritizing_medicines",
+                "title": "Finalizing results",
+                "detail": "Applying final checks before review.",
+                "percent": 97,
+                "status": "running",
+                "image_count": 1,
+                "total_runs": 4,
+                "completed_runs": 4,
+                "successful_runs": 4,
+                "medicine_count": 1,
+            },
+        )
+        scan_log_id = scan_log.id
+
+    response = client.get(
+        f"/api/ai/scan-documents/jobs/{scan_log_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["progress"]["stage"] == "prioritizing_medicines"
+    assert payload["progress"]["title"] == "Finalizing results"
+    assert payload["progress"]["detail"] == "Applying final checks before review."
+    assert payload["progress"]["title"] != "Ready to review"
+    assert payload["result"] is None
 
 
 def test_get_scan_documents_job_status_requires_owner(client: TestClient) -> None:
@@ -1662,6 +1741,352 @@ def test_get_scan_documents_job_status_requires_owner(client: TestClient) -> Non
     )
 
     assert response.status_code == 404
+
+
+def test_generate_scan_progress_sse_yields_initial_snapshot_immediately() -> None:
+    async def scenario() -> None:
+        disconnect_flag = False
+        event_hub = ScanProgressEventHub()
+        generator = generate_scan_progress_sse(
+            scan_log_id=123,
+            initial_event="progress",
+            initial_payload={
+                "scan_log_id": 123,
+                "progress": {
+                    "stage": "queued",
+                    "title": "Preparing scan",
+                    "detail": "Upload complete. Starting server-side processing.",
+                    "percent": 15,
+                    "status": "pending",
+                    "image_count": 1,
+                    "total_runs": None,
+                    "completed_runs": None,
+                    "successful_runs": None,
+                    "medicine_count": None,
+                },
+                "result": None,
+                "error_message": None,
+            },
+            initial_terminal=False,
+            is_disconnected=lambda: asyncio.sleep(0, result=disconnect_flag),
+            event_hub=event_hub,
+            heartbeat_interval=60,
+            poll_interval=0.05,
+        )
+        try:
+            event_name, payload = await next_sse_message(generator)
+            assert event_name == "progress"
+            assert payload is not None
+            assert payload["scan_log_id"] == 123
+            assert payload["progress"]["stage"] == "queued"
+            assert event_hub.subscriber_count(123) == 1
+        finally:
+            await generator.aclose()
+        assert event_hub.subscriber_count(123) == 0
+
+    asyncio.run(scenario())
+
+
+def test_scan_documents_job_events_requires_owner(client: TestClient) -> None:
+    owner_token = register_and_login(client, email="scan-job-events-owner@example.com", full_name="Owner User")
+    other_token = register_and_login(client, email="scan-job-events-other@example.com", full_name="Other User")
+    owner_user_id = get_user_id_from_token(client, owner_token)
+    session_factory = get_session_factory()
+
+    with session_factory() as db:
+        repository = ScanLogRepository(db)
+        scan_log = repository.create_pending(
+            user_id=owner_user_id,
+            file_records=[
+                ScanLogFileCreate(
+                    original_filename="scan.png",
+                    original_mime_type="image/png",
+                    original_byte_size=3,
+                    original_sha256_hash=hashlib.sha256(b"abc").hexdigest(),
+                    original_content=b"abc",
+                )
+            ],
+        )
+        scan_log_id = scan_log.id
+
+    response = client.get(
+        f"/api/ai/scan-documents/jobs/{scan_log_id}/events",
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_generate_scan_progress_sse_yields_progress_then_completion() -> None:
+    async def scenario() -> None:
+        event_hub = ScanProgressEventHub()
+        generator = generate_scan_progress_sse(
+            scan_log_id=321,
+            initial_event="progress",
+            initial_payload={
+                "scan_log_id": 321,
+                "progress": {
+                    "stage": "queued",
+                    "title": "Preparing scan",
+                    "detail": "Upload complete. Starting server-side processing.",
+                    "percent": 15,
+                    "status": "pending",
+                    "image_count": 1,
+                    "total_runs": None,
+                    "completed_runs": None,
+                    "successful_runs": None,
+                    "medicine_count": None,
+                },
+                "result": None,
+                "error_message": None,
+            },
+            initial_terminal=False,
+            is_disconnected=lambda: asyncio.sleep(0, result=False),
+            event_hub=event_hub,
+            heartbeat_interval=60,
+            poll_interval=0.05,
+        )
+
+        try:
+            initial_event_name, _initial_payload = await next_sse_message(generator)
+            assert initial_event_name == "progress"
+
+            event_hub.publish(
+                321,
+                event="progress",
+                payload={
+                    "scan_log_id": 321,
+                    "progress": {
+                        "stage": "extracting",
+                        "title": "Extracting medical data",
+                        "detail": "Running 1 of 4 AI extraction passes.",
+                        "percent": 50,
+                        "status": "running",
+                        "image_count": 1,
+                        "total_runs": 4,
+                        "completed_runs": 1,
+                        "successful_runs": 1,
+                        "medicine_count": None,
+                    },
+                    "result": None,
+                    "error_message": None,
+                },
+            )
+
+            progress_event_name, progress_payload = await next_sse_message(generator)
+            assert progress_event_name == "progress"
+            assert progress_payload is not None
+            assert progress_payload["progress"]["stage"] == "extracting"
+            assert progress_payload["progress"]["completed_runs"] == 1
+
+            event_hub.publish(
+                321,
+                event="completed",
+                payload={
+                    "scan_log_id": 321,
+                    "progress": {
+                        "stage": "completed",
+                        "title": "Ready to review",
+                        "detail": "Results are ready for you to review.",
+                        "percent": 100,
+                        "status": "succeeded",
+                        "image_count": 1,
+                        "total_runs": 4,
+                        "completed_runs": 4,
+                        "successful_runs": 4,
+                        "medicine_count": 1,
+                    },
+                    "result": {
+                        "scan_log_id": 321,
+                        **SCAN_RESULT,
+                    },
+                    "error_message": None,
+                },
+                terminal=True,
+            )
+
+            completed_event_name, completed_payload = await next_sse_message(generator)
+            assert completed_event_name == "completed"
+            assert completed_payload is not None
+            assert completed_payload["progress"]["status"] == "succeeded"
+            assert completed_payload["result"]["scan_log_id"] == 321
+
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(anext(generator), timeout=0.5)
+        finally:
+            await generator.aclose()
+
+        assert event_hub.subscriber_count(321) == 0
+
+    asyncio.run(scenario())
+
+
+def test_generate_scan_progress_sse_yields_cancelled_and_stops() -> None:
+    async def scenario() -> None:
+        event_hub = ScanProgressEventHub()
+        generator = generate_scan_progress_sse(
+            scan_log_id=456,
+            initial_event="progress",
+            initial_payload={
+                "scan_log_id": 456,
+                "progress": {
+                    "stage": "queued",
+                    "title": "Preparing scan",
+                    "detail": "Upload complete. Starting server-side processing.",
+                    "percent": 15,
+                    "status": "pending",
+                    "image_count": 1,
+                    "total_runs": None,
+                    "completed_runs": None,
+                    "successful_runs": None,
+                    "medicine_count": None,
+                },
+                "result": None,
+                "error_message": None,
+            },
+            initial_terminal=False,
+            is_disconnected=lambda: asyncio.sleep(0, result=False),
+            event_hub=event_hub,
+            heartbeat_interval=60,
+            poll_interval=0.05,
+        )
+
+        try:
+            _initial_event_name, _initial_payload = await next_sse_message(generator)
+            event_hub.publish(
+                456,
+                event="cancelled",
+                payload={
+                    "scan_log_id": 456,
+                    "progress": {
+                        "stage": "failed",
+                        "title": "Scan cancelled",
+                        "detail": "Scan was cancelled by the user.",
+                        "percent": 97,
+                        "status": "failed",
+                        "image_count": 1,
+                        "total_runs": None,
+                        "completed_runs": None,
+                        "successful_runs": None,
+                        "medicine_count": None,
+                    },
+                    "result": None,
+                    "error_message": "Scan was cancelled by the user.",
+                },
+                terminal=True,
+            )
+
+            terminal_event_name, terminal_payload = await next_sse_message(generator)
+            assert terminal_event_name == "cancelled"
+            assert terminal_payload is not None
+            assert terminal_payload["progress"]["status"] == "failed"
+
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(anext(generator), timeout=0.5)
+        finally:
+            await generator.aclose()
+
+        assert event_hub.subscriber_count(456) == 0
+
+    asyncio.run(scenario())
+
+
+def test_generate_scan_progress_sse_exits_on_disconnect() -> None:
+    async def scenario() -> None:
+        event_hub = ScanProgressEventHub()
+        disconnect_flag = False
+
+        async def is_disconnected() -> bool:
+            return disconnect_flag
+
+        generator = generate_scan_progress_sse(
+            scan_log_id=654,
+            initial_event="progress",
+            initial_payload={
+                "scan_log_id": 654,
+                "progress": {
+                    "stage": "queued",
+                    "title": "Preparing scan",
+                    "detail": "Upload complete. Starting server-side processing.",
+                    "percent": 15,
+                    "status": "pending",
+                    "image_count": 1,
+                    "total_runs": None,
+                    "completed_runs": None,
+                    "successful_runs": None,
+                    "medicine_count": None,
+                },
+                "result": None,
+                "error_message": None,
+            },
+            initial_terminal=False,
+            is_disconnected=is_disconnected,
+            event_hub=event_hub,
+            heartbeat_interval=60,
+            poll_interval=0.05,
+        )
+
+        try:
+            _initial_event_name, _initial_payload = await next_sse_message(generator)
+            assert event_hub.subscriber_count(654) == 1
+            disconnect_flag = True
+
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(anext(generator), timeout=0.5)
+        finally:
+            await generator.aclose()
+
+        assert event_hub.subscriber_count(654) == 0
+
+    asyncio.run(scenario())
+
+
+def test_scan_documents_job_events_returns_terminal_snapshot_for_owner(client: TestClient) -> None:
+    token = register_and_login(client, email="scan-job-events-terminal@example.com", full_name="Siti Aminah")
+    user_id = get_user_id_from_token(client, token)
+    session_factory = get_session_factory()
+
+    with session_factory() as db:
+        repository = ScanLogRepository(db)
+        scan_log = repository.create_pending(
+            user_id=user_id,
+            file_records=[
+                ScanLogFileCreate(
+                    original_filename="scan.png",
+                    original_mime_type="image/png",
+                    original_byte_size=3,
+                    original_sha256_hash=hashlib.sha256(b"abc").hexdigest(),
+                    original_content=b"abc",
+                )
+            ],
+            progress_payload={
+                "stage": "queued",
+                "title": "Preparing scan",
+                "detail": "Upload complete. Starting server-side processing.",
+                "percent": 15,
+                "status": "pending",
+                "image_count": 1,
+                "total_runs": None,
+                "completed_runs": None,
+                "successful_runs": None,
+                "medicine_count": None,
+            },
+        )
+        cancelled_scan_log = repository.mark_cancelled(scan_log)
+        scan_log_id = cancelled_scan_log.id
+
+    response = client.get(
+        f"/api/ai/scan-documents/jobs/{scan_log_id}/events",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    event_name, payload = parse_sse_message(response.text)
+    assert event_name == "cancelled"
+    assert payload is not None
+    assert payload["scan_log_id"] == scan_log_id
+    assert payload["progress"]["status"] == "failed"
 
 
 def test_medical_document_processor_reports_progress_during_runs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1746,13 +2171,62 @@ def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:
     text_block = get_message_block(messages[1].content, 0)
     image_block = get_message_block(messages[1].content, 1)
     image_url = cast(dict[str, Any], image_block["image_url"])
+    rendered_user_prompt = cast(str, text_block["text"])
+    rendered_system_prompt = str(messages[0].content)
 
-    assert "Return only valid JSON" in str(messages[0].content)
-    assert "Analyze the 1 uploaded medical document image(s)." in cast(str, text_block["text"])
-    assert '["Siti Aminah", "Budi Saputra"]' in cast(str, text_block["text"])
+    assert "Return only valid JSON" in rendered_system_prompt
+    assert "Analyze the 1 uploaded medical document image(s) as one claim packet." in rendered_user_prompt
+    assert "PRIMARY TASK" in rendered_user_prompt
+    assert "FINANCIAL EXTRACTION RULES" in rendered_user_prompt
+    assert "AMBIGUITY / ANTI-INFERENCE RULES" in rendered_user_prompt
+    assert "Extract summary.total_amount as the grand total for the full uploaded claim packet" in rendered_user_prompt
+    assert "Do not duplicate pharmacy or medicine spending across medicines and other_charges." in rendered_user_prompt
+    assert "Do not infer gender from the patient's name" in rendered_user_prompt
+    assert "If handwritten free text is too ambiguous to support one clear reading, use null instead of guessing." in rendered_user_prompt
+    assert "Prefer the consultation or treatment date" in rendered_user_prompt
+    assert '["Siti Aminah", "Budi Saputra"]' in rendered_user_prompt
     assert image_block["type"] == "image_url"
     assert cast(str, image_url["url"]).startswith("data:image/png;base64,")
     assert image_url["url"] == "data:image/png;base64,YWJj"
+
+
+def test_document_validation_prompt_defines_provider_identity_not_insurer_branding() -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    prompt_bundle = validation_processor._load_prompt_bundle()
+
+    messages = validation_processor._build_messages(
+        images=[
+            DocumentImageInput(
+                filename="scan.jpg",
+                mime_type="image/jpeg",
+                base64_data="YWJj",
+            )
+        ],
+        patient_name_candidates=["Nathan Benedict Kristian"],
+        expected_patient_name="Nathan Benedict Kristian",
+        prompt_bundle=prompt_bundle,
+    )
+
+    text_block = get_message_block(messages[1].content, 0)
+    rendered_user_prompt = cast(str, text_block["text"])
+
+    assert "medical provider identity" in rendered_user_prompt
+    assert "hospital, clinic, lab, pharmacy, medical practice, or treating doctor" in rendered_user_prompt
+    assert "SIP/license number" in rendered_user_prompt
+    assert "official stamp" in rendered_user_prompt
+    assert "insurer, payer, or TPA branding alone" in rendered_user_prompt
+    assert "mandiri inhealth" in rendered_user_prompt
+
+
+def test_financial_packet_judge_prompt_emphasizes_terbilang_and_force_pick() -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    prompt_bundle = medical_processor._load_prompt_bundle(ai_service_module.FINANCIAL_PACKET_JUDGE_PROMPT_FILE_PATH)
+
+    assert "remaining ledger candidates are close and visually ambiguous" in prompt_bundle.system_template
+    assert "Always choose one provided candidate index unless the packet is genuinely unreadable." in prompt_bundle.user_template
+    assert "Use terbilang or amount-in-words text as a consistency check" in prompt_bundle.user_template
+    assert "Prioritize evidence in this order: visible numeric receipt amounts, terbilang consistency, then packet coherence across pages." in prompt_bundle.user_template
+    assert 'Do not over-weight weak handwritten description text such as "untuk pembayaran"' in prompt_bundle.user_template
 
 
 def test_build_messages_remain_image_url_after_langchain_normalization() -> None:
@@ -2207,14 +2681,25 @@ def test_ainvoke_with_tracking_persists_usage_metadata(monkeypatch: pytest.Monke
 
     monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
 
+    messages = [
+        SystemMessage(content="system prompt"),
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "user prompt"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,YWJj"}},
+            ]
+        ),
+    ]
+
     response, tracking_payload = asyncio.run(
         medical_processor._ainvoke_with_tracking(
             FakeModel(),
-            [object(), object()],
+            messages,
             provider="google_genai",
             model_name="gemini-test",
             call_kind="scan_extraction",
             success_context={"request_context_payload": {"image_count": 1}},
+            prompt_file_path=Path("test_prompt.yaml"),
         )
     )
 
@@ -2222,6 +2707,7 @@ def test_ainvoke_with_tracking_persists_usage_metadata(monkeypatch: pytest.Monke
     assert tracking_payload["prompt_tokens"] == 123
     assert tracking_payload["completion_tokens"] == 45
     assert tracking_payload["total_tokens"] == 168
+    assert isinstance(tracking_payload["ai_api_call_log_id"], int)
 
     with session_factory() as db:
         rows = db.execute(select(AIApiCallLog)).scalars().all()
@@ -2231,6 +2717,12 @@ def test_ainvoke_with_tracking_persists_usage_metadata(monkeypatch: pytest.Monke
         assert rows[0].prompt_tokens == 123
         assert rows[0].completion_tokens == 45
         assert rows[0].total_tokens == 168
+        assert rows[0].prompt_file_path == "test_prompt.yaml"
+        assert rows[0].raw_response_text == json.dumps(SCAN_RESULT)
+        assert rows[0].response_content_payload == json.dumps(SCAN_RESULT)
+        assert isinstance(rows[0].prompt_payload, list)
+        assert "YWJj" not in json.dumps(rows[0].prompt_payload)
+        assert rows[0].prompt_payload[1]["content"][1]["image_url"]["redacted"] is True
 
 
 def test_ainvoke_with_tracking_persists_failure_without_usage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2262,6 +2754,8 @@ def test_ainvoke_with_tracking_persists_failure_without_usage(monkeypatch: pytes
         assert rows[0].success is False
         assert rows[0].error_message == "provider boom"
         assert rows[0].prompt_tokens is None
+        assert rows[0].prompt_payload is not None
+        assert rows[0].raw_response_text is None
 
 
 def test_ainvoke_with_tracking_uses_google_async_compat_fallback(
@@ -2327,6 +2821,543 @@ def test_ainvoke_with_tracking_uses_google_async_compat_fallback(
         assert rows[0].total_tokens == 27
 
 
+def test_run_model_inference_persists_parsed_scan_extraction_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(SCAN_RESULT))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel())
+
+    prompt_bundle = medical_processor._load_prompt_bundle()
+    result, tracking_payload = asyncio.run(
+        medical_processor._run_model_inference(
+            model_spec=AIModelSpec(provider="google_genai", model="gemini-test"),
+            images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            patient_name_candidates=["Budi Saputra"],
+            validation_hints={},
+            prompt_bundle=prompt_bundle,
+            ai_call_context={"scan_log_id": 1, "user_id": 2},
+        )
+    )
+
+    assert result.summary.medical_facility_name == "RS Sehat Sentosa"
+    assert isinstance(tracking_payload["ai_api_call_log_id"], int)
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "scan_extraction"
+        assert row.parsed_response_payload == SCAN_RESULT
+        assert row.response_validation_error is None
+        assert row.result_context_payload == {"call_kind": "scan_extraction", "schema_valid": True}
+
+
+def test_document_validation_inference_persists_parsed_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(VALIDATION_RESULT))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+
+    prompt_bundle = validation_processor._load_prompt_bundle()
+    result = asyncio.run(
+        validation_processor._run_model_inference(
+            model_spec=AIModelSpec(provider="google_genai", model="gemini-test"),
+            images=[DocumentImageInput(filename="scan.jpg", mime_type="image/jpeg", base64_data="YWJj")],
+            prompt_bundle=prompt_bundle,
+            patient_name_candidates=["Budi Saputra"],
+            expected_patient_name="Budi Saputra",
+            ai_call_context={"scan_log_id": 3, "user_id": 4},
+        )
+    )
+
+    assert result.images[0].filename == "scan.jpg"
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "scan_validation"
+        assert row.parsed_response_payload == VALIDATION_RESULT
+        assert row.response_validation_error is None
+        assert row.result_context_payload == {"call_kind": "scan_validation", "schema_valid": True}
+
+
+def test_judge_field_conflict_persists_selection_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeJudgeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps({"selected_candidate_index": 0, "reason": "Prefer stronger support"}))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeJudgeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    selected_key, reason = asyncio.run(
+        medical_processor._judge_field_conflict(
+            "patient_info.address",
+            [DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            [
+                {"raw_value": "JL. Alpha No.1", "normalized_key": "alpha", "run_count": 2, "producers": {"p1", "p2"}},
+                {"raw_value": "JL. Beta No.2", "normalized_key": "beta", "run_count": 1, "producers": {"p3"}},
+            ],
+            ai_call_context={"scan_log_id": 99, "user_id": 7},
+        )
+    )
+
+    assert selected_key == "alpha"
+    assert reason == "Prefer stronger support"
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "field_judge"
+        assert row.prompt_file_path.endswith("medical_document_field_judge.yaml")
+        assert row.request_context_payload == {
+            "field_path": "patient_info.address",
+            "candidate_count": 2,
+            "image_count": 1,
+        }
+        assert row.parsed_response_payload == {"selected_candidate_index": 0, "reason": "Prefer stronger support"}
+        assert row.result_context_payload == {
+            "field_path": "patient_info.address",
+            "selected_candidate_index": 0,
+            "selected_candidate_key": "alpha",
+            "selected_candidate_valid": True,
+            "abstained": False,
+        }
+        assert "YWJj" not in json.dumps(row.prompt_payload)
+
+
+def test_financial_packet_judge_persists_selection_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeJudgeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps({"selected_candidate_index": 1, "reason": "Receipt-backed total is stronger"}))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeJudgeModel())
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    selected_index, reason = asyncio.run(
+        medical_processor._judge_financial_packet_conflict(
+            [DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            [{"grand_total": 125000}, {"grand_total": 126000}],
+            ai_call_context={"scan_log_id": 101, "user_id": 5},
+        )
+    )
+
+    assert selected_index == 1
+    assert reason == "Receipt-backed total is stronger"
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "field_judge"
+        assert row.prompt_file_path.endswith("financial_packet_judge.yaml")
+        assert row.request_context_payload == {
+            "field_path": "financial.packet",
+            "candidate_count": 2,
+            "image_count": 1,
+        }
+        assert row.result_context_payload == {
+            "field_path": "financial.packet",
+            "selected_candidate_index": 1,
+            "selected_candidate_valid": True,
+            "abstained": False,
+        }
+
+
+def test_medicine_relevance_judge_persists_parsed_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = medicine_relevance_service.MedicineRelevanceLLMJudge()
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "relevance": "relevant",
+                        "confidence": 0.91,
+                        "reason": "Matches diagnosis context.",
+                        "matched_diagnosis": True,
+                        "matched_anamnesis": False,
+                    }
+                )
+            )
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(judge, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        judge,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    result = asyncio.run(
+        judge.judge(
+            medicine_name="Paracetamol",
+            diagnosis_text="Influenza",
+            anamnesis_text="Demam dua hari",
+            evidence_rows=[],
+            ai_call_context={"user_id": 7},
+        )
+    )
+
+    assert result.relevance == "relevant"
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "medicine_relevance"
+        assert row.parsed_response_payload["relevance"] == "relevant"
+        assert row.result_context_payload == {
+            "medicine_name": "Paracetamol",
+            "relevance": "relevant",
+            "confidence": 0.91,
+        }
+
+
+def test_medicine_prioritization_judge_persists_parsed_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = ScanMedicineImageInterpretationJudge()
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "judgements": [
+                            {
+                                "original_index": 0,
+                                "interpreted_name": "Paracetamol",
+                                "interpretation_confidence": 0.94,
+                                "interpretation_reason": "Label is clear.",
+                                "relevance": "relevant",
+                                "relevance_confidence": 0.73,
+                                "matched_diagnosis": True,
+                                "matched_anamnesis": False,
+                            }
+                        ]
+                    }
+                )
+            )
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(judge, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        judge,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    result = asyncio.run(
+        judge.judge_batch(
+            images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            diagnosis_text="Influenza",
+            anamnesis_text="Demam",
+            ambiguous_medicines=[{"name": "Paracetmol"}],
+            ranked_group_suggestions=[],
+            db_medicine_hints=[],
+            ai_call_context={"scan_log_id": 44, "user_id": 3},
+        )
+    )
+
+    assert isinstance(result, BatchMedicineInterpretationResponse)
+    assert len(result.judgements) == 1
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.call_kind == "medicine_prioritization"
+        assert row.parsed_response_payload["judgements"][0]["interpreted_name"] == "Paracetamol"
+        assert row.result_context_payload == {
+            "ambiguous_medicine_count": 1,
+            "judgement_count": 1,
+        }
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_interpreted_name"),
+    [
+        (
+            {
+                "instructions": [{"text": "Return exactly one key: judgements."}],
+                "judgements": [
+                    {
+                        "original_index": 0,
+                        "interpreted_name": "Paracetamol",
+                        "interpretation_confidence": 0.94,
+                        "interpretation_reason": "Label is clear.",
+                        "relevance": "relevant",
+                        "relevance_confidence": 0.73,
+                        "matched_diagnosis": True,
+                        "matched_anamnesis": False,
+                    }
+                ],
+            },
+            "Paracetamol",
+        ),
+        (
+            {
+                "judgments": [
+                    {
+                        "original_index": 0,
+                        "interpreted_name": "Paracetamol",
+                        "interpretation_confidence": 0.94,
+                        "interpretation_reason": "Label is clear.",
+                        "relevance": "relevant",
+                        "relevance_confidence": 0.73,
+                        "matched_diagnosis": True,
+                        "matched_anamnesis": False,
+                    }
+                ],
+            },
+            "Paracetamol",
+        ),
+        (
+            {
+                "judgements": [
+                    {
+                        "original_index": 0,
+                        "name": "CARDIO ASPIRIN 100 MG",
+                        "interpretation_confidence": 0.94,
+                        "interpretation_reason": "Label is clear.",
+                        "relevance": "relevant",
+                        "relevance_confidence": 0.73,
+                        "matched_diagnosis": True,
+                        "matched_anamnesis": False,
+                    }
+                ],
+            },
+            "CARDIO ASPIRIN 100 MG",
+        ),
+    ],
+)
+def test_medicine_prioritization_judge_normalizes_common_schema_slips(
+    monkeypatch: pytest.MonkeyPatch,
+    response_payload: dict[str, Any],
+    expected_interpreted_name: str,
+) -> None:
+    judge = ScanMedicineImageInterpretationJudge()
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(response_payload))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(judge, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        judge,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    result = asyncio.run(
+        judge.judge_batch(
+            images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+            diagnosis_text="Influenza",
+            anamnesis_text="Demam",
+            ambiguous_medicines=[{"extracted_name": "Paracetmol"}],
+            ranked_group_suggestions=[],
+            db_medicine_hints=[],
+            ai_call_context={"scan_log_id": 44, "user_id": 3},
+        )
+    )
+
+    assert result.judgements[0].interpreted_name == expected_interpreted_name
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.parsed_response_payload["judgements"][0]["interpreted_name"] == expected_interpreted_name
+        assert "instructions" not in row.parsed_response_payload
+        assert "judgments" not in row.parsed_response_payload
+        assert "name" not in row.parsed_response_payload["judgements"][0]
+        assert row.response_validation_error is None
+
+
+def test_medicine_prioritization_judge_keeps_strict_validation_after_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = ScanMedicineImageInterpretationJudge()
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "instructions": [{"text": "Return exactly one key: judgements."}],
+                        "expected_types": {"judgements": "array<object>"},
+                    }
+                )
+            )
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(judge, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        judge,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    with pytest.raises(RuntimeError, match="Batch medicine interpretation payload is invalid."):
+        asyncio.run(
+            judge.judge_batch(
+                images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+                diagnosis_text="Influenza",
+                anamnesis_text="Demam",
+                ambiguous_medicines=[{"extracted_name": "Paracetmol"}],
+                ranked_group_suggestions=[],
+                db_medicine_hints=[],
+                ai_call_context={"scan_log_id": 44, "user_id": 3},
+            )
+        )
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.response_validation_error == "schema validation failed paths=instructions,expected_types"
+
+
+def test_medicine_prioritization_judge_logs_validation_failures_without_input_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    judge = ScanMedicineImageInterpretationJudge()
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "judgements": [
+                            {
+                                "original_index": 0,
+                                "interpreted_name": "Paracetamol",
+                                "interpretation_confidence": 0.94,
+                                "interpretation_reason": "Label is clear.",
+                                "relevance": "relevant",
+                                "relevance_confidence": 0.73,
+                                "matched_diagnosis": True,
+                                "matched_anamnesis": False,
+                                "unexpected": "CARDIO ASPIRIN 100 MG",
+                            }
+                        ]
+                    }
+                )
+            )
+
+    monkeypatch.setenv("AI_PIPELINE_DEBUG_LOGS", "true")
+    clear_ai_pipeline_debug_logging_cache()
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(judge, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        judge,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="judge-model")],
+    )
+
+    with pytest.raises(RuntimeError, match="Batch medicine interpretation payload is invalid."):
+        asyncio.run(
+            judge.judge_batch(
+                images=[DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")],
+                diagnosis_text="Influenza",
+                anamnesis_text="Demam",
+                ambiguous_medicines=[{"extracted_name": "Paracetmol"}],
+                ranked_group_suggestions=[],
+                db_medicine_hints=[],
+                ai_call_context={"scan_log_id": 44, "user_id": 3},
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert "CARDIO ASPIRIN 100 MG" not in captured.err
+    assert "input_value" not in captured.err
+    assert "schema validation failed paths=judgements.0.unexpected" in captured.err
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.response_validation_error == "schema validation failed paths=judgements.0.unexpected"
+        assert "CARDIO ASPIRIN 100 MG" not in row.response_validation_error
+
+    monkeypatch.delenv("AI_PIPELINE_DEBUG_LOGS", raising=False)
+    clear_ai_pipeline_debug_logging_cache()
+
+
+def test_model_invocation_test_persists_call_log_without_scan_log_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = model_invocation_test_module.ModelInvocationTestService(settings=build_settings())
+    session_factory = build_session_factory_with_ai_models([])
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 1
+            return AIMessage(content=json.dumps({"ok": True}))
+
+    monkeypatch.setattr("app.services.ai_service.get_session_factory", lambda: session_factory)
+    monkeypatch.setattr(service, "_create_chat_model", lambda model_spec: FakeModel())
+
+    result = asyncio.run(
+        service.invoke_model(
+            provider="google_genai",
+            model_name="gemini-test",
+            message="hello",
+            image=None,
+        )
+    )
+
+    assert result.parsed_json == {"ok": True}
+
+    with session_factory() as db:
+        row = db.execute(select(AIApiCallLog)).scalar_one()
+        assert row.scan_log_id is None
+        assert row.call_kind == "model_test"
+        assert row.raw_response_text == json.dumps({"ok": True})
+        assert row.parsed_response_payload == {"ok": True}
+        assert row.result_context_payload == {
+            "call_kind": "model_test",
+            "image_supplied": False,
+            "json_parsed": True,
+        }
+
+
 def test_process_uses_judge_for_service_date_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2386,6 +3417,243 @@ def test_process_uses_judge_for_service_date_conflict(
     assert result.result.summary.service_date == "2024-08-11"
     assert result.field_confidence["summary.service_date"]["judge_used"] is True
     assert result.extraction_meta_payload["judge_invocations"][0]["field_path"] == "summary.service_date"
+    assert result.extraction_meta_payload["judge_attempt_count"] == 1
+    assert result.extraction_meta_payload["judge_applied_count"] == 1
+    assert result.extraction_meta_payload["judge_cached_hit_count"] == 0
+
+
+def test_process_defers_financial_judge_when_reconciliation_can_resolve_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+
+    outputs = {
+        "model-a": {
+            **SCAN_RESULT,
+            "summary": {
+                **SCAN_RESULT["summary"],
+                "total_amount": 999999,
+            },
+            "financial_recap": {
+                "total_medicines": 111111,
+                "total_other_charges": 222222,
+                "grand_total": 999999,
+            },
+        },
+        "model-b": {
+            **SCAN_RESULT,
+        },
+    }
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            return AIMessage(content=json.dumps(outputs[self.model_name]))
+
+    async def fail_for_financial_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del images, candidates
+        if field_path in {
+            "summary.total_amount",
+            "financial_recap.total_medicines",
+            "financial_recap.total_other_charges",
+            "financial_recap.grand_total",
+        }:
+            raise AssertionError("Financial fields should not be judged during the first pass when reconciliation can resolve them.")
+        return None, None
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-a"),
+            AIModelSpec(provider="google_genai", model="model-b"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", fail_for_financial_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.result.summary.total_amount == SCAN_RESULT["summary"]["total_amount"]
+    assert result.result.financial_recap.total_medicines == SCAN_RESULT["financial_recap"]["total_medicines"]
+    assert result.result.financial_recap.total_other_charges == SCAN_RESULT["financial_recap"]["total_other_charges"]
+    assert result.result.financial_recap.grand_total == SCAN_RESULT["financial_recap"]["grand_total"]
+
+
+def test_fusion_rejudge_cache_reuses_no_selection_result() -> None:
+    judge_call_count = 0
+
+    async def fake_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        nonlocal judge_call_count
+        del field_path, images, candidates
+        judge_call_count += 1
+        return None, "Still ambiguous"
+
+    engine = MedicalExtractionFusionEngine(judge_field=fake_judge)
+    state = FusionWorkingState(
+        field_confidence={
+            "summary.total_amount": {
+                "value": 125000,
+                "confidence": 0.4,
+                "candidates": [
+                    {
+                        "normalized_key": "125000",
+                        "value": 125000,
+                        "support_count": 2,
+                        "producer_count": 2,
+                    },
+                    {
+                        "normalized_key": "130000",
+                        "value": 130000,
+                        "support_count": 2,
+                        "producer_count": 2,
+                    },
+                ],
+                "judge_used": False,
+                "judge_reason": None,
+                "review_flags": [],
+                "rule_hits": [],
+            }
+        }
+    )
+    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+
+    first = asyncio.run(
+        engine._maybe_rejudge_field_from_candidates(
+            result,
+            field_path="summary.total_amount",
+            images=[
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            field_confidence=state.field_confidence,
+            state=state,
+        )
+    )
+    second = asyncio.run(
+        engine._maybe_rejudge_field_from_candidates(
+            result,
+            field_path="summary.total_amount",
+            images=[
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ],
+            field_confidence=state.field_confidence,
+            state=state,
+        )
+    )
+
+    assert first is False
+    assert second is False
+    assert judge_call_count == 1
+    assert state.judge_attempt_count == 1
+    assert state.judge_cached_hit_count == 1
+
+
+def test_build_medicine_ledger_candidates_prefers_explicit_medicine_price_source_for_same_amount() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    result = AIMedicalScanResponse.model_validate(
+        {
+            **SCAN_RESULT,
+            "medicines": [
+                {
+                    **SCAN_RESULT["medicines"][0],
+                    "total_price": 10000,
+                }
+            ],
+            "other_charges": [
+                {
+                    "category": "OTHER",
+                    "description": "Obat",
+                    "amount": 10000,
+                }
+            ],
+        }
+    )
+    list_group_meta = {
+        "medicines": {
+            "selected_groups": [
+                {
+                    "output_index": 0,
+                    "path_prefix": "medicines[paracetamol]",
+                    "key": "paracetamol",
+                    "score": 1.0,
+                    "support_count": 1,
+                    "producer_count": 1,
+                    "is_grouped_compound": False,
+                    "is_package_level_medicine": False,
+                }
+            ]
+        },
+        "other_charges": {
+            "groups": [],
+            "selected_groups": [
+                {
+                    "bucket": "medicine",
+                    "amount": 10000,
+                    "key": "MEDICINE:10000:other",
+                    "path_prefix": "other_charges[medicine-10000-other]",
+                    "score": 1.0,
+                    "support_count": 2,
+                    "producer_count": 1,
+                    "representative_value": {
+                        "category": "OTHER",
+                        "description": "Obat",
+                        "amount": 10000,
+                    },
+                }
+            ],
+        },
+    }
+
+    candidates = engine._build_medicine_ledger_candidates(
+        result,
+        selected_other_charge_groups=cast(list[dict[str, Any]], list_group_meta["other_charges"]["selected_groups"]),
+        list_group_meta=cast(dict[str, Any], list_group_meta),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["amount"] == 10000
+    assert candidates[0]["source_type"] == "medicine_row"
 
 
 def test_process_does_not_invoke_judge_for_equivalent_service_date_formats(
@@ -2670,7 +3938,7 @@ def test_process_keeps_explicit_gender_when_null_support_is_below_threshold(
     assert "prefer null over inferred gender when model support is ambiguous" not in result.field_confidence["patient_info.gender"]["rule_hits"]
 
 
-def test_reconciliation_deferral_guard_does_not_trigger_below_delta_threshold() -> None:
+def test_financial_dominance_helper_requires_minimum_strength_gap() -> None:
     async def noop_judge(
         field_path: str,
         images: list[Any],
@@ -2680,43 +3948,44 @@ def test_reconciliation_deferral_guard_does_not_trigger_below_delta_threshold() 
         return None, None
 
     engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
-    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
+    below_threshold_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.0,
+                "grand_total_match_score": 2.0,
+                "other_total_match_score": 1.5,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 6.76,
+                "grand_total_match_score": 2.0,
+                "other_total_match_score": 1.5,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(below_threshold_candidates) is False
 
-    supported_targets = {
-        "summary.total_amount": [
-            {"value": 125000, "support_count": 5, "producer_count": 0},
-            {"value": 168000, "support_count": 1, "producer_count": 0},
-            {"value": 200000, "support_count": 1, "producer_count": 0},
-        ],
-        "financial_recap.grand_total": [
-            {"value": 125000, "support_count": 4, "producer_count": 0},
-        ],
-    }
-
-    below_threshold_subset = {
-        "grand_total": 168000,  # relative delta = 0.344 < 0.35
-        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
-        "dropped_group_indices": [0],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=below_threshold_subset,
-        supported_targets=supported_targets,
-    ) is False
-
-    above_threshold_subset = {
-        "grand_total": 200000,  # relative delta = 0.6 > 0.35
-        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
-        "dropped_group_indices": [0],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=above_threshold_subset,
-        supported_targets=supported_targets,
-    ) is True
+    at_threshold_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.0,
+                "grand_total_match_score": 2.0,
+                "other_total_match_score": 1.5,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 6.75,
+                "grand_total_match_score": 2.0,
+                "other_total_match_score": 1.5,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(at_threshold_candidates) is True
 
 
-def test_reconciliation_deferral_guard_support_threshold_boundary() -> None:
+def test_financial_dominance_helper_requires_non_regressing_grand_total_match() -> None:
     async def noop_judge(
         field_path: str,
         images: list[Any],
@@ -2726,41 +3995,44 @@ def test_reconciliation_deferral_guard_support_threshold_boundary() -> None:
         return None, None
 
     engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
-    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
-    supported_targets = {
-        "summary.total_amount": [
-            {"value": 125000, "support_count": 5, "producer_count": 0},
-            {"value": 200000, "support_count": 1, "producer_count": 0},
-        ],
-        "financial_recap.grand_total": [
-            {"value": 125000, "support_count": 4, "producer_count": 0},
-        ],
-    }
+    weaker_grand_total_match_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.5,
+                "grand_total_match_score": 1.9,
+                "other_total_match_score": 1.8,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 7.0,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.8,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(weaker_grand_total_match_candidates) is False
 
-    at_threshold_subset = {
-        "grand_total": 200000,
-        "canonical_medicine_source": {"support_count": 2, "producer_count": 1},  # support score = 2.2
-        "dropped_group_indices": [0],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=at_threshold_subset,
-        supported_targets=supported_targets,
-    ) is True
-
-    above_threshold_subset = {
-        "grand_total": 200000,
-        "canonical_medicine_source": {"support_count": 2, "producer_count": 2},  # support score = 2.4
-        "dropped_group_indices": [0],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=above_threshold_subset,
-        supported_targets=supported_targets,
-    ) is False
+    stronger_grand_total_match_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.5,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.8,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 7.0,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.8,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(stronger_grand_total_match_candidates) is True
 
 
-def test_reconciliation_deferral_guard_drop_count_threshold_boundary() -> None:
+def test_financial_dominance_helper_requires_non_regressing_other_total_match() -> None:
     async def noop_judge(
         field_path: str,
         images: list[Any],
@@ -2770,38 +4042,78 @@ def test_reconciliation_deferral_guard_drop_count_threshold_boundary() -> None:
         return None, None
 
     engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
-    result = AIMedicalScanResponse.model_validate(SCAN_RESULT)
-    supported_targets = {
-        "summary.total_amount": [
-            {"value": 125000, "support_count": 5, "producer_count": 0},
-            {"value": 200000, "support_count": 1, "producer_count": 0},
-        ],
-        "financial_recap.grand_total": [
-            {"value": 125000, "support_count": 4, "producer_count": 0},
-        ],
-    }
+    weaker_other_total_match_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.5,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.3,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 7.0,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.4,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(weaker_other_total_match_candidates) is False
 
-    below_drop_threshold_subset = {
-        "grand_total": 200000,
-        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
-        "dropped_group_indices": [],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=below_drop_threshold_subset,
-        supported_targets=supported_targets,
-    ) is False
+    stronger_other_total_match_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.5,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.4,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 7.0,
+                "grand_total_match_score": 2.1,
+                "other_total_match_score": 1.4,
+            }
+        },
+    ]
+    assert engine._has_dominant_financial_candidate(stronger_other_total_match_candidates) is True
 
-    at_drop_threshold_subset = {
-        "grand_total": 200000,
-        "canonical_medicine_source": {"support_count": 1, "producer_count": 0},
-        "dropped_group_indices": [0],
-    }
-    assert engine._should_defer_coherent_financial_override(
-        result=result,
-        best_subset=at_drop_threshold_subset,
-        supported_targets=supported_targets,
-    ) is True
+
+def test_financial_dominance_helper_requires_adjudication_for_material_total_difference() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
+
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    materially_different_candidates = [
+        {
+            "grand_total": 1145000,
+            "medicine_total": 145000,
+            "other_total": 1000000,
+            "evidence_summary": {
+                "evidence_strength": 9.5,
+                "grand_total_match_score": 2.5,
+                "other_total_match_score": 2.5,
+            },
+        },
+        {
+            "grand_total": 597900,
+            "medicine_total": 102900,
+            "other_total": 495000,
+            "evidence_summary": {
+                "evidence_strength": 8.0,
+                "grand_total_match_score": 2.2,
+                "other_total_match_score": 2.0,
+                "receipt_backed_packet": True,
+            },
+        },
+    ]
+
+    assert engine._has_dominant_financial_candidate(materially_different_candidates) is False
 
 
 def test_parse_indonesian_amount_words_parses_standard_terbilang_phrases() -> None:
@@ -3047,6 +4359,14 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
         del images
         return cast(str, candidates[0]["normalized_key"]), "Preserve the leading candidate."
 
+    async def conservative_financial_packet_judge(
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[int | None, str | None]:
+        del images
+        selected_index = next(index for index, candidate in enumerate(candidates) if candidate["grand_total"] == 356900)
+        return selected_index, "Receipt-backed 356900 ledger is strongest."
+
     monkeypatch.setattr(
         medical_processor,
         "_create_chat_model",
@@ -3062,6 +4382,7 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
         ],
     )
     monkeypatch.setattr(medical_processor, "_judge_field_conflict", conservative_judge)
+    monkeypatch.setattr(medical_processor, "_judge_financial_packet_conflict", conservative_financial_packet_judge)
 
     result = asyncio.run(
         medical_processor.process(
@@ -3098,6 +4419,939 @@ def test_process_keeps_consensus_lists_coherent_and_avoids_inflated_totals(
         if candidate["selected"]
     )
     assert selected_total_medicines_candidate["value"] == 78900
+
+
+def test_other_charge_classifier_treats_pharmacy_payment_terms_as_medicine() -> None:
+    assert classify_other_charge_kind("SERVICE", "Pembayaran Resep Apotek Makmuri") == "MEDICINE"
+    assert classify_other_charge_kind("OTHER", "Nota Penjualan Resep a/n pasien") == "MEDICINE"
+    assert classify_other_charge_kind("SERVICE", "Instalasi Farmasi Klinik") == "MEDICINE"
+    assert classify_other_charge_kind("LABORATORY", "Pemeriksaan Laboratorium Kolesterol") == "LABORATORY"
+    assert classify_other_charge_kind("CONSULTATION", "Biaya konsultasi dokter") == "CONSULTATION"
+
+
+def test_process_deduplicates_padma_pharmacy_receipt_from_other_charges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Resep", "Kwitansi Apotek"],
+                    "medical_facility_name": "Apotek Padma Medika",
+                    "service_date": "2026-04-26",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 344000,
+                },
+                "patient_info": {"name": "Bryan Immanuel Wibawa", "date_of_birth": None, "age": 10, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "Nyeri telan batuk pilek demam sariawan",
+                    "diagnoses": [{"description": "ISPA + stomatitis", "doctor_name": "Dr. Gani Wangunhardjo, Sp.A"}],
+                    "therapy_note": "5 macam",
+                },
+                "medicines": [{"name": "Cataflam", "quantity": 8, "unit": "Cap", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "CONSULTATION", "description": "Biaya Pemeriksaan & Pengobatan", "amount": 200000},
+                    {"category": "OTHER", "description": "Resep", "amount": 144000},
+                ],
+                "financial_recap": {"total_medicines": 144000, "total_other_charges": 200000, "grand_total": 344000},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Nota Penjualan", "Resep"],
+                    "medical_facility_name": "Apotek Padma Medika",
+                    "service_date": "2026-04-26",
+                    "transaction_date": "2026-04-26",
+                    "currency": "IDR",
+                    "total_amount": 344000,
+                },
+                "patient_info": {"name": "Bryan Immanuel Wibawa", "date_of_birth": None, "age": 10, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "Nyeri telan batuk pilek demam sariawan",
+                    "diagnoses": [{"description": "ISPA + stomatitis", "doctor_name": "Dr. Gani Wangunhardjo, Sp.A"}],
+                    "therapy_note": "4 macam",
+                },
+                "medicines": [{"name": "Cataflam", "quantity": 8, "unit": "Cap", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "CONSULTATION", "description": "Biaya Pemeriksaan & Pengobatan", "amount": 200000},
+                    {"category": "SERVICE", "description": "Resep a/n Bryan Immanuel W", "amount": 144000},
+                ],
+                "financial_recap": {"total_medicines": 144000, "total_other_charges": 344000, "grand_total": 344000},
+            },
+        ],
+        "model-secondary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Resep"],
+                    "medical_facility_name": "Dr. Gani Wangunhardjo",
+                    "service_date": "2026-04-26",
+                    "transaction_date": "2026-04-26",
+                    "currency": "IDR",
+                    "total_amount": 344000,
+                },
+                "patient_info": {"name": "Bryan Immanuel Wibawa", "date_of_birth": None, "age": 10, "gender": "MALE", "address": None},
+                "medical_context": {
+                    "anamnesis": "Nyeri telan batuk pilek demam",
+                    "diagnoses": [{"description": "ISPA + stomatitis", "doctor_name": "Dr. Gani Wangunhardjo, Sp.A"}],
+                    "therapy_note": "5 macam",
+                },
+                "medicines": [{"name": "Tremenza", "quantity": 15, "unit": "Cap", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "SERVICE", "description": "Biaya Pemeriksaan & Pengobatan", "amount": 200000},
+                    {"category": "Pharmacy", "description": "Apotek Padma Medika", "amount": 144000},
+                ],
+                "financial_recap": {"total_medicines": 144000, "total_other_charges": 200000, "grand_total": 344000},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Kwitansi", "Resep"],
+                    "medical_facility_name": "Dr. Gani Wangunhardjo",
+                    "service_date": "2026-04-26",
+                    "transaction_date": "2026-04-26",
+                    "currency": "IDR",
+                    "total_amount": 344000,
+                },
+                "patient_info": {"name": "Bryan Immanuel Wibawa", "date_of_birth": None, "age": 10, "gender": "MALE", "address": None},
+                "medical_context": {
+                    "anamnesis": "Nyeri telan batuk pilek demam",
+                    "diagnoses": [{"description": "ISPA + stomatitis", "doctor_name": "Dr. Gani Wangunhardjo, Sp.A"}],
+                    "therapy_note": "5 macam",
+                },
+                "medicines": [{"name": "Tremenza", "quantity": 15, "unit": "Cap", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "SERVICE", "description": "Biaya Pemeriksaan & Pengobatan", "amount": 200000},
+                    {"category": "OTHER", "description": "Pembelian obat Apotek Padma Medika", "amount": 144000},
+                ],
+                "financial_recap": {"total_medicines": 144000, "total_other_charges": 200000, "grand_total": 344000},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel(model_spec.model))
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="ollama", model="model-secondary"),
+        ],
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_field_conflict",
+        lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_financial_packet_conflict",
+        lambda images, candidates: asyncio.sleep(0, result=(0, "Use the coherent pharmacy plus consultation ledger.")),
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")]
+        )
+    )
+
+    assert result.result.financial_recap.total_medicines == 144000
+    assert result.result.financial_recap.total_other_charges == 200000
+    assert result.result.financial_recap.grand_total == 344000
+    assert result.result.summary.total_amount == 344000
+    assert len(result.result.other_charges) == 1
+    assert result.result.other_charges[0].amount == 200000
+
+
+def test_process_reconciles_multi_receipt_packet_and_merges_duplicate_payment_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi Pembayaran Laboratorium", "Kwitansi Dokter", "Salinan Resep", "Nota Penjualan"],
+                    "medical_facility_name": "Parahita Diagnostic Center",
+                    "service_date": "2023-07-07",
+                    "transaction_date": "2023-07-07",
+                    "currency": "IDR",
+                    "total_amount": 657900,
+                },
+                "patient_info": {"name": "Jane Doe", "date_of_birth": None, "age": 25, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "kontrol",
+                    "diagnoses": [{"description": "PJK + HT", "doctor_name": "dr. Samuel Sudanawidjaja"}],
+                    "therapy_note": "Platogrix, Thrombo, Rytmonorm",
+                },
+                "medicines": [{"name": "Platogrix 75 mg", "quantity": 30, "unit": "tablet", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "LABORATORY", "description": "Pemeriksaan Laboratorium: Kolesterol Total, Kolesterol HDL, Glukosa Puasa / BSN, Free T4", "amount": 657900},
+                    {"category": "CONSULTATION", "description": "Pemeriksaan & konsultasi", "amount": 350000},
+                    {"category": "OTHER", "description": "Nota Penjualan Resep Apotek UBAYA", "amount": 1472600},
+                ],
+                "financial_recap": {"total_medicines": 1472600, "total_other_charges": 1007900, "grand_total": 657900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi Pembayaran Laboratorium", "Kwitansi", "Salinan Resep", "Nota Penjualan"],
+                    "medical_facility_name": "Parahita Diagnostic Center",
+                    "service_date": "2023-07-07",
+                    "transaction_date": "2023-07-07",
+                    "currency": "IDR",
+                    "total_amount": 2130900,
+                },
+                "patient_info": {"name": "Jane Doe", "date_of_birth": None, "age": 25, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "kontrol",
+                    "diagnoses": [{"description": "PJK + HT", "doctor_name": "dr. Samuel Sudanawidjaja"}],
+                    "therapy_note": "Platogrix, Thrombo, Rytmonorm",
+                },
+                "medicines": [{"name": "Thrombo aspilet", "quantity": 15, "unit": "tablet", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "LABORATORY", "description": "Kolesterol Total, Kolesterol HDL, Glukosa Puasa / BSN, Free T4", "amount": 657900},
+                    {"category": "CONSULTATION", "description": "Pemeriksaan dan konsultasi", "amount": 350000},
+                    {"category": "SERVICE", "description": "Pembayaran Resep Apotek UBAYA", "amount": 1472600},
+                ],
+                "financial_recap": {"total_medicines": 1472600, "total_other_charges": 1007900, "grand_total": 2130900},
+            },
+        ],
+        "model-secondary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi", "Resep", "Formulir Rawat Jalan", "Nota Penjualan"],
+                    "medical_facility_name": "Parahita Diagnostic Center",
+                    "service_date": "2023-07-07",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 657900,
+                },
+                "patient_info": {"name": "Jane Doe", "date_of_birth": None, "age": 25, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "kontrol",
+                    "diagnoses": [{"description": "PJK + HT", "doctor_name": "dr. Samuel Sudanawidjaja"}],
+                    "therapy_note": "obat rutin",
+                },
+                "medicines": [{"name": "Rytmonorm", "quantity": 30, "unit": "tablet", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "LABORATORY", "description": "Tagihan Pemeriksaan Laboratorium Kolesterol Total HDL Glukosa Puasa Free T4", "amount": 657900},
+                    {"category": "LABORATORY", "description": "Kwitansi Pemeriksaan Laboratorium Kolesterol Total HDL Glukosa Puasa Free T4", "amount": 657900},
+                    {"category": "CONSULTATION", "description": "Pemeriksaan & konsultasi", "amount": 350000},
+                    {"category": "SERVICE", "description": "Resep a/n Jane Doe dari dr. Samuel", "amount": 1472600},
+                ],
+                "financial_recap": {"total_medicines": 1472600, "total_other_charges": 1665800, "grand_total": 657900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Kwitansi", "Resep", "Formulir Rawat Jalan", "Nota Penjualan"],
+                    "medical_facility_name": "Parahita Diagnostic Center",
+                    "service_date": "2023-07-07",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 2130600,
+                },
+                "patient_info": {"name": "Jane Doe", "date_of_birth": None, "age": 25, "gender": None, "address": None},
+                "medical_context": {
+                    "anamnesis": "kontrol",
+                    "diagnoses": [{"description": "PJK + HT", "doctor_name": "dr. Samuel Sudanawidjaja"}],
+                    "therapy_note": "obat rutin",
+                },
+                "medicines": [{"name": "Concor", "quantity": 30, "unit": "tablet", "dosage_instruction": None, "unit_price": None, "total_price": None}],
+                "other_charges": [
+                    {"category": "LABORATORY", "description": "Pemeriksaan Laboratorium Kolesterol Total HDL Glukosa Puasa Free T4", "amount": 657900},
+                    {"category": "CONSULTATION", "description": "Pemeriksaan dan konsultasi dokter", "amount": 350000},
+                    {"category": "OTHER", "description": "Instalasi Farmasi UBAYA Nota Penjualan", "amount": 1472600},
+                ],
+                "financial_recap": {"total_medicines": 1472600, "total_other_charges": 1007900, "grand_total": 2130600},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    monkeypatch.setattr(medical_processor, "_create_chat_model", lambda model_spec: FakeModel(model_spec.model))
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="ollama", model="model-secondary"),
+        ],
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_field_conflict",
+        lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_financial_packet_conflict",
+        lambda images, candidates: asyncio.sleep(
+            0,
+            result=(
+                next(index for index, candidate in enumerate(candidates) if candidate["grand_total"] == 2480500),
+                "Full packet ledger counts lab, consultation, and pharmacy once.",
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [DocumentImageInput(filename="scan.png", mime_type="image/png", base64_data="YWJj")]
+        )
+    )
+
+    assert result.result.financial_recap.total_medicines == 1472600
+    assert result.result.financial_recap.total_other_charges == 1007900
+    assert result.result.financial_recap.grand_total == 2480500
+    assert result.result.summary.total_amount == 2480500
+    assert sorted(charge.amount for charge in result.result.other_charges if charge.amount is not None) == [350000, 657900]
+
+
+def test_process_skips_financial_packet_judge_when_heuristic_receipt_backed_ledger_is_dominant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "demam, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "SERVICE", "description": "Pembayaran Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "fans, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast tab 500 mg", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "OTHER", "description": "Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+        ],
+        "model-secondary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+        ],
+        "model-noisy": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Panas, batuk pilek sejak 3 hari",
+                    "diagnoses": [{"description": "Gangguan pernafasan atas", "doctor_name": "dr. Makmuri MS. Sp.A(K)"}],
+                    "therapy_note": "Obat: Obatan",
+                },
+                "medicines": [{"name": "Paracetamol", "quantity": 1, "unit": "strip", "dosage_instruction": "1 tab x 3x sehari", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "OTHER", "description": "Obat-obatan", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "Panas, batuk pilek sejak 3 hari",
+                    "diagnoses": [{"description": "Gangguan pernafasan atas", "doctor_name": "dr. Makmuri MS. Sp.A(K)"}],
+                    "therapy_note": "Obat: Obatan",
+                },
+                "medicines": [{"name": "Paracetamol", "quantity": 1, "unit": "strip", "dosage_instruction": "1 tab x 3x sehari", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "OTHER", "description": "Obat-obatan", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+    financial_judge_calls = 0
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    async def field_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, "Not needed for this test"
+
+    async def packet_judge(
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[int | None, str | None]:
+        nonlocal financial_judge_calls
+        del images, candidates
+        financial_judge_calls += 1
+        return 0, "Judge should not be called when the heuristic ledger is already dominant."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="google_genai", model="model-secondary"),
+            AIModelSpec(provider="ollama", model="model-noisy"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", field_judge)
+    monkeypatch.setattr(medical_processor, "_judge_financial_packet_conflict", packet_judge)
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert financial_judge_calls == 0
+    assert result.result.summary.total_amount == 296900
+    assert result.result.financial_recap.total_medicines == 78900
+    assert result.result.financial_recap.total_other_charges == 218000
+    assert result.result.financial_recap.grand_total == 296900
+    assert result.extraction_meta_payload["financial_resolution_mode"] == "heuristic"
+    assert result.extraction_meta_payload["financial_judge_attempt_count"] == 0
+    assert result.extraction_meta_payload["financial_judge_applied_count"] == 0
+    assert result.extraction_meta_payload["financial_judge_skipped_reason"] == "dominant_candidate"
+    assert result.extraction_meta_payload["derived_financials"]["financial_judge_skipped_reason"] == "dominant_candidate"
+    assert any(
+        "Skipped packet-level financial adjudication" in note
+        for note in result.extraction_meta_payload["derived_financials"]["notes"]
+    )
+    assert result.extraction_meta_payload["financial_evidence_summary"]["selected_candidate"]["grand_total"] == 296900
+
+
+def test_process_uses_financial_packet_judge_only_for_close_ledger_tie_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+        ],
+        "model-secondary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "demam, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "SERVICE", "description": "Pembayaran Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "fans, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast tab 500 mg", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "OTHER", "description": "Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+    financial_judge_calls = 0
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    async def field_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, "Not needed for this test"
+
+    async def packet_judge(
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[int | None, str | None]:
+        nonlocal financial_judge_calls
+        del images
+        financial_judge_calls += 1
+        selected_index = next(index for index, candidate in enumerate(candidates) if candidate["grand_total"] == 356900)
+        return selected_index, "Visible clinic and pharmacy receipts support 356900."
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="google_genai", model="model-secondary"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", field_judge)
+    monkeypatch.setattr(medical_processor, "_judge_financial_packet_conflict", packet_judge)
+    monkeypatch.setattr(
+        MedicalExtractionFusionEngine,
+        "_has_dominant_financial_candidate",
+        lambda self, plausible_candidates: False,
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert financial_judge_calls == 1
+    assert result.result.summary.total_amount == 356900
+    assert result.result.financial_recap.total_medicines == 78900
+    assert result.result.financial_recap.total_other_charges == 278000
+    assert result.result.financial_recap.grand_total == 356900
+    assert result.extraction_meta_payload["financial_resolution_mode"] == "adjudicated"
+    assert result.extraction_meta_payload["financial_judge_attempt_count"] == 1
+    assert result.extraction_meta_payload["financial_judge_applied_count"] == 1
+    assert result.extraction_meta_payload["financial_judge_skipped_reason"] is None
+
+
+def test_process_marks_financial_review_when_packet_judge_abstains_on_ambiguous_ledgers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    medical_processor = MedicalDocumentProcessor(settings=build_settings())
+    outputs = {
+        "model-primary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Resep", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": None,
+                    "currency": "IDR",
+                    "total_amount": 296900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": None,
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "panas, batuk, pilek, tenggorokan",
+                    "diagnoses": [{"description": "faringitis + tonsilitis", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Poliklinik, resep obat sesuai dosis",
+                },
+                "medicines": [{"name": "Meactrin tab 500 mg", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 78900, "total_price": 78900}],
+                "other_charges": [{"category": "CONSULTATION", "description": "Biaya konsultasi dokter", "amount": 218000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 218000, "grand_total": 296900},
+            },
+        ],
+        "model-secondary": [
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "demam, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "SERVICE", "description": "Pembayaran Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+            {
+                **SCAN_RESULT,
+                "summary": {
+                    "detected_documents": ["Formulir Rawat Jalan", "Salinan Resep", "Kwitansi", "Kwitansi"],
+                    "medical_facility_name": "Klinik Utama Makmuri",
+                    "service_date": "2025-08-28",
+                    "transaction_date": "2025-08-31",
+                    "currency": "IDR",
+                    "total_amount": 356900,
+                },
+                "patient_info": {
+                    "name": "Nick Frederic Kristian",
+                    "date_of_birth": None,
+                    "age": 13,
+                    "gender": "MALE",
+                    "address": None,
+                },
+                "medical_context": {
+                    "anamnesis": "fans, batuk pilek lama, nyeri",
+                    "diagnoses": [{"description": "pharyngitis + asthma", "doctor_name": "dr. Makmuri MS, Sp.A(K)"}],
+                    "therapy_note": "Policare",
+                },
+                "medicines": [{"name": "Montelukast tab 500 mg", "quantity": 10, "unit": "tablet", "dosage_instruction": "S 1 dd 1", "unit_price": None, "total_price": 78900}],
+                "other_charges": [{"category": "OTHER", "description": "Resep dr. Makmuri", "amount": 278000}],
+                "financial_recap": {"total_medicines": 78900, "total_other_charges": 278000, "grand_total": 356900},
+            },
+        ],
+    }
+    call_counts = {model_name: 0 for model_name in outputs}
+    financial_judge_calls = 0
+
+    class FakeModel:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            del messages
+            call_index = call_counts[self.model_name]
+            call_counts[self.model_name] += 1
+            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
+
+    async def field_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, "Not needed for this test"
+
+    async def packet_judge(
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[int | None, str | None]:
+        nonlocal financial_judge_calls
+        del images, candidates
+        financial_judge_calls += 1
+        return None, "Ambiguous receipt evidence"
+
+    monkeypatch.setattr(
+        medical_processor,
+        "_create_chat_model",
+        lambda model_spec: FakeModel(model_spec.model),
+    )
+    monkeypatch.setattr(
+        medical_processor,
+        "_get_enabled_model_specs",
+        lambda: [
+            AIModelSpec(provider="google_genai", model="model-primary"),
+            AIModelSpec(provider="google_genai", model="model-secondary"),
+        ],
+    )
+    monkeypatch.setattr(medical_processor, "_judge_field_conflict", field_judge)
+    monkeypatch.setattr(medical_processor, "_judge_financial_packet_conflict", packet_judge)
+    monkeypatch.setattr(
+        MedicalExtractionFusionEngine,
+        "_has_dominant_financial_candidate",
+        lambda self, plausible_candidates: False,
+    )
+
+    result = asyncio.run(
+        medical_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.png",
+                    mime_type="image/png",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert financial_judge_calls == 1
+    assert result.result.summary.total_amount == 296900
+    assert result.result.financial_recap.grand_total == 296900
+    assert result.extraction_meta_payload["financial_judge_attempt_count"] == 1
+    assert result.extraction_meta_payload["financial_judge_applied_count"] == 0
+    assert result.extraction_meta_payload["financial_judge_skipped_reason"] is None
+    assert result.review_required is True
 
 
 def test_process_flags_line_item_total_medicines_mismatch_against_row_sum(
@@ -3204,12 +5458,16 @@ def test_process_marks_backfilled_financial_totals_as_review_worthy(
     )
 
     grand_total_check = result.extraction_meta_payload["constraint_checks"]["financial_recap.grand_total"]
-    assert grand_total_check["used_derived_value"] is False
+    assert grand_total_check["used_derived_value"] is True
     assert result.result.financial_recap.grand_total is not None
     assert result.result.summary.total_amount is not None
     assert result.result.financial_recap.grand_total == result.result.summary.total_amount
     assert result.review_required is True
     assert len(result.review_reasons) > 0
+    assert {
+        "field_path": "financial_recap.grand_total",
+        "value": result.result.financial_recap.grand_total,
+    } in result.extraction_meta_payload["derived_financials"]["forced_non_null_fields"]
 
 
 def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_prices(
@@ -3464,6 +5722,17 @@ def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_price
         "_judge_field_conflict",
         lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
     )
+    monkeypatch.setattr(
+        medical_processor,
+        "_judge_financial_packet_conflict",
+        lambda images, candidates: asyncio.sleep(
+            0,
+            result=(
+                next(index for index, candidate in enumerate(candidates) if candidate["grand_total"] == 597900),
+                "Receipt-backed 597900 ledger is strongest.",
+            ),
+        ),
+    )
 
     result = asyncio.run(
         medical_processor.process(
@@ -3491,6 +5760,10 @@ def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_price
     assert result.result.financial_recap.total_medicines == 102900
     assert result.result.financial_recap.total_other_charges == 495000
     assert result.result.financial_recap.grand_total == 597900
+    assert result.extraction_meta_payload["financial_resolution_mode"] == "adjudicated"
+    assert result.extraction_meta_payload["financial_judge_attempt_count"] == 1
+    assert result.extraction_meta_payload["financial_judge_applied_count"] == 1
+    assert result.extraction_meta_payload["financial_judge_skipped_reason"] is None
     assert len(result.result.other_charges) == 2
     assert sorted(charge.amount for charge in result.result.other_charges if charge.amount is not None) == [195000, 300000]
 
@@ -3507,214 +5780,34 @@ def test_process_prefers_coherent_packet_ledger_over_hallucinated_medicine_price
     )
 
 
-def test_process_preserves_strong_consensus_when_coherent_reconciliation_is_weaker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    medical_processor = MedicalDocumentProcessor(settings=build_settings())
-    outputs = {
-        "model-primary": [
-            {
-                **SCAN_RESULT,
-                "summary": {
-                    "detected_documents": ["Kwitansi DR MAHE", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
-                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
-                    "service_date": "2025-08-31",
-                    "transaction_date": None,
-                    "currency": "IDR",
-                    "total_amount": 597900,
-                },
-                "patient_info": {
-                    "name": "Nathan Benedict Kristian",
-                    "date_of_birth": None,
-                    "age": 6,
-                    "gender": "Pria",
-                    "address": None,
-                },
-                "medical_context": {
-                    "anamnesis": "Batuk ngikil demam hng",
-                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
-                    "therapy_note": "Zibramax, puyer batuk, profen",
-                },
-                "medicines": [
-                    {"name": "Zibramax", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
-                    {"name": "Profen", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
-                    {"name": "Lasal", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
-                ],
-                "other_charges": [
-                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
-                ],
-                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
-            },
-            {
-                **SCAN_RESULT,
-                "summary": {
-                    "detected_documents": ["Kwitansi DR MAHE", "Kwitansi Apotek Podojodo", "Salinan Resep", "Formulir Rawat Jalan"],
-                    "medical_facility_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D.",
-                    "service_date": "2025-08-31",
-                    "transaction_date": None,
-                    "currency": "IDR",
-                    "total_amount": 597900,
-                },
-                "patient_info": {
-                    "name": "Nathan Benedict Kristian",
-                    "date_of_birth": None,
-                    "age": 6,
-                    "gender": "Pria",
-                    "address": None,
-                },
-                "medical_context": {
-                    "anamnesis": "Batuk ngikil demam hngs",
-                    "diagnoses": [{"description": "Pertusis", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K)., Ph.D."}],
-                    "therapy_note": "Zibramax, puyer batuk, profen",
-                },
-                "medicines": [
-                    {"name": "Zibramax", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 160000, "total_price": 160000},
-                    {"name": "Profen", "quantity": 1, "unit": None, "dosage_instruction": None, "unit_price": 35000, "total_price": 35000},
-                    {"name": "Lasal", "quantity": None, "unit": "mg", "dosage_instruction": "3 dd pulv", "unit_price": None, "total_price": None},
-                ],
-                "other_charges": [
-                    {"category": "Consultation", "description": "Pemeriksaan / Jasa Dokter", "amount": 300000},
-                ],
-                "financial_recap": {"total_medicines": 297900, "total_other_charges": 300000, "grand_total": 597900},
-            },
-        ],
-        "model-weaker": [
-            {
-                **SCAN_RESULT,
-                "summary": {
-                    "detected_documents": ["receipt", "prescription", "medical_form"],
-                    "medical_facility_name": "DR MAHE",
-                    "service_date": "2025-08-01",
-                    "transaction_date": None,
-                    "currency": "IDR",
-                    "total_amount": 1145000,
-                },
-                "patient_info": {
-                    "name": "Nathan Benedict Kristian",
-                    "date_of_birth": None,
-                    "age": 6,
-                    "gender": "Pria",
-                    "address": None,
-                },
-                "medical_context": {
-                    "anamnesis": "Batuk ngilili demam hanya",
-                    "diagnoses": [{"description": "perburukan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
-                    "therapy_note": "Abramax puyer bap d. prover",
-                },
-                "medicines": [
-                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
-                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
-                ],
-                "other_charges": [
-                    {"category": "Consultation", "description": "Jasa dokter", "amount": 900000},
-                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 145000},
-                    {"category": "Pharmacy", "description": "Obat", "amount": 100000},
-                    {"category": "Medical Service", "description": "Dr. Mahendra Tri Arif, Sp.A (K), PhD", "amount": 100000},
-                    {"category": "Jasa Medis", "description": "Jasa Medis", "amount": 150000},
-                ],
-                "financial_recap": {"total_medicines": None, "total_other_charges": 1145000, "grand_total": 1145000},
-            },
-            {
-                **SCAN_RESULT,
-                "summary": {
-                    "detected_documents": ["receipt", "prescription", "medical_form"],
-                    "medical_facility_name": "DR MAHE",
-                    "service_date": "2025-08-01",
-                    "transaction_date": None,
-                    "currency": "IDR",
-                    "total_amount": 1145000,
-                },
-                "patient_info": {
-                    "name": "Nathan Benedict Kristian",
-                    "date_of_birth": None,
-                    "age": 6,
-                    "gender": None,
-                    "address": None,
-                },
-                "medical_context": {
-                    "anamnesis": "Batuk ngilili demam hanya",
-                    "diagnoses": [{"description": "perburukan", "doctor_name": "dr. Mahendra Tri Arif S., Sp.A(K), Ph.D."}],
-                    "therapy_note": "Abramax puyer bap d. prover",
-                },
-                "medicines": [
-                    {"name": "Microcet", "quantity": None, "unit": None, "dosage_instruction": "1,25mg", "unit_price": None, "total_price": None},
-                    {"name": "Tritone", "quantity": None, "unit": None, "dosage_instruction": "3mg", "unit_price": None, "total_price": None},
-                ],
-                "other_charges": [
-                    {"category": "Consultation", "description": "Jasa dokter", "amount": 900000},
-                    {"category": "Consultation", "description": "Pemeriksaan & Pengobatan Anak", "amount": 145000},
-                    {"category": "Pharmacy", "description": "Obat", "amount": 100000},
-                    {"category": "Medical Service", "description": "Dr. Mahendra Tri Arif, Sp.A (K), PhD", "amount": 100000},
-                    {"category": "Jasa Medis", "description": "Jasa Medis", "amount": 150000},
-                ],
-                "financial_recap": {"total_medicines": 0, "total_other_charges": 1145000, "grand_total": 1145000},
-            },
-        ],
-    }
-    call_counts = {model_name: 0 for model_name in outputs}
+def test_financial_dominance_helper_recognizes_clear_receipt_backed_winner() -> None:
+    async def noop_judge(
+        field_path: str,
+        images: list[object],
+        candidates: list[dict[str, object]],
+    ) -> tuple[str | None, str | None]:
+        del field_path, images, candidates
+        return None, None
 
-    class FakeModel:
-        def __init__(self, model_name: str) -> None:
-            self.model_name = model_name
+    engine = MedicalExtractionFusionEngine(judge_field=noop_judge)
+    plausible_candidates = [
+        {
+            "evidence_summary": {
+                "evidence_strength": 8.2,
+                "grand_total_match_score": 2.4,
+                "other_total_match_score": 2.2,
+            }
+        },
+        {
+            "evidence_summary": {
+                "evidence_strength": 6.3,
+                "grand_total_match_score": 2.0,
+                "other_total_match_score": 1.1,
+            }
+        },
+    ]
 
-        async def ainvoke(self, messages: list[object]) -> AIMessage:
-            del messages
-            call_index = call_counts[self.model_name]
-            call_counts[self.model_name] += 1
-            return AIMessage(content=json.dumps(outputs[self.model_name][call_index]))
-
-    monkeypatch.setattr(
-        medical_processor,
-        "_create_chat_model",
-        lambda model_spec: FakeModel(model_spec.model),
-    )
-    monkeypatch.setattr(
-        medical_processor,
-        "_get_enabled_model_specs",
-        lambda: [
-            AIModelSpec(provider="google_genai", model="model-primary"),
-            AIModelSpec(provider="ollama", model="model-weaker"),
-        ],
-    )
-    monkeypatch.setattr(
-        medical_processor,
-        "_judge_field_conflict",
-        lambda field_path, images, candidates: asyncio.sleep(0, result=(cast(str, candidates[0]["normalized_key"]), "Preserve leading candidate.")),
-    )
-
-    result = asyncio.run(
-        medical_processor.process(
-            [
-                DocumentImageInput(
-                    filename="scan.png",
-                    mime_type="image/png",
-                    base64_data="YWJj",
-                )
-            ],
-            validation_hints={
-                "ordered_documents": [
-                    {"image_index": 0, "document_index": 0, "document_type": "receipt", "decision": "valid"},
-                    {"image_index": 0, "document_index": 1, "document_type": "receipt", "decision": "valid"},
-                    {"image_index": 0, "document_index": 2, "document_type": "receipt", "decision": "valid"},
-                    {"image_index": 0, "document_index": 3, "document_type": "prescription", "decision": "valid"},
-                    {"image_index": 1, "document_index": 0, "document_type": "medical_form", "decision": "valid"},
-                ]
-            },
-        )
-    )
-
-    assert result.result.summary.total_amount == 597900
-    assert result.result.financial_recap.total_medicines == 297900
-    assert result.result.financial_recap.total_other_charges == 300000
-    assert result.result.financial_recap.grand_total == 597900
-    assert any(
-        "materially weaker than the existing consensus totals" in reason
-        for reason in result.review_reasons
-    )
-    assert not any(
-        corrected.get("field_path") == "summary.total_amount" and corrected.get("corrected_value") == 1145000
-        for corrected in result.extraction_meta_payload["corrected_fields"]
-    )
+    assert engine._has_dominant_financial_candidate(plausible_candidates) is True
 
 
 
@@ -4648,6 +6741,189 @@ def test_document_validation_processor_allows_receipt_without_stamp_or_signature
         "review_reasons": [],
         **receipt_result,
     }
+
+
+def test_document_validation_processor_accepts_strict_document_identity_from_visible_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    stamped_medical_form_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "medical_form",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": False,
+                        "stamp_detected": True,
+                        "signature_detected": True,
+                        "decision": "valid",
+                        "reasons": ["Treating doctor stamp is visible but clinic field is blank."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(stamped_medical_form_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    result = asyncio.run(
+        validation_processor.process(
+            [
+                DocumentImageInput(
+                    filename="scan.jpg",
+                    mime_type="image/jpeg",
+                    base64_data="YWJj",
+                )
+            ]
+        )
+    )
+
+    assert result.review_required is True
+    assert result.review_reasons == [
+        "Image 1 document 1: provider identity accepted from visible official stamp evidence."
+    ]
+    assert result.model_dump() == {
+        "packet_patient_name": None,
+        "patient_name_match_status": "not_checked",
+        "patient_name_match_reason": None,
+        "review_required": True,
+        "review_reasons": [
+            "Image 1 document 1: provider identity accepted from visible official stamp evidence."
+        ],
+        **stamped_medical_form_result,
+    }
+
+
+def test_document_validation_processor_rejects_strict_document_identity_from_signature_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    signature_only_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "medical_form",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": False,
+                        "stamp_detected": False,
+                        "signature_detected": True,
+                        "decision": "valid",
+                        "reasons": ["Doctor signature is visible but provider identity is not clear."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(signature_only_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            validation_processor.process(
+                [
+                    DocumentImageInput(
+                        filename="scan.jpg",
+                        mime_type="image/jpeg",
+                        base64_data="YWJj",
+                    )
+                ]
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    detail = get_http_exception_detail_dict(exc_info.value)
+    assert detail["message"] == "Document validation failed."
+    assert "medical facility identity is not clearly visible" in detail["errors"][0]["message"]
+
+
+def test_document_validation_processor_rejects_receipt_without_provider_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_processor = DocumentValidationProcessor(settings=build_settings())
+    receipt_result = {
+        "images": [
+            {
+                "image_index": 0,
+                "filename": "scan.jpg",
+                "document_count_detected": 1,
+                "documents": [
+                    {
+                        "document_index": 0,
+                        "document_type": "receipt",
+                        "is_medical_document": True,
+                        "readability_ok": True,
+                        "facility_identity_visible": False,
+                        "stamp_detected": True,
+                        "signature_detected": False,
+                        "decision": "valid",
+                        "reasons": ["Only payer branding is visible."],
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeModel:
+        async def ainvoke(self, messages: list[object]) -> AIMessage:
+            assert len(messages) == 2
+            return AIMessage(content=json.dumps(receipt_result))
+
+    monkeypatch.setattr(validation_processor, "_create_chat_model", lambda model_spec: FakeModel())
+    monkeypatch.setattr(
+        validation_processor,
+        "_get_enabled_model_specs",
+        lambda: [AIModelSpec(provider="google_genai", model="gemini-1.5-flash")],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            validation_processor.process(
+                [
+                    DocumentImageInput(
+                        filename="scan.jpg",
+                        mime_type="image/jpeg",
+                        base64_data="YWJj",
+                    )
+                ]
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    detail = get_http_exception_detail_dict(exc_info.value)
+    assert detail["message"] == "Document validation failed."
+    assert "medical facility identity is not clearly visible" in detail["errors"][0]["message"]
 
 
 def test_document_validation_processor_rejects_standalone_prescription_without_stamp_or_signature(

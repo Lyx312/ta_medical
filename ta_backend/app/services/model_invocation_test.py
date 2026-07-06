@@ -23,10 +23,6 @@ class ModelInvocationTestService(BaseDocumentAIProcessor):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings=settings)
 
-    def _persist_ai_api_call_log(self, payload: Any) -> None:
-        del payload
-        return
-
     def _parse_optional_json(self, raw_text: str) -> dict[str, Any] | list[Any] | None:
         candidate_payload = self._strip_code_fences(raw_text)
         try:
@@ -101,6 +97,7 @@ class ModelInvocationTestService(BaseDocumentAIProcessor):
                         "image_supplied": image is not None,
                     },
                 },
+                prompt_file_path=None,
             )
         except HTTPException:
             raise
@@ -120,6 +117,16 @@ class ModelInvocationTestService(BaseDocumentAIProcessor):
 
         raw_text = self._extract_text_content(response.content)
         parsed_json = self._parse_optional_json(raw_text)
+        self._record_ai_call_outcome(
+            tracking_payload,
+            parsed_response_payload=parsed_json,
+            response_validation_error=None if parsed_json is not None else "Response was not valid JSON.",
+            result_context_payload={
+                "call_kind": "model_test",
+                "image_supplied": image is not None,
+                "json_parsed": parsed_json is not None,
+            },
+        )
         return ModelInvokeTestResponse(
             success=True,
             provider=provider,

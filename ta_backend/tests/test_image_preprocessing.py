@@ -18,13 +18,12 @@ def build_image_bytes(
     image = Image.new(image_mode, size, color=color)
     output = BytesIO()
 
-    save_kwargs: dict[str, str | bytes] = {"format": image_format}
     if exif_orientation is not None:
         exif = Image.Exif()
         exif[274] = exif_orientation
-        save_kwargs["exif"] = exif.tobytes()
-
-    image.save(output, **save_kwargs)
+        image.save(output, format=image_format, exif=exif.tobytes())
+    else:
+        image.save(output, format=image_format)
     return output.getvalue()
 
 

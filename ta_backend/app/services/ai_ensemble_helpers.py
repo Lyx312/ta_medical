@@ -22,6 +22,7 @@ from app.services.ai_ensemble_config import (
     NUMERIC_FIELD_PATHS,
     OTHER_CHARGE_DESCRIPTOR_STOPWORDS,
     PACKAGE_LEVEL_MEDICINE_KEYWORDS,
+    PHARMACY_PAYMENT_KEYWORDS,
     SERVICE_KEYWORDS,
     SELF_CONSISTENCY_CALIBRATION_FEATURES,
     SEMANTIC_FIELD_PATHS,
@@ -73,8 +74,13 @@ INDONESIAN_WORD_TOKEN_PATTERN = re.compile(r"[a-z]+", re.IGNORECASE)
 
 
 def contains_keyword(text: str, keywords: Collection[str]) -> bool:
-    lowered_text = text.casefold()
-    return any(keyword in lowered_text for keyword in keywords)
+    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+    padded_text = f" {normalized_text} "
+    for keyword in keywords:
+        normalized_keyword = re.sub(r"[^a-z0-9]+", " ", keyword.casefold()).strip()
+        if normalized_keyword and f" {normalized_keyword} " in padded_text:
+            return True
+    return False
 
 
 def sequence_similarity(left: str, right: str) -> float:
@@ -104,6 +110,10 @@ def is_generic_medicine_key(value: str) -> bool:
         "drug",
         "pharmacy",
         "apotek",
+        "apotik",
+        "farmasi",
+        "resep",
+        "salinanresep",
     }
 
 
@@ -165,13 +175,22 @@ def classify_other_charge_kind(category: Any, description: Any) -> str:
     description_text = normalize_whitespace(str(description or "")).casefold()
     combined_text = f"{category_text} {description_text}".strip()
 
+    has_consultation_keyword = contains_keyword(combined_text, CONSULTATION_KEYWORDS)
+    has_service_keyword = contains_keyword(combined_text, SERVICE_KEYWORDS)
+    category_standard = map_category_to_standard(category_text)
+    prescription_only_keywords = ("prescription", "resep", "salinan resep")
+    strong_pharmacy_keywords = tuple(keyword for keyword in PHARMACY_PAYMENT_KEYWORDS if keyword not in prescription_only_keywords)
+    has_pharmacy_payment_keyword = contains_keyword(combined_text, strong_pharmacy_keywords)
+    has_prescription_keyword = contains_keyword(combined_text, prescription_only_keywords)
+    category_is_service_like = category_standard in {"CONSULTATION", "SERVICE"} or has_consultation_keyword or has_service_keyword
+    if has_pharmacy_payment_keyword or (has_prescription_keyword and not category_is_service_like):
+        return "MEDICINE"
+
     standard_cat = map_category_to_standard(combined_text)
     if standard_cat and standard_cat != "OTHER":
         return standard_cat
 
     has_medicine_keyword = contains_keyword(combined_text, GENERIC_MEDICINE_KEYWORDS)
-    has_consultation_keyword = contains_keyword(combined_text, CONSULTATION_KEYWORDS)
-    has_service_keyword = contains_keyword(combined_text, SERVICE_KEYWORDS)
 
     if has_medicine_keyword and (has_consultation_keyword or has_service_keyword):
         return "OTHER"
@@ -350,11 +369,16 @@ def parse_indonesian_amount_words(text: str) -> tuple[float | int | None, float]
 
 def parse_other_charge_group_key(group_key: str) -> tuple[str, str | None, str]:
     raw_kind, _, payload = group_key.partition(":")
-    amount_text, _, descriptor_key = payload.partition("|")
-    return raw_kind or "other", amount_text or None, descriptor_key or "other"
+    if "|" in payload:
+        amount_text, _, descriptor_key = payload.partition("|")
+    else:
+        amount_text, _, descriptor_key = payload.partition(":")
+    return (raw_kind or "other").casefold(), amount_text or None, descriptor_key or "other"
 
 
 def other_charge_kinds_share_family(left_kind: str, right_kind: str) -> bool:
+    left_kind = normalize_whitespace(left_kind).casefold()
+    right_kind = normalize_whitespace(right_kind).casefold()
     return left_kind == right_kind or {left_kind, right_kind} <= {"service", "consultation"}
 
 

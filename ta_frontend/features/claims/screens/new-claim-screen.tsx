@@ -16,9 +16,12 @@ import * as ImagePicker from 'expo-image-picker';
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { useFocusEffect } from '@react-navigation/native';
+import { router, type Href } from 'expo-router';
+import EventSource, { type EventSourceEvent, type EventSourceListener } from 'react-native-sse';
 
 import { AppButton } from '@/components/ui/app-button';
 import { FieldError, FieldLabel, SelectField, TextAreaField, TextField } from '@/components/ui/form-field';
+import { ImageViewer } from '@/components/ui/image-viewer';
 import { ScreenHeader } from '@/components/ui/screen-header';
 import { SurfaceCard } from '@/components/ui/surface-card';
 import { ThemedText } from '@/components/themed-text';
@@ -26,7 +29,12 @@ import { Colors, Opacity, Radii, Spacing, Typography } from '@/constants/theme';
 import { useAuth } from '@/contexts/auth-context';
 import { ClaimScanProgressCard } from '@/features/claims/components/claim-scan-progress-card';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { getScanDocumentsJob, startScanDocumentsJob, cancelScanDocumentsJob } from '@/services/api/ai';
+import {
+  cancelScanDocumentsJob,
+  getScanDocumentsJob,
+  openScanDocumentsJobEventStream,
+  startScanDocumentsJob,
+} from '@/services/api/ai';
 import { createClaimWithProgress } from '@/services/api/claims';
 import { getFamilyMembers } from '@/services/api/family-members';
 import type {
@@ -34,14 +42,15 @@ import type {
   ApiError,
   ClaimMedicineInput,
   FamilyMember,
+  ScanJobEventName,
   ScanProgressPayload,
 } from '@/services/api/types';
 
 const BENEFIT_TYPES = [
-  { value: 'rawat_jalan', label: 'Rawat Jalan' },
-  { value: 'rawat_inap', label: 'Rawat Inap' },
-  { value: 'emergency', label: 'Emergency' },
-  { value: 'maternity', label: 'Maternity' },
+  { value: 'rawat_jalan', label: 'Rawat Jalan', disabled: false },
+  { value: 'rawat_inap', label: 'Rawat Inap', disabled: true },
+  { value: 'emergency', label: 'Emergency', disabled: true },
+  { value: 'maternity', label: 'Maternity', disabled: true },
 ];
 
 type PatientOption = {
@@ -140,25 +149,34 @@ export function NewClaimScreen() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitStatusText, setSubmitStatusText] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const scanPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [viewerImageUri, setViewerImageUri] = useState<string | null>(null);
+  const [viewerImageTitle, setViewerImageTitle] = useState('');
+  const scanEventSourceRef = useRef<EventSource<ScanJobEventName> | null>(null);
+  const scanStreamOpenedRef = useRef(false);
+  const scanStreamSettledRef = useRef(false);
+  const scanFallbackInFlightRef = useRef(false);
 
-  const clearScanPoll = useCallback(() => {
-    if (scanPollTimeoutRef.current) {
-      clearTimeout(scanPollTimeoutRef.current);
-      scanPollTimeoutRef.current = null;
+  const closeScanStream = useCallback(() => {
+    if (scanEventSourceRef.current) {
+      scanEventSourceRef.current.removeAllEventListeners();
+      scanEventSourceRef.current.close();
+      scanEventSourceRef.current = null;
     }
+    scanStreamOpenedRef.current = false;
+    scanStreamSettledRef.current = false;
+    scanFallbackInFlightRef.current = false;
   }, []);
 
   const resetScanFeedback = useCallback(() => {
-    clearScanPoll();
+    closeScanStream();
     setScanState('idle');
     setScanProgress(null);
     setScanErrorMessage('');
     setCurrentScanLogId(undefined);
     setIsCancellingScan(false);
-  }, [clearScanPoll]);
+  }, [closeScanStream]);
 
-  useEffect(() => () => clearScanPoll(), [clearScanPoll]);
+  useEffect(() => () => closeScanStream(), [closeScanStream]);
 
   const patientOptions: PatientOption[] = useMemo(() => {
     const options: PatientOption[] = [];
@@ -383,42 +401,132 @@ export function NewClaimScreen() {
     setMedicines((prev) => prev.filter((medicine) => medicine.localId !== localId));
   };
 
-  const pollScanJob = useCallback(
-    (scanLogId: number, retryCount: number = 0) => {
-      clearScanPoll();
-      scanPollTimeoutRef.current = setTimeout(async () => {
-        try {
-          const status = await getScanDocumentsJob(scanLogId);
-          setScanProgress(status.progress);
-          if (status.result) {
-            applyAIScanData(status.result);
-            setSourceScanLogId(status.scan_log_id);
-            setScanErrorMessage('');
-            setScanState('succeeded');
-            clearScanPoll();
-            return;
-          }
-          if (status.progress.status === 'failed') {
-            setScanErrorMessage(status.error_message ?? 'Unable to scan documents.');
-            setScanState('failed');
-            clearScanPoll();
-            return;
-          }
-          setScanState('processing');
-          pollScanJob(scanLogId, 0);
-        } catch (err) {
-          if (retryCount < 3) {
-            pollScanJob(scanLogId, retryCount + 1);
-            return;
-          }
-          const apiError = err as ApiError;
-          setScanErrorMessage(apiError.message ?? 'Unable to refresh scan progress.');
-          setScanState('failed');
-          clearScanPoll();
-        }
-      }, 1000);
+  const reconcileScanJob = useCallback(
+    async (scanLogId: number) => {
+      const status = await getScanDocumentsJob(scanLogId);
+      setScanProgress(status.progress);
+
+      if (status.result) {
+        applyAIScanData(status.result);
+        setSourceScanLogId(status.scan_log_id);
+        setScanErrorMessage('');
+        setScanState('succeeded');
+        closeScanStream();
+        return status;
+      }
+
+      if (status.progress.status === 'failed') {
+        setScanErrorMessage(status.error_message ?? 'Unable to scan documents.');
+        setScanState('failed');
+        closeScanStream();
+        return status;
+      }
+
+      setScanErrorMessage('');
+      setScanState('processing');
+      return status;
     },
-      [clearScanPoll, applyAIScanData],
+    [applyAIScanData, closeScanStream],
+  );
+
+  const openScanStream = useCallback(
+    async (scanLogId: number) => {
+      closeScanStream();
+
+      const eventSource = await openScanDocumentsJobEventStream(scanLogId);
+      scanEventSourceRef.current = eventSource;
+      scanStreamOpenedRef.current = false;
+      scanStreamSettledRef.current = false;
+      scanFallbackInFlightRef.current = false;
+
+      const applyProgressPayload = (event: EventSourceEvent<'progress', ScanJobEventName>) => {
+        if (!event.data) {
+          return;
+        }
+        const status = JSON.parse(event.data) as Awaited<ReturnType<typeof getScanDocumentsJob>>;
+        setScanProgress(status.progress);
+        setScanErrorMessage('');
+        setScanState('processing');
+      };
+
+      const applyCompletedPayload = (event: EventSourceEvent<'completed', ScanJobEventName>) => {
+        if (!event.data) {
+          return;
+        }
+        const status = JSON.parse(event.data) as Awaited<ReturnType<typeof getScanDocumentsJob>>;
+        if (status.result) {
+          applyAIScanData(status.result);
+          setSourceScanLogId(status.scan_log_id);
+        }
+        setScanProgress(status.progress);
+        setScanErrorMessage('');
+        setScanState('succeeded');
+        scanStreamSettledRef.current = true;
+        closeScanStream();
+      };
+
+      const applyFailedPayload = (
+        event: EventSourceEvent<'failed' | 'cancelled', ScanJobEventName>,
+        fallbackMessage: string,
+      ) => {
+        if (!event.data) {
+          return;
+        }
+        const status = JSON.parse(event.data) as Awaited<ReturnType<typeof getScanDocumentsJob>>;
+        setScanProgress(status.progress);
+        setScanErrorMessage(status.error_message ?? fallbackMessage);
+        setScanState('failed');
+        scanStreamSettledRef.current = true;
+        closeScanStream();
+      };
+
+      const reconcileAfterStreamError = async () => {
+        if (scanFallbackInFlightRef.current || scanStreamSettledRef.current) {
+          return;
+        }
+
+        scanFallbackInFlightRef.current = true;
+        try {
+          await reconcileScanJob(scanLogId);
+        } catch (err) {
+          if (!scanStreamOpenedRef.current) {
+            const apiError = err as ApiError;
+            setScanErrorMessage(apiError.message ?? 'Unable to refresh scan progress.');
+            setScanState('failed');
+            closeScanStream();
+          }
+        } finally {
+          scanFallbackInFlightRef.current = false;
+        }
+      };
+
+      const openListener: EventSourceListener<ScanJobEventName, 'open'> = () => {
+        scanStreamOpenedRef.current = true;
+      };
+      const progressListener: EventSourceListener<ScanJobEventName, 'progress'> = (event) => {
+        applyProgressPayload(event);
+      };
+      const completedListener: EventSourceListener<ScanJobEventName, 'completed'> = (event) => {
+        applyCompletedPayload(event);
+      };
+      const failedListener: EventSourceListener<ScanJobEventName, 'failed'> = (event) => {
+        applyFailedPayload(event, 'Unable to scan documents.');
+      };
+      const cancelledListener: EventSourceListener<ScanJobEventName, 'cancelled'> = (event) => {
+        applyFailedPayload(event, 'Scan was cancelled by the user.');
+      };
+      const errorListener: EventSourceListener<ScanJobEventName, 'error'> = () => {
+        void reconcileAfterStreamError();
+      };
+
+      eventSource.addEventListener('open', openListener);
+      eventSource.addEventListener('progress', progressListener);
+      eventSource.addEventListener('completed', completedListener);
+      eventSource.addEventListener('failed', failedListener);
+      eventSource.addEventListener('cancelled', cancelledListener);
+      eventSource.addEventListener('error', errorListener);
+    },
+    [applyAIScanData, closeScanStream, reconcileScanJob],
   );
 
   const handleAIScan = async () => {
@@ -427,7 +535,7 @@ export function NewClaimScreen() {
       return;
     }
 
-    clearScanPoll();
+    closeScanStream();
     setScanState('uploading');
     setScanErrorMessage('');
     setScanProgress(buildUploadProgressPayload(0));
@@ -441,7 +549,7 @@ export function NewClaimScreen() {
       setCurrentScanLogId(job.scan_log_id);
       setScanProgress(job.progress);
       setScanState('processing');
-      pollScanJob(job.scan_log_id);
+      await openScanStream(job.scan_log_id);
     } catch (err) {
       const apiError = err as ApiError;
       setScanErrorMessage(apiError.message ?? 'Unable to scan documents.');
@@ -458,7 +566,7 @@ export function NewClaimScreen() {
       setScanProgress(response.progress);
       setScanState('failed');
       setScanErrorMessage('Scan was cancelled by the user.');
-      clearScanPoll();
+      closeScanStream();
     } catch (err) {
       const apiError = err as ApiError;
       setScanErrorMessage(apiError.message ?? 'Failed to cancel scan.');
@@ -536,7 +644,7 @@ export function NewClaimScreen() {
 
     try {
       const medicinesInput = toClaimMedicineInputList(medicines);
-      await createClaimWithProgress(
+      const createdClaim = await createClaimWithProgress(
         {
           nama_pasien: selectedPatient.name,
           tanggal_pelayanan: formatDateForSubmission(serviceDate),
@@ -558,7 +666,8 @@ export function NewClaimScreen() {
         },
       );
 
-      Alert.alert('Success', 'Claim submitted successfully.', [{ text: 'OK', onPress: resetForm }]);
+      resetForm();
+      router.replace(`/user/claims/${createdClaim.id}` as Href);
     } catch (err) {
       const apiError = err as ApiError;
       Alert.alert('Submission Failed', apiError.message ?? 'Unable to submit claim.');
@@ -613,7 +722,13 @@ export function NewClaimScreen() {
                   <View style={viewStyles.imageGrid}>
                     {imageUris.map((uri, index) => (
                       <View key={`${uri}-${index}`} style={viewStyles.imageThumbContainer}>
-                        <Image source={{ uri }} style={imageStyles.imageThumb} />
+                        <Pressable
+                          onPress={() => {
+                            setViewerImageUri(uri);
+                            setViewerImageTitle(`Document ${index + 1}`);
+                          }}>
+                          <Image source={{ uri }} style={imageStyles.imageThumb} />
+                        </Pressable>
                         <Pressable style={viewStyles.removeImageButton} onPress={() => removeImage(index)} disabled={scanBusy}>
                           <Ionicons name="close-circle" size={22} color={colors.error} />
                         </Pressable>
@@ -835,28 +950,36 @@ export function NewClaimScreen() {
             <FlatList
               data={BENEFIT_TYPES}
               keyExtractor={(item) => item.value}
-              renderItem={({ item }) => (
-                <Pressable
-                  style={[
-                    viewStyles.benefitOption,
-                    { borderBottomColor: colors.divider },
-                    benefitType === item.value && { backgroundColor: `${colors.secondary}20` },
-                  ]}
-                  onPress={() => {
-                    setBenefitType(item.value);
-                    setErrors((prev) => ({ ...prev, jenis_manfaat: '' }));
-                    setShowBenefitPicker(false);
-                  }}>
-                  <ThemedText
+              renderItem={({ item }) => {
+                const isSelected = benefitType === item.value;
+                const isDisabled = item.disabled;
+
+                return (
+                  <Pressable
+                    disabled={isDisabled}
                     style={[
-                      textStyles.benefitOptionText,
-                      { color: benefitType === item.value ? colors.secondary : colors.text },
-                    ]}>
-                    {item.label}
-                  </ThemedText>
-                  {benefitType === item.value ? <Ionicons name="checkmark" size={22} color={colors.secondary} /> : null}
-                </Pressable>
-              )}
+                      viewStyles.benefitOption,
+                      { borderBottomColor: colors.divider },
+                      isSelected && !isDisabled && { backgroundColor: `${colors.secondary}20` },
+                      isDisabled && viewStyles.disabledBlock,
+                    ]}
+                    onPress={() => {
+                      setBenefitType(item.value);
+                      setErrors((prev) => ({ ...prev, jenis_manfaat: '' }));
+                      setShowBenefitPicker(false);
+                    }}>
+                    <ThemedText
+                      style={[
+                        textStyles.benefitOptionText,
+                        { color: isSelected ? colors.secondary : colors.text },
+                        isDisabled && { color: colors.icon },
+                      ]}>
+                      {item.label}
+                    </ThemedText>
+                    {isSelected && !isDisabled ? <Ionicons name="checkmark" size={22} color={colors.secondary} /> : null}
+                  </Pressable>
+                );
+              }}
             />
           </View>
         </View>
@@ -903,6 +1026,16 @@ export function NewClaimScreen() {
           </View>
         </View>
       </Modal>
+
+      <ImageViewer
+        visible={viewerImageUri !== null}
+        uri={viewerImageUri}
+        title={viewerImageTitle}
+        onClose={() => {
+          setViewerImageUri(null);
+          setViewerImageTitle('');
+        }}
+      />
     </SafeAreaView>
   );
 }

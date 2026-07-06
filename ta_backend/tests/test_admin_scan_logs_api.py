@@ -8,8 +8,9 @@ from app.api.routes import ai as ai_route
 from app.api.routes import claims as claims_route
 from app.api.routes.ai import processor as ai_processor
 from app.core.config import get_settings
-from app.db.session import clear_database_caches
+from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
+from app.repositories.scan_log_repository import AIApiCallLogCreate, ScanLogRepository
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services.ai_service import DocumentImageInput
 from app.services.image_preprocessing import ProcessedDocumentImage
@@ -160,6 +161,32 @@ def test_admin_can_list_and_view_scan_logs(
     assert scan_response.status_code == 200
     scan_log_id = scan_response.json()["scan_log_id"]
 
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        ScanLogRepository(db).create_ai_api_call_log(
+            AIApiCallLogCreate(
+                scan_log_id=scan_log_id,
+                user_id=1,
+                provider="google_genai",
+                model_name="gemini-test",
+                call_kind="field_judge",
+                success=True,
+                request_context_payload={"field_path": "summary.service_date", "candidate_count": 2},
+                prompt_file_path="app/prompts/ai/medical_document_field_judge.yaml",
+                prompt_payload=[{"role": "system", "content": "judge prompt"}],
+                raw_response_text='{"selected_candidate_index":0}',
+                response_content_payload='{"selected_candidate_index":0}',
+                parsed_response_payload={"selected_candidate_index": 0, "reason": "better supported"},
+                result_context_payload={
+                    "field_path": "summary.service_date",
+                    "selected_candidate_index": 0,
+                    "selected_candidate_key": "2024-08-10",
+                    "selected_candidate_valid": True,
+                    "abstained": False,
+                },
+            )
+        )
+
     list_response = client.get(
         "/api/admin/scan-logs?status=succeeded",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -186,6 +213,13 @@ def test_admin_can_list_and_view_scan_logs(
     assert detail_payload["validation_payload"]["images"][0]["filename"] == "scan.jpg"
     assert detail_payload["extraction_payload"] == SCAN_RESULT
     assert detail_payload["ai_model_runs"] == []
+    assert len(detail_payload["ai_api_calls"]) == 1
+    assert detail_payload["ai_api_calls"][0]["call_kind"] == "field_judge"
+    assert detail_payload["ai_api_calls"][0]["prompt_file_path"].endswith("medical_document_field_judge.yaml")
+    assert detail_payload["ai_api_calls"][0]["prompt_payload"] == [{"role": "system", "content": "judge prompt"}]
+    assert detail_payload["ai_api_calls"][0]["raw_response_text"] == '{"selected_candidate_index":0}'
+    assert detail_payload["ai_api_calls"][0]["parsed_response_payload"]["selected_candidate_index"] == 0
+    assert detail_payload["ai_api_calls"][0]["result_context_payload"]["field_path"] == "summary.service_date"
     assert detail_payload["extraction_meta_payload"]["calibration_version"] == "legacy"
     assert detail_payload["files"][0]["original_image_data_url"].startswith("data:image/png;base64,")
     assert detail_payload["files"][0]["processed_image_data_url"].startswith("data:image/jpeg;base64,")

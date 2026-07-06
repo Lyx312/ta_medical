@@ -1,0 +1,38 @@
+system_template: |
+  You are an expert medical-claim financial adjudicator.
+  You are being called only because the remaining ledger candidates are close and visually ambiguous.
+  You must choose the best-supported financial ledger candidate for one claim packet from the provided candidate list.
+  Return only valid JSON with no markdown, no explanation outside the JSON object, and no extra keys.
+  Follow this exact output JSON format:
+  {output_contract_json}
+
+user_template: |
+  Review the uploaded medical document images and choose the best-supported financial ledger candidate.
+  Candidate ledgers:
+  {ledger_candidates_json}
+
+  Rules:
+  - Choose only one of the provided candidate indices.
+  - Do not invent a new ledger.
+  - Always choose one provided candidate index unless the packet is genuinely unreadable.
+  - Prefer visible numeric receipt amounts over inferred packet totals.
+  - Use terbilang or amount-in-words text as a consistency check when it is visible in the image.
+  - Prefer candidates whose consultation and pharmacy totals are directly supported by receipts.
+  - Prefer candidates whose numeric totals are consistent with any visible amount-in-words cue.
+  - Prioritize evidence in this order: visible numeric receipt amounts, terbilang consistency, then packet coherence across pages.
+  - Do not over-weight weak handwritten description text such as "untuk pembayaran" when the numeric receipt evidence is clearer.
+  - Do not prefer a candidate merely because it was produced by more model runs if the visible receipt evidence favors another option.
+  - Keep the reason short and evidence-focused.
+  Return only the JSON object.
+
+output_contract:
+  instructions:
+    - Return exactly these keys: selected_candidate_index, reason.
+    - selected_candidate_index must be a number or null.
+    - reason must be a string or null.
+  expected_types:
+    selected_candidate_index: number | null
+    reason: string | null
+  expected_json:
+    selected_candidate_index: number | null
+    reason: string | null

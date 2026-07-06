@@ -22,7 +22,12 @@ from app.core.config import ROOT_DIR, Settings
 from app.db.session import get_session_factory
 from app.repositories.ai_model_repository import AIModelRepository
 from app.repositories.scan_log_repository import AIApiCallLogCreate, ScanLogRepository
-from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse, ValidationPatientNameMatchStatus
+from app.schemas.ai import (
+    AIMedicalScanResponse,
+    DocumentValidationItem,
+    DocumentValidationResponse,
+    ValidationPatientNameMatchStatus,
+)
 from app.services.ai_ensemble_config import (
     AI_EXTRACTION_MAX_PRODUCERS,
     AI_EXTRACTION_MIN_SUCCESSFUL_RUNS,
@@ -47,6 +52,7 @@ from app.services.ai_provider_catalog import (
 PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_scan.yaml"
 VALIDATION_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_validation.yaml"
 FIELD_JUDGE_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "medical_document_field_judge.yaml"
+FINANCIAL_PACKET_JUDGE_PROMPT_FILE_PATH = ROOT_DIR / "app" / "prompts" / "ai" / "financial_packet_judge.yaml"
 AI_MODEL_REQUEST_TIMEOUT_SECONDS = 180  # 3-minute timeout per AI request
 STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES = {"medical_form", "doctor_note", "prescription"}
 STAMP_OR_SIGNATURE_OPTIONAL_TYPES = {"receipt", "lab_result", "radiology_result"}
@@ -452,6 +458,115 @@ class BaseDocumentAIProcessor:
             )
         return cast(list[Any], human_content)
 
+    def _serialize_messages_for_log(self, messages: list[Any]) -> list[dict[str, Any]]:
+        serialized_messages: list[dict[str, Any]] = []
+        for message in messages:
+            serialized_messages.append(
+                {
+                    "role": str(getattr(message, "type", message.__class__.__name__)),
+                    "content": self._sanitize_log_payload(getattr(message, "content", message)),
+                }
+            )
+        return serialized_messages
+
+    def _sanitize_log_payload(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [self._sanitize_log_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_log_payload(item) for item in value]
+        if isinstance(value, dict):
+            if value.get("type") == "image_url" and isinstance(value.get("image_url"), dict):
+                image_url = cast(dict[str, Any], value["image_url"])
+                raw_url = image_url.get("url")
+                mime_type = self._extract_data_url_mime_type(raw_url) if isinstance(raw_url, str) else None
+                return {
+                    "type": "image_url",
+                    "image_url": {
+                        "redacted": True,
+                        "source": "data_url" if isinstance(raw_url, str) and raw_url.startswith("data:") else "url",
+                        "mime_type": mime_type,
+                    },
+                }
+            return {str(key): self._sanitize_log_payload(item) for key, item in value.items()}
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            return self._sanitize_log_payload(value.model_dump())
+        if hasattr(value, "__dict__"):
+            return self._sanitize_log_payload(vars(value))
+        return str(value)
+
+    def _extract_data_url_mime_type(self, value: str) -> str | None:
+        if not value.startswith("data:"):
+            return None
+        prefix, _, _payload = value.partition(",")
+        mime_type = prefix.removeprefix("data:").partition(";")[0].strip()
+        return mime_type or None
+
+    def _extract_raw_response_text_for_log(self, content: Any) -> str | None:
+        try:
+            return self._extract_text_content(content)
+        except HTTPException:
+            return None
+
+    def _persist_ai_api_call_log(self, payload: AIApiCallLogCreate) -> Any | None:
+        try:
+            session_factory = get_session_factory()
+            with session_factory() as db:
+                return ScanLogRepository(db).create_ai_api_call_log(payload)
+        except Exception as exc:  # noqa: BLE001
+            ai_pipeline_log(
+                event="ai_api_call_log_persist_failed",
+                component="ai_call_tracking",
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
+            return None
+
+    def _update_ai_api_call_log(
+        self,
+        ai_api_call_log_id: int,
+        *,
+        parsed_response_payload: Any | None = None,
+        response_validation_error: str | None = None,
+        result_context_payload: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            session_factory = get_session_factory()
+            with session_factory() as db:
+                ScanLogRepository(db).update_ai_api_call_log(
+                    ai_api_call_log_id,
+                    parsed_response_payload=parsed_response_payload,
+                    response_validation_error=response_validation_error,
+                    result_context_payload=result_context_payload,
+                )
+        except Exception as exc:  # noqa: BLE001
+            ai_pipeline_log(
+                event="ai_api_call_log_update_failed",
+                component="ai_call_tracking",
+                success=False,
+                ai_api_call_log_id=ai_api_call_log_id,
+                **ai_pipeline_exception_fields(exc),
+            )
+
+    def _record_ai_call_outcome(
+        self,
+        tracking_payload: dict[str, Any],
+        *,
+        parsed_response_payload: Any | None = None,
+        response_validation_error: str | None = None,
+        result_context_payload: dict[str, Any] | None = None,
+    ) -> None:
+        ai_api_call_log_id = tracking_payload.get("ai_api_call_log_id")
+        if not isinstance(ai_api_call_log_id, int):
+            return
+        self._update_ai_api_call_log(
+            ai_api_call_log_id,
+            parsed_response_payload=parsed_response_payload,
+            response_validation_error=response_validation_error,
+            result_context_payload=result_context_payload,
+        )
+
     def _extract_usage_metadata(self, response: Any) -> dict[str, Any]:
         usage_sources: list[Any] = []
         for attr_name in ("usage_metadata", "response_metadata"):
@@ -499,13 +614,13 @@ class BaseDocumentAIProcessor:
         except (TypeError, ValueError):
             return None
 
-    def _persist_ai_api_call_log(self, payload: AIApiCallLogCreate) -> None:
-        try:
-            session_factory = get_session_factory()
-            with session_factory() as db:
-                ScanLogRepository(db).create_ai_api_call_log(payload)
-        except Exception:
-            return
+    def _describe_exception(self, exc: Exception) -> str:
+        if isinstance(exc, HTTPException):
+            if isinstance(exc.detail, str):
+                return exc.detail
+            if isinstance(exc.detail, dict):
+                return str(exc.detail.get("message", "HTTP error"))
+        return str(exc) or exc.__class__.__name__
 
     async def _ainvoke_with_tracking(
         self,
@@ -516,6 +631,7 @@ class BaseDocumentAIProcessor:
         model_name: str,
         call_kind: str,
         success_context: dict[str, Any] | None = None,
+        prompt_file_path: Path | None = None,
     ) -> tuple[Any, dict[str, Any]]:
         context = dict(success_context or {})
         started_at = time.perf_counter()
@@ -527,6 +643,7 @@ class BaseDocumentAIProcessor:
             success = True
             return response, self._build_ai_call_tracking_payload(
                 response=response,
+                messages=messages,
                 provider=provider,
                 model_name=model_name,
                 call_kind=call_kind,
@@ -534,11 +651,13 @@ class BaseDocumentAIProcessor:
                 success=True,
                 error_message=None,
                 started_at=started_at,
+                prompt_file_path=prompt_file_path,
             )
         except Exception as exc:  # noqa: BLE001
             error_message = str(exc) or exc.__class__.__name__
             tracking_payload = self._build_ai_call_tracking_payload(
                 response=response,
+                messages=messages,
                 provider=provider,
                 model_name=model_name,
                 call_kind=call_kind,
@@ -546,8 +665,10 @@ class BaseDocumentAIProcessor:
                 success=False,
                 error_message=error_message,
                 started_at=started_at,
+                prompt_file_path=prompt_file_path,
             )
-            self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+            record = self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+            tracking_payload["ai_api_call_log_id"] = getattr(record, "id", None)
             raise
         finally:
             if success and response is not None:
@@ -689,6 +810,7 @@ class BaseDocumentAIProcessor:
         self,
         *,
         response: Any,
+        messages: list[Any],
         provider: str,
         model_name: str,
         call_kind: str,
@@ -696,6 +818,7 @@ class BaseDocumentAIProcessor:
         success: bool,
         error_message: str | None,
         started_at: float,
+        prompt_file_path: Path | None,
     ) -> dict[str, Any]:
         usage = self._extract_usage_metadata(response) if response is not None else {
             "prompt_tokens": None,
@@ -703,6 +826,7 @@ class BaseDocumentAIProcessor:
             "total_tokens": None,
             "usage_payload": None,
         }
+        response_content = getattr(response, "content", None) if response is not None else None
         tracking_payload = {
             "scan_log_id": context.get("scan_log_id"),
             "user_id": context.get("user_id"),
@@ -721,9 +845,17 @@ class BaseDocumentAIProcessor:
             "latency_ms": int(round((time.perf_counter() - started_at) * 1000)),
             "usage_payload": usage.get("usage_payload"),
             "request_context_payload": context.get("request_context_payload"),
+            "prompt_file_path": str(prompt_file_path) if prompt_file_path is not None else None,
+            "prompt_payload": self._serialize_messages_for_log(messages),
+            "raw_response_text": self._extract_raw_response_text_for_log(response_content),
+            "response_content_payload": self._sanitize_log_payload(response_content),
+            "parsed_response_payload": None,
+            "response_validation_error": None,
+            "result_context_payload": None,
         }
         if success:
-            self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+            record = self._persist_ai_api_call_log(AIApiCallLogCreate(**tracking_payload))
+            tracking_payload["ai_api_call_log_id"] = getattr(record, "id", None)
         return tracking_payload
 
 
@@ -869,16 +1001,47 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 )
                 raise error
 
+            judge_prompt_bundle: PromptBundle | None = None
+            financial_judge_prompt_bundle: PromptBundle | None = None
+            judge_model_spec: AIModelSpec | None = None
+
             async def judge_field(field_path: str, judge_images: list[Any], candidates: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+                nonlocal judge_prompt_bundle, judge_model_spec
+                if judge_prompt_bundle is None:
+                    judge_prompt_bundle = self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
+                if judge_model_spec is None:
+                    judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
                 try:
                     return await self._judge_field_conflict(
                         field_path,
                         judge_images,
                         candidates,
                         ai_call_context=ai_call_context,
+                        judge_model_spec_override=judge_model_spec,
+                        prompt_bundle_override=judge_prompt_bundle,
                     )
                 except TypeError:
                     return await self._judge_field_conflict(field_path, judge_images, candidates)
+
+            async def judge_financial_packet(
+                judge_images: list[Any],
+                candidates: list[dict[str, Any]],
+            ) -> tuple[int | None, str | None]:
+                nonlocal financial_judge_prompt_bundle, judge_model_spec
+                if financial_judge_prompt_bundle is None:
+                    financial_judge_prompt_bundle = self._load_prompt_bundle(FINANCIAL_PACKET_JUDGE_PROMPT_FILE_PATH)
+                if judge_model_spec is None:
+                    judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
+                try:
+                    return await self._judge_financial_packet_conflict(
+                        judge_images,
+                        candidates,
+                        ai_call_context=ai_call_context,
+                        judge_model_spec_override=judge_model_spec,
+                        prompt_bundle_override=financial_judge_prompt_bundle,
+                    )
+                except TypeError:
+                    return await self._judge_financial_packet_conflict(judge_images, candidates)
 
             await report_progress(
                 "fusion_started",
@@ -886,7 +1049,10 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 completed_runs=len(traces),
                 successful_runs=len(successful_traces),
             )
-            fusion_engine = MedicalExtractionFusionEngine(judge_field=judge_field)
+            fusion_engine = MedicalExtractionFusionEngine(
+                judge_field=judge_field,
+                judge_financial_packet=judge_financial_packet,
+            )
             outcome = await fusion_engine.fuse(
                 successful_traces=successful_traces,
                 all_traces=list(traces),
@@ -1056,13 +1222,27 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             model_name=model_spec.model,
             call_kind="scan_extraction",
             success_context=ai_call_context,
+            prompt_file_path=self._prompt_file_path,
         )
-
-        payload = self._parse_ai_response_to_json(response.content)
+        try:
+            payload = self._parse_ai_response_to_json(response.content)
+        except HTTPException as exc:
+            self._record_ai_call_outcome(
+                tracking_payload,
+                response_validation_error=self._describe_exception(exc),
+                result_context_payload={"call_kind": "scan_extraction", "parse_succeeded": False},
+            )
+            raise
 
         try:
-            return AIMedicalScanResponse.model_validate(payload), tracking_payload
+            result = AIMedicalScanResponse.model_validate(payload)
         except ValidationError as exc:
+            self._record_ai_call_outcome(
+                tracking_payload,
+                parsed_response_payload=payload,
+                response_validation_error=str(exc),
+                result_context_payload={"call_kind": "scan_extraction", "schema_valid": False},
+            )
             self._log_pipeline_event(
                 "extraction_response_validation_failed",
                 "medical_document_processor",
@@ -1077,6 +1257,12 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="AI model returned invalid response shape.",
             ) from exc
+        self._record_ai_call_outcome(
+            tracking_payload,
+            parsed_response_payload=payload,
+            result_context_payload={"call_kind": "scan_extraction", "schema_valid": True},
+        )
+        return result, tracking_payload
 
     def _build_messages(
         self,
@@ -1110,9 +1296,11 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
         images: list[Any],
         candidates: list[dict[str, Any]],
         ai_call_context: dict[str, Any] | None = None,
+        judge_model_spec_override: AIModelSpec | None = None,
+        prompt_bundle_override: PromptBundle | None = None,
     ) -> tuple[str | None, str | None]:
-        judge_model_spec = replace(self.get_primary_enabled_model_spec(), temperature=0.0)
-        prompt_bundle = self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
+        judge_model_spec = judge_model_spec_override or replace(self.get_primary_enabled_model_spec(), temperature=0.0)
+        prompt_bundle = prompt_bundle_override or self._load_prompt_bundle(FIELD_JUDGE_PROMPT_FILE_PATH)
         self._log_pipeline_event(
             "field_judge_started",
             "medical_document_processor",
@@ -1163,11 +1351,35 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                         "image_count": len(images),
                     },
                 },
+                prompt_file_path=FIELD_JUDGE_PROMPT_FILE_PATH,
             )
-            payload = self._parse_ai_response_to_json(response.content)
+            try:
+                payload = self._parse_ai_response_to_json(response.content)
+            except HTTPException as exc:
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    response_validation_error=self._describe_exception(exc),
+                    result_context_payload={
+                        "field_path": field_path,
+                        "candidate_count": len(candidates),
+                        "parse_succeeded": False,
+                    },
+                )
+                raise
             selected_index = payload.get("selected_candidate_index")
             judge_reason = cast(str | None, payload.get("reason"))
             if selected_index is None or not isinstance(selected_index, int):
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=payload,
+                    result_context_payload={
+                        "field_path": field_path,
+                        "selected_candidate_index": None,
+                        "selected_candidate_key": None,
+                        "selected_candidate_valid": False,
+                        "abstained": True,
+                    },
+                )
                 self._log_pipeline_event(
                     "field_judge_completed",
                     "medical_document_processor",
@@ -1183,6 +1395,17 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 )
                 return None, judge_reason
             if selected_index < 0 or selected_index >= len(candidates):
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=payload,
+                    result_context_payload={
+                        "field_path": field_path,
+                        "selected_candidate_index": selected_index,
+                        "selected_candidate_key": None,
+                        "selected_candidate_valid": False,
+                        "abstained": False,
+                    },
+                )
                 self._log_pipeline_event(
                     "field_judge_completed",
                     "medical_document_processor",
@@ -1198,6 +1421,18 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                     selected_candidate_valid=False,
                 )
                 return None, judge_reason
+            selected_candidate_key = cast(str, candidates[selected_index]["normalized_key"])
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                parsed_response_payload=payload,
+                result_context_payload={
+                    "field_path": field_path,
+                    "selected_candidate_index": selected_index,
+                    "selected_candidate_key": selected_candidate_key,
+                    "selected_candidate_valid": True,
+                    "abstained": False,
+                },
+            )
             self._log_pipeline_event(
                 "field_judge_completed",
                 "medical_document_processor",
@@ -1212,7 +1447,7 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
                 selected_candidate_index=selected_index,
                 selected_candidate_valid=True,
             )
-            return cast(str, candidates[selected_index]["normalized_key"]), judge_reason
+            return selected_candidate_key, judge_reason
         except Exception as exc:
             self._log_pipeline_event(
                 "field_judge_failed",
@@ -1229,13 +1464,161 @@ class MedicalDocumentProcessor(BaseDocumentAIProcessor):
             )
             raise
 
-    def _describe_exception(self, exc: Exception) -> str:
-        if isinstance(exc, HTTPException):
-            if isinstance(exc.detail, str):
-                return exc.detail
-            if isinstance(exc.detail, dict):
-                return str(exc.detail.get("message", "HTTP error"))
-        return str(exc) or exc.__class__.__name__
+    async def _judge_financial_packet_conflict(
+        self,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+        ai_call_context: dict[str, Any] | None = None,
+        judge_model_spec_override: AIModelSpec | None = None,
+        prompt_bundle_override: PromptBundle | None = None,
+    ) -> tuple[int | None, str | None]:
+        judge_model_spec = judge_model_spec_override or replace(self.get_primary_enabled_model_spec(), temperature=0.0)
+        prompt_bundle = prompt_bundle_override or self._load_prompt_bundle(FINANCIAL_PACKET_JUDGE_PROMPT_FILE_PATH)
+        self._log_pipeline_event(
+            "field_judge_started",
+            "medical_document_processor",
+            ai_call_context=ai_call_context,
+            provider=judge_model_spec.provider,
+            model=judge_model_spec.model,
+            call_kind="field_judge",
+            field_path="financial.packet",
+            candidate_count=len(candidates),
+            image_count=len(images),
+        )
+        try:
+            template_input = {
+                "ledger_candidates_json": json.dumps(candidates, ensure_ascii=False, indent=2),
+                "output_contract_json": json.dumps(prompt_bundle.output_contract, indent=2),
+            }
+            system_prompt = PromptTemplate.from_template(prompt_bundle.system_template).format(**template_input)
+            user_prompt = PromptTemplate.from_template(prompt_bundle.user_template).format(**template_input)
+            model = self._create_chat_model(judge_model_spec)
+            response, _tracking_payload = await self._ainvoke_with_tracking(
+                model,
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=self._build_image_messages(user_prompt, cast(list[DocumentImageInput], images))),
+                ],
+                provider=judge_model_spec.provider,
+                model_name=judge_model_spec.model,
+                call_kind="field_judge",
+                success_context={
+                    **(ai_call_context or {}),
+                    "temperature": judge_model_spec.temperature,
+                    "request_context_payload": {
+                        "field_path": "financial.packet",
+                        "candidate_count": len(candidates),
+                        "image_count": len(images),
+                    },
+                },
+                prompt_file_path=FINANCIAL_PACKET_JUDGE_PROMPT_FILE_PATH,
+            )
+            try:
+                payload = self._parse_ai_response_to_json(response.content)
+            except HTTPException as exc:
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    response_validation_error=self._describe_exception(exc),
+                    result_context_payload={
+                        "field_path": "financial.packet",
+                        "candidate_count": len(candidates),
+                        "parse_succeeded": False,
+                    },
+                )
+                raise
+            selected_index = payload.get("selected_candidate_index")
+            judge_reason = cast(str | None, payload.get("reason"))
+            if selected_index is None or not isinstance(selected_index, int):
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=payload,
+                    result_context_payload={
+                        "field_path": "financial.packet",
+                        "selected_candidate_index": None,
+                        "selected_candidate_valid": False,
+                        "abstained": True,
+                    },
+                )
+                self._log_pipeline_event(
+                    "field_judge_completed",
+                    "medical_document_processor",
+                    ai_call_context=ai_call_context,
+                    provider=judge_model_spec.provider,
+                    model=judge_model_spec.model,
+                    call_kind="field_judge",
+                    field_path="financial.packet",
+                    candidate_count=len(candidates),
+                    image_count=len(images),
+                    success=True,
+                    selected_candidate_index=None,
+                )
+                return None, judge_reason
+            if selected_index < 0 or selected_index >= len(candidates):
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=payload,
+                    result_context_payload={
+                        "field_path": "financial.packet",
+                        "selected_candidate_index": selected_index,
+                        "selected_candidate_valid": False,
+                        "abstained": False,
+                    },
+                )
+                self._log_pipeline_event(
+                    "field_judge_completed",
+                    "medical_document_processor",
+                    ai_call_context=ai_call_context,
+                    provider=judge_model_spec.provider,
+                    model=judge_model_spec.model,
+                    call_kind="field_judge",
+                    field_path="financial.packet",
+                    candidate_count=len(candidates),
+                    image_count=len(images),
+                    success=True,
+                    selected_candidate_index=selected_index,
+                    selected_candidate_valid=False,
+                )
+                return None, judge_reason
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                parsed_response_payload=payload,
+                result_context_payload={
+                    "field_path": "financial.packet",
+                    "selected_candidate_index": selected_index,
+                    "selected_candidate_valid": True,
+                    "abstained": False,
+                },
+            )
+            self._log_pipeline_event(
+                "field_judge_completed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=judge_model_spec.provider,
+                model=judge_model_spec.model,
+                call_kind="field_judge",
+                field_path="financial.packet",
+                candidate_count=len(candidates),
+                image_count=len(images),
+                success=True,
+                selected_candidate_index=selected_index,
+                selected_candidate_valid=True,
+            )
+            return selected_index, judge_reason
+        except Exception as exc:
+            self._log_pipeline_event(
+                "field_judge_failed",
+                "medical_document_processor",
+                ai_call_context=ai_call_context,
+                provider=judge_model_spec.provider,
+                model=judge_model_spec.model,
+                call_kind="field_judge",
+                field_path="financial.packet",
+                candidate_count=len(candidates),
+                image_count=len(images),
+                success=False,
+                **ai_pipeline_exception_fields(exc),
+            )
+            raise
 
 class DocumentValidationProcessor(BaseDocumentAIProcessor):
     def __init__(
@@ -1364,9 +1747,32 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                 model_name=model_spec.model,
                 call_kind="scan_validation",
                 success_context=ai_call_context,
+                prompt_file_path=self._prompt_file_path,
             )
-            payload = self._parse_ai_response_to_json(response.content)
-            result = DocumentValidationResponse.model_validate(payload)
+            try:
+                payload = self._parse_ai_response_to_json(response.content)
+            except HTTPException as exc:
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    response_validation_error=self._describe_exception(exc),
+                    result_context_payload={"call_kind": "scan_validation", "parse_succeeded": False},
+                )
+                raise
+            try:
+                result = DocumentValidationResponse.model_validate(payload)
+            except ValidationError as exc:
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=payload,
+                    response_validation_error=str(exc),
+                    result_context_payload={"call_kind": "scan_validation", "schema_valid": False},
+                )
+                raise
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                parsed_response_payload=payload,
+                result_context_payload={"call_kind": "scan_validation", "schema_valid": True},
+            )
             self._log_pipeline_event(
                 "validation_inference_completed",
                 "document_validation_processor",
@@ -1493,13 +1899,18 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
                     failures.append(f"{document_label}: the document is unreadable, blurred, or cropped.")
 
                 if not document.facility_identity_visible:
-                    failures.append(f"{document_label}: the medical facility identity is not clearly visible.")
+                    if self._can_accept_provider_identity_from_stamp(document):
+                        review_reasons.append(
+                            f"{document_label}: provider identity accepted from visible official stamp evidence."
+                        )
+                    else:
+                        failures.append(f"{document_label}: the medical facility identity is not clearly visible.")
 
                 if (
                     document.document_type in STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES
-                    and not (document.stamp_detected or document.signature_detected)
+                    and not (document.stamp_detected and document.signature_detected)
                 ):
-                    message = f"{document_label}: a visible facility stamp or doctor signature is required."
+                    message = f"{document_label}: a visible facility stamp and doctor signature is required."
                     if is_multi_document_image:
                         review_reasons.append(message)
                     else:
@@ -1536,6 +1947,14 @@ class DocumentValidationProcessor(BaseDocumentAIProcessor):
 
         result.review_reasons = list(dict.fromkeys(review_reasons))
         result.review_required = bool(result.review_reasons)
+
+    def _can_accept_provider_identity_from_stamp(self, document: DocumentValidationItem) -> bool:
+        return (
+            document.document_type in STRICT_STAMP_OR_SIGNATURE_REQUIRED_TYPES
+            and document.is_medical_document
+            and document.readability_ok
+            and document.stamp_detected
+        )
 
     def _build_document_failure(
         self,

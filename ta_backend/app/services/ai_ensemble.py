@@ -155,6 +155,12 @@ class MedicalExtractionOutcome:
 class FusionWorkingState:
     field_confidence: dict[str, Any] = field(default_factory=dict)
     judge_invocations: list[dict[str, Any]] = field(default_factory=list)
+    judge_attempt_count: int = 0
+    judge_applied_count: int = 0
+    judge_cached_hit_count: int = 0
+    judge_result_cache: dict[tuple[Any, ...], tuple[str | None, str | None]] = field(default_factory=dict)
+    financial_judge_attempt_count: int = 0
+    financial_judge_applied_count: int = 0
     list_group_meta: dict[str, Any] = field(default_factory=dict)
     inventory_conflicts: list[str] = field(default_factory=list)
     normalized_terms: list[dict[str, Any]] = field(default_factory=list)
@@ -178,15 +184,33 @@ class ReconciliationArtifacts:
     corrected_fields: list[dict[str, Any]]
     unresolved_conflicts: list[str]
     terbilang_consistency: dict[str, Any]
+    financial_resolution_mode: str
+    financial_evidence_summary: dict[str, Any]
+    financial_judge_skipped_reason: str | None
 
 
 JudgeFieldFn = Callable[[str, list[Any], list[dict[str, Any]]], Awaitable[tuple[str | None, str | None]]]
+JudgeFinancialPacketFn = Callable[[list[Any], list[dict[str, Any]]], Awaitable[tuple[int | None, str | None]]]
 
 
 class MedicalExtractionFusionEngine:
-    def __init__(self, *, judge_field: JudgeFieldFn) -> None:
+    def __init__(
+        self,
+        *,
+        judge_field: JudgeFieldFn,
+        judge_financial_packet: JudgeFinancialPacketFn | None = None,
+    ) -> None:
         self._judge_field = judge_field
+        self._judge_financial_packet = judge_financial_packet or self._default_judge_financial_packet
         self._calibration_artifact = load_self_consistency_calibration_artifact()
+
+    async def _default_judge_financial_packet(
+        self,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[int | None, str | None]:
+        del images, candidates
+        return None, None
 
     async def fuse(
         self,
@@ -269,6 +293,11 @@ class MedicalExtractionFusionEngine:
             successful_run_count=len(successful_traces),
             total_run_count=len(all_traces),
             judge_invocation_count=len(state.judge_invocations),
+            judge_attempt_count=state.judge_attempt_count,
+            judge_applied_count=state.judge_applied_count,
+            judge_cached_hit_count=state.judge_cached_hit_count,
+            financial_judge_attempt_count=state.financial_judge_attempt_count,
+            financial_judge_applied_count=state.financial_judge_applied_count,
             nullified_field_count=len(state.nullified_fields),
             review_required=review_required,
             overall_confidence=overall_confidence,
@@ -301,7 +330,7 @@ class MedicalExtractionFusionEngine:
             traces,
             images,
             state.field_confidence,
-            state.judge_invocations,
+            state,
             validation_hints=validation_hints,
             inventory_conflicts=state.inventory_conflicts,
         )
@@ -321,13 +350,13 @@ class MedicalExtractionFusionEngine:
             traces=traces,
             images=images,
             field_confidence=state.field_confidence,
-            judge_invocations=state.judge_invocations,
+            state=state,
         )
         medical_context = await self._fuse_medical_context(
             traces,
             images,
             state.field_confidence,
-            state.judge_invocations,
+            state,
             list_group_meta=state.list_group_meta,
         )
         ai_pipeline_log(
@@ -346,14 +375,14 @@ class MedicalExtractionFusionEngine:
             traces=traces,
             images=images,
             field_confidence=state.field_confidence,
-            judge_invocations=state.judge_invocations,
+            state=state,
         )
         medicines = await self._fuse_list_items(
             traces,
             images,
             "medicines",
             state.field_confidence,
-            state.judge_invocations,
+            state,
             validation_hints=validation_hints,
             list_group_meta=state.list_group_meta,
         )
@@ -375,7 +404,7 @@ class MedicalExtractionFusionEngine:
             images,
             "other_charges",
             state.field_confidence,
-            state.judge_invocations,
+            state,
             exclude_amount_keys=medicine_amount_keys,
             validation_hints=validation_hints,
             list_group_meta=state.list_group_meta,
@@ -408,7 +437,7 @@ class MedicalExtractionFusionEngine:
             result,
             images=images,
             field_confidence=state.field_confidence,
-            judge_invocations=state.judge_invocations,
+            state=state,
             list_group_meta=state.list_group_meta,
         )
         return ReconciliationArtifacts(
@@ -416,6 +445,9 @@ class MedicalExtractionFusionEngine:
             corrected_fields=cast(list[dict[str, Any]], reconciliation_meta.get("corrected_fields", [])),
             unresolved_conflicts=cast(list[str], reconciliation_meta.get("unresolved_conflicts", [])),
             terbilang_consistency=cast(dict[str, Any], reconciliation_meta.get("terbilang_consistency", {})),
+            financial_resolution_mode=cast(str, reconciliation_meta.get("financial_resolution_mode", "heuristic")),
+            financial_evidence_summary=cast(dict[str, Any], reconciliation_meta.get("financial_evidence_summary", {})),
+            financial_judge_skipped_reason=cast(str | None, reconciliation_meta.get("financial_judge_skipped_reason")),
         )
 
     def _apply_safe_output_policies(
@@ -460,10 +492,18 @@ class MedicalExtractionFusionEngine:
             "list_group_meta": state.list_group_meta,
             "constraint_checks": constraint_checks,
             "judge_invocations": state.judge_invocations,
+            "judge_attempt_count": state.judge_attempt_count,
+            "judge_applied_count": state.judge_applied_count,
+            "judge_cached_hit_count": state.judge_cached_hit_count,
+            "financial_judge_attempt_count": state.financial_judge_attempt_count,
+            "financial_judge_applied_count": state.financial_judge_applied_count,
             "packet_inventory_hints": validation_hints,
             "inventory_conflicts": state.inventory_conflicts,
             "derived_financials": reconciliation.derived_financials,
             "terbilang_consistency": reconciliation.terbilang_consistency,
+            "financial_resolution_mode": reconciliation.financial_resolution_mode,
+            "financial_evidence_summary": reconciliation.financial_evidence_summary,
+            "financial_judge_skipped_reason": reconciliation.financial_judge_skipped_reason,
             "corrected_fields": reconciliation.corrected_fields,
             "normalized_terms": state.normalized_terms,
             "nullified_fields": state.nullified_fields,
@@ -473,6 +513,55 @@ class MedicalExtractionFusionEngine:
             "review_reasons": review_reasons,
             "overall_confidence": overall_confidence,
         }
+
+    def _build_judge_cache_key(
+        self,
+        *,
+        field_path: str,
+        cache_field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[Any, ...]:
+        candidate_signature: list[tuple[str, int, int]] = []
+        for candidate in candidates:
+            producer_count = candidate.get("producer_count")
+            if not isinstance(producer_count, int):
+                producers = candidate.get("producers")
+                producer_count = len(cast(set[str], producers)) if isinstance(producers, set) else 0
+            support_count = candidate.get("run_count", candidate.get("support_count", 0))
+            candidate_signature.append(
+                (
+                    str(candidate.get("normalized_key")),
+                    int(support_count or 0),
+                    int(producer_count or 0),
+                )
+            )
+        return (field_path, cache_field_path, len(images), tuple(candidate_signature))
+
+    async def _judge_field_with_cache(
+        self,
+        state: FusionWorkingState,
+        *,
+        field_path: str,
+        cache_field_path: str,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        cache_key = self._build_judge_cache_key(
+            field_path=field_path,
+            cache_field_path=cache_field_path,
+            images=images,
+            candidates=candidates,
+        )
+        cached = state.judge_result_cache.get(cache_key)
+        if cached is not None:
+            state.judge_cached_hit_count += 1
+            return cached
+
+        state.judge_attempt_count += 1
+        result = await self._judge_field(field_path, images, candidates)
+        state.judge_result_cache[cache_key] = result
+        return result
 
     def _iter_summary_scalar_values(
         self,
@@ -550,7 +639,7 @@ class MedicalExtractionFusionEngine:
         traces: list[SuccessfulProducerInferenceTrace],
         images: list[Any],
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         *,
         validation_hints: dict[str, Any],
         inventory_conflicts: list[str],
@@ -558,7 +647,7 @@ class MedicalExtractionFusionEngine:
         detected_documents, detected_document_meta = await self._fuse_detected_documents(
             traces,
             images,
-            judge_invocations,
+            state,
             validation_hints=validation_hints,
             inventory_conflicts=inventory_conflicts,
         )
@@ -570,11 +659,11 @@ class MedicalExtractionFusionEngine:
                 values,
                 images,
                 field_confidence,
-                judge_invocations,
+                state,
             )
         return AIScanSummary(detected_documents=detected_documents, **fused_scalars)
 
-    async def _fuse_section_object(self, *, section_name: str, section_source: list[Any], fields: tuple[str, ...], section_model: Any, traces: list[SuccessfulProducerInferenceTrace], images: list[Any], field_confidence: dict[str, Any], judge_invocations: list[dict[str, Any]]) -> Any:
+    async def _fuse_section_object(self, *, section_name: str, section_source: list[Any], fields: tuple[str, ...], section_model: Any, traces: list[SuccessfulProducerInferenceTrace], images: list[Any], field_confidence: dict[str, Any], state: FusionWorkingState) -> Any:
         fused: dict[str, Any] = {}
         for field_name in fields:
             fused[field_name] = await self._fuse_scalar(
@@ -582,7 +671,7 @@ class MedicalExtractionFusionEngine:
                 [(trace, getattr(source, field_name)) for trace, source in zip(traces, section_source)],
                 images,
                 field_confidence,
-                judge_invocations,
+                state,
             )
         return section_model(**fused)
 
@@ -591,7 +680,7 @@ class MedicalExtractionFusionEngine:
         traces: list[SuccessfulProducerInferenceTrace],
         images: list[Any],
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         *,
         list_group_meta: dict[str, Any],
     ) -> AIScanMedicalContext:
@@ -606,9 +695,9 @@ class MedicalExtractionFusionEngine:
                 values,
                 images,
                 field_confidence,
-                judge_invocations,
+                state,
             )
-        diagnoses = await self._fuse_list_items(traces, images, "diagnoses", field_confidence, judge_invocations, list_group_meta=list_group_meta)
+        diagnoses = await self._fuse_list_items(traces, images, "diagnoses", field_confidence, state, list_group_meta=list_group_meta)
         return AIScanMedicalContext(
             anamnesis=fused_scalars["anamnesis"],
             diagnoses=diagnoses,
@@ -743,7 +832,7 @@ class MedicalExtractionFusionEngine:
         *,
         images: list[Any],
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         list_group_meta: dict[str, Any] | None,
     ) -> list[Any]:
         item_model, item_fields = self._list_item_schema(list_name)
@@ -762,7 +851,7 @@ class MedicalExtractionFusionEngine:
                     [(trace, getattr(item, field_name)) for trace, item in grouped_items],
                     images,
                     field_confidence,
-                    judge_invocations,
+                    state,
                     output_path=f"{path_prefix}.{field_name}",
                 )
             fused_items.append(item_model(**fused_fields))
@@ -776,7 +865,7 @@ class MedicalExtractionFusionEngine:
         images: list[Any],
         list_name: str,
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         *,
         exclude_amount_keys: set[str] | None = None,
         validation_hints: dict[str, Any] | None = None,
@@ -817,7 +906,7 @@ class MedicalExtractionFusionEngine:
             selected_groups,
             images=images,
             field_confidence=field_confidence,
-            judge_invocations=judge_invocations,
+            state=state,
             list_group_meta=list_group_meta,
         )
 
@@ -927,7 +1016,7 @@ class MedicalExtractionFusionEngine:
             return None
         return "flagged handwritten uncertainty for divergent low-support semantic candidates"
 
-    async def _fuse_scalar(self, field_path: str, values: list[tuple[SuccessfulProducerInferenceTrace, Any]], images: list[Any], field_confidence: dict[str, Any], judge_invocations: list[dict[str, Any]], *, output_path: str | None = None) -> Any:
+    async def _fuse_scalar(self, field_path: str, values: list[tuple[SuccessfulProducerInferenceTrace, Any]], images: list[Any], field_confidence: dict[str, Any], state: FusionWorkingState, *, output_path: str | None = None) -> Any:
         total_runs = len(values)
         total_producers = len({trace.producer_id for trace, _ in values})
         output_field_path = output_path or field_path
@@ -963,14 +1052,21 @@ class MedicalExtractionFusionEngine:
             close_runner_up=close_runner_up,
         )
         if judge_policy is not None:
-            selected_key, judge_reason = await self._judge_field(field_path, images, ranked[:3])
+            selected_key, judge_reason = await self._judge_field_with_cache(
+                state,
+                field_path=field_path,
+                cache_field_path=output_field_path,
+                images=images,
+                candidates=ranked[:3],
+            )
             if selected_key is not None:
                 matching = next((candidate for candidate in ranked if candidate["normalized_key"] == selected_key), None)
                 if matching is not None:
                     winner = matching
                     judge_used = True
                     rule_hits.append(judge_policy)
-                    judge_invocations.append({"field_path": output_field_path, "selected_candidate": winner["raw_value"], "reason": judge_reason})
+                    state.judge_applied_count += 1
+                    state.judge_invocations.append({"field_path": output_field_path, "selected_candidate": winner["raw_value"], "reason": judge_reason})
 
         consensus_features = self._build_self_consistency_features(
             field_path,
@@ -1350,23 +1446,57 @@ class MedicalExtractionFusionEngine:
             return None
         if runner_up is None:
             return None
+        if is_financial_field_path(field_path):
+            return None
         if field_path == "summary.service_date" and winner["normalized_key"] != runner_up["normalized_key"]:
             return "judge used for conflicting service date candidates"
-        if is_financial_field_path(field_path) and winner["normalized_key"] != runner_up["normalized_key"]:
-            return "judge used for conflicting financial candidates"
-        if output_field_path.startswith("medicines[") and output_field_path.endswith(".name") and self._materially_divergent_candidates(ranked):
+        if (
+            output_field_path.startswith("medicines[")
+            and output_field_path.endswith(".name")
+            and self._materially_divergent_candidates(ranked)
+            and not self._winner_has_strong_consensus_lead(winner, runner_up)
+        ):
             return "judge used for divergent medicine-name candidates"
-        if field_path.endswith(".dosage_instruction") and self._is_material_dosage_conflict(ranked, winner, runner_up):
+        if (
+            field_path.endswith(".dosage_instruction")
+            and self._is_material_dosage_conflict(ranked, winner, runner_up)
+            and not self._winner_has_strong_consensus_lead(winner, runner_up)
+        ):
             return "judge used for material dosage conflict"
-        if output_field_path in {"medical_context.anamnesis", "medical_context.therapy_note"} and self._materially_divergent_candidates(ranked):
+        if (
+            output_field_path in {"medical_context.anamnesis", "medical_context.therapy_note"}
+            and self._materially_divergent_candidates(ranked)
+            and not self._winner_has_strong_consensus_lead(winner, runner_up)
+        ):
             return "judge used for divergent handwritten semantic field"
-        if output_field_path.startswith("diagnoses[") and output_field_path.endswith(".description") and self._materially_divergent_candidates(ranked):
+        if (
+            output_field_path.startswith("diagnoses[")
+            and output_field_path.endswith(".description")
+            and self._materially_divergent_candidates(ranked)
+            and not self._winner_has_strong_consensus_lead(winner, runner_up)
+        ):
             return "judge used for divergent diagnosis candidates"
         if self._should_judge_patient_name(field_path, winner, runner_up):
             return "judge used for ambiguous patient-name candidates"
         if close_runner_up and is_critical_field_path(field_path):
             return "judge used for close critical-field conflict"
         return None
+
+    def _winner_has_strong_consensus_lead(
+        self,
+        winner: dict[str, Any],
+        runner_up: dict[str, Any] | None,
+    ) -> bool:
+        if runner_up is None:
+            return True
+        winner_run_count = int(winner.get("run_count", 0))
+        runner_up_run_count = int(runner_up.get("run_count", 0))
+        winner_producer_count = int(winner.get("producer_count", len(cast(set[str], winner.get("producers", set())))))
+        runner_up_producer_count = int(runner_up.get("producer_count", len(cast(set[str], runner_up.get("producers", set())))))
+        return (
+            winner_run_count >= runner_up_run_count + 2
+            and winner_producer_count >= runner_up_producer_count
+        )
 
     def _should_judge_patient_name(
         self,
@@ -1436,7 +1566,7 @@ class MedicalExtractionFusionEngine:
         field_path: str,
         images: list[Any],
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
     ) -> bool:
         meta = field_confidence.get(field_path)
         if not isinstance(meta, dict):
@@ -1456,7 +1586,13 @@ class MedicalExtractionFusionEngine:
         if len(candidate_inputs) <= 1:
             return False
 
-        selected_key, judge_reason = await self._judge_field(field_path, images, candidate_inputs)
+        selected_key, judge_reason = await self._judge_field_with_cache(
+            state,
+            field_path=field_path,
+            cache_field_path=field_path,
+            images=images,
+            candidates=candidate_inputs,
+        )
         if selected_key is None:
             return False
 
@@ -1472,7 +1608,8 @@ class MedicalExtractionFusionEngine:
         meta["rule_hits"] = [*meta.get("rule_hits", []), "judge applied after reconciliation conflict"]
         if "judge_resolved" not in meta.get("review_flags", []):
             meta.setdefault("review_flags", []).append("judge_resolved")
-        judge_invocations.append(
+        state.judge_applied_count += 1
+        state.judge_invocations.append(
             {
                 "field_path": field_path,
                 "selected_candidate": selected_candidate["raw_value"],
@@ -1522,15 +1659,26 @@ class MedicalExtractionFusionEngine:
         selected_other_charge_groups: list[dict[str, Any]],
         list_group_meta: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        candidates: list[dict[str, Any]] = []
-        seen_amounts: set[float | int] = set()
+        candidates_by_amount: dict[float | int, dict[str, Any]] = {}
+
+        def source_preference(candidate: dict[str, Any]) -> tuple[int, float, float]:
+            source_type = str(candidate.get("source_type", ""))
+            source_rank = {
+                "medicine_row": 3,
+                "visible_medicine_sum": 2,
+                "other_charge": 1,
+            }.get(source_type, 0)
+            support_score = self._support_score(candidate.get("support_count", 0), candidate.get("producer_count", 0))
+            return (source_rank, support_score, float(candidate.get("score", 0.0)))
 
         def add_candidate(candidate: dict[str, Any]) -> None:
             amount = coerce_numeric_value(candidate.get("amount"))
-            if amount is None or amount in seen_amounts:
+            if amount is None:
                 return
-            seen_amounts.add(amount)
-            candidates.append({**candidate, "amount": amount})
+            normalized_candidate = {**candidate, "amount": amount}
+            existing = candidates_by_amount.get(amount)
+            if existing is None or source_preference(normalized_candidate) > source_preference(existing):
+                candidates_by_amount[amount] = normalized_candidate
 
         for group in selected_other_charge_groups:
             if group.get("bucket") != "medicine":
@@ -1626,7 +1774,93 @@ class MedicalExtractionFusionEngine:
                 }
             )
 
-        return candidates
+        return list(candidates_by_amount.values())
+
+    def _support_score(self, support_count: Any, producer_count: Any) -> float:
+        return float(support_count or 0) + (0.2 * float(producer_count or 0))
+
+    def _serialize_financial_ledger_candidate(
+        self,
+        candidate: dict[str, Any],
+        *,
+        selected_other_charge_groups: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        selected_charge_entries: list[dict[str, Any]] = []
+        dropped_charge_entries: list[dict[str, Any]] = []
+
+        for index in cast(list[int], candidate.get("selected_group_indices", [])):
+            if index >= len(selected_other_charge_groups):
+                continue
+            group = selected_other_charge_groups[index]
+            representative = cast(dict[str, Any], group.get("representative_value") or {})
+            selected_charge_entries.append(
+                {
+                    "bucket": group.get("bucket"),
+                    "category": representative.get("category"),
+                    "description": representative.get("description"),
+                    "amount": representative.get("amount"),
+                    "support_count": group.get("support_count"),
+                    "producer_count": group.get("producer_count"),
+                }
+            )
+
+        for index in cast(list[int], candidate.get("dropped_group_indices", [])):
+            if index >= len(selected_other_charge_groups):
+                continue
+            group = selected_other_charge_groups[index]
+            representative = cast(dict[str, Any], group.get("representative_value") or {})
+            dropped_charge_entries.append(
+                {
+                    "bucket": group.get("bucket"),
+                    "category": representative.get("category"),
+                    "description": representative.get("description"),
+                    "amount": representative.get("amount"),
+                    "support_count": group.get("support_count"),
+                    "producer_count": group.get("producer_count"),
+                }
+            )
+
+        return {
+            "grand_total": candidate.get("grand_total"),
+            "total_medicines": candidate.get("medicine_total"),
+            "total_other_charges": candidate.get("other_total"),
+            "selected_other_charges": selected_charge_entries,
+            "dropped_other_charges": dropped_charge_entries,
+            "canonical_medicine_source": {
+                "source_type": cast(dict[str, Any], candidate.get("canonical_medicine_source") or {}).get("source_type"),
+                "amount": cast(dict[str, Any], candidate.get("canonical_medicine_source") or {}).get("amount"),
+                "support_count": cast(dict[str, Any], candidate.get("canonical_medicine_source") or {}).get("support_count"),
+                "producer_count": cast(dict[str, Any], candidate.get("canonical_medicine_source") or {}).get("producer_count"),
+            },
+            "evidence_summary": cast(dict[str, Any], candidate.get("evidence_summary") or {}),
+        }
+
+    def _build_financial_evidence_summary(
+        self,
+        ranked_candidates: list[dict[str, Any]],
+        *,
+        plausible_candidates: list[dict[str, Any]],
+        selected_candidate: dict[str, Any] | None,
+        selected_candidate_index: int | None,
+        selected_reason: str | None,
+        selected_other_charge_groups: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "candidate_count": len(ranked_candidates),
+            "coherent_candidate_count": len([candidate for candidate in ranked_candidates if candidate.get("coherent", False)]),
+            "plausible_candidate_count": len(plausible_candidates),
+            "selected_candidate_index": selected_candidate_index,
+            "selected_reason": selected_reason,
+            "top_candidates": [
+                self._serialize_financial_ledger_candidate(candidate, selected_other_charge_groups=selected_other_charge_groups)
+                for candidate in ranked_candidates[:3]
+            ],
+            "selected_candidate": (
+                self._serialize_financial_ledger_candidate(selected_candidate, selected_other_charge_groups=selected_other_charge_groups)
+                if selected_candidate is not None
+                else None
+            ),
+        }
 
     def _annotate_ledger_selection(
         self,
@@ -1725,12 +1959,13 @@ class MedicalExtractionFusionEngine:
         *,
         images: list[Any],
         field_confidence: dict[str, Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         list_group_meta: dict[str, Any],
     ) -> dict[str, Any]:
         corrected_fields: list[dict[str, Any]] = []
         unresolved_conflicts: list[str] = []
         reconciliation_notes: list[str] = []
+        financial_resolution_mode = "heuristic"
         reconciliation_notes.extend(
             self._prune_noisy_medicines_for_reconciliation(
                 result,
@@ -1756,47 +1991,50 @@ class MedicalExtractionFusionEngine:
             "financial_recap": result.financial_recap.model_dump(),
         }
 
-        best_subset = self._choose_best_ledger_subset(
+        ranked_ledger_candidates = self._enumerate_ledger_subset_candidates(
             selected_groups,
             medicine_candidates=medicine_ledger_candidates,
             supported_targets=supported_targets,
             medicine_line_items_null_dominant=medicine_line_items_null_dominant,
         )
+        best_subset = ranked_ledger_candidates[0] if ranked_ledger_candidates else None
+        plausible_candidates = self._select_plausible_ledger_candidates(ranked_ledger_candidates)
+        selected_candidate_index: int | None = None
+        selected_candidate_reason: str | None = None
+        financial_judge_skipped_reason: str | None = None
 
         if (
             best_subset is not None
             and best_subset.get("coherent", False)
-            and self._should_defer_coherent_financial_override(
-                result=result,
-                best_subset=best_subset,
-                supported_targets=supported_targets,
-            )
+            and len(plausible_candidates) > 1
         ):
-            reconciliation_notes.append(
-                "Deferred coherent reconciliation override because it materially diverged from stronger consensus totals."
-            )
-            unresolved_conflicts.append(
-                "Financial reconciliation candidate was coherent but materially weaker than the existing consensus totals."
-            )
-            current_grand_total = coerce_numeric_value(result.financial_recap.grand_total)
-            preserved_subset = self._choose_best_ledger_subset(
-                selected_groups,
-                medicine_candidates=medicine_ledger_candidates,
-                supported_targets=supported_targets,
-                medicine_line_items_null_dominant=medicine_line_items_null_dominant,
-                preferred_grand_total=current_grand_total,
-            )
-            if preserved_subset is not None and preserved_subset.get("coherent", False):
-                best_subset = {
-                    **preserved_subset,
-                    "deferred_by_consensus_guard": True,
-                }
+            if self._has_dominant_financial_candidate(plausible_candidates):
+                financial_judge_skipped_reason = "dominant_candidate"
+                reconciliation_notes.append(
+                    "Skipped packet-level financial adjudication because the strongest heuristic ledger was already dominant."
+                )
             else:
-                best_subset = {
-                    **best_subset,
-                    "coherent": False,
-                    "deferred_by_consensus_guard": True,
-                }
+                serialized_plausible_candidates = [
+                    self._serialize_financial_ledger_candidate(candidate, selected_other_charge_groups=selected_groups)
+                    for candidate in plausible_candidates
+                ]
+                selected_candidate_index, selected_candidate_reason = await self._adjudicate_financial_packet(
+                    images=images,
+                    candidates=serialized_plausible_candidates,
+                    state=state,
+                )
+                if selected_candidate_index is not None:
+                    best_subset = plausible_candidates[selected_candidate_index]
+                    financial_resolution_mode = "adjudicated"
+                    reconciliation_notes.append("Packet-level financial adjudication selected the strongest receipt-backed ledger.")
+                else:
+                    if self._has_dominant_financial_candidate(plausible_candidates):
+                        best_subset = plausible_candidates[0]
+                        reconciliation_notes.append("Packet-level financial adjudication abstained; kept the strongest receipt-backed heuristic ledger.")
+                    else:
+                        best_subset = None
+                        unresolved_conflicts.append("Financial packet adjudication could not confidently select between multiple plausible ledgers.")
+                        reconciliation_notes.append("Preserved extracted financial totals because packet-level adjudication abstained on an ambiguous ledger conflict.")
 
         if best_subset is not None and best_subset.get("coherent", False):
             dropped_indices = cast(list[int], best_subset["dropped_group_indices"])
@@ -1837,16 +2075,9 @@ class MedicalExtractionFusionEngine:
                     "reconciled from canonical packet ledger",
                 )
         else:
+            best_subset = None
             price_counted_in_ledger = []
             financial_outlier_suppressions = []
-            for field_path in FINANCIAL_TOTAL_FIELD_SEQUENCE[1:] + FINANCIAL_TOTAL_FIELD_SEQUENCE[:1]:
-                await self._maybe_rejudge_field_from_candidates(
-                    result,
-                    field_path=field_path,
-                    images=images,
-                    field_confidence=field_confidence,
-                    judge_invocations=judge_invocations,
-                )
             unresolved_conflicts.append("Financial totals could not be reconciled into a coherent packet ledger.")
 
         terbilang_consistency = self._extract_terbilang_consistency(
@@ -1867,12 +2098,30 @@ class MedicalExtractionFusionEngine:
         if forced_non_null_fields:
             reconciliation_notes.append("Financial totals were backfilled with strongest available candidates to avoid null outputs.")
 
+        nullified_inconsistent_fields: list[dict[str, Any]] = []
+        if best_subset is None:
+            nullified_inconsistent_fields = self._nullify_inconsistent_financial_recap(
+                result,
+                field_confidence=field_confidence,
+                corrected_fields=corrected_fields,
+            )
+            if nullified_inconsistent_fields:
+                reconciliation_notes.append("Conflicting financial recap fields were cleared because no coherent packet ledger was available.")
+
         selected_group_meta["reconciliation"] = {
             "supported_targets": supported_targets,
             "selected_subset": best_subset,
             "terbilang_consistency": terbilang_consistency,
             "notes": reconciliation_notes,
         }
+        financial_evidence_summary = self._build_financial_evidence_summary(
+            ranked_ledger_candidates,
+            plausible_candidates=plausible_candidates,
+            selected_candidate=best_subset,
+            selected_candidate_index=selected_candidate_index,
+            selected_reason=selected_candidate_reason,
+            selected_other_charge_groups=selected_groups,
+        )
 
         return {
             "derived_financials": {
@@ -1884,7 +2133,11 @@ class MedicalExtractionFusionEngine:
                 "financial_outlier_suppressions": financial_outlier_suppressions,
                 "selected_subset": best_subset,
                 "terbilang_consistency": terbilang_consistency,
+                "financial_resolution_mode": financial_resolution_mode,
+                "financial_evidence_summary": financial_evidence_summary,
+                "financial_judge_skipped_reason": financial_judge_skipped_reason,
                 "forced_non_null_fields": forced_non_null_fields,
+                "nullified_inconsistent_fields": nullified_inconsistent_fields,
                 "notes": reconciliation_notes,
                 "post_reconciliation": {
                     "summary_total_amount": result.summary.total_amount,
@@ -1895,6 +2148,9 @@ class MedicalExtractionFusionEngine:
             "corrected_fields": corrected_fields,
             "unresolved_conflicts": list(dict.fromkeys(unresolved_conflicts)),
             "terbilang_consistency": terbilang_consistency,
+            "financial_resolution_mode": financial_resolution_mode,
+            "financial_evidence_summary": financial_evidence_summary,
+            "financial_judge_skipped_reason": financial_judge_skipped_reason,
         }
 
     def _extract_supported_numeric_targets(self, field_confidence: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -1916,8 +2172,61 @@ class MedicalExtractionFusionEngine:
                     }
                 )
             if field_targets:
-                targets[field_path] = field_targets
+                targets[field_path] = self._cluster_supported_numeric_targets(field_targets)
         return targets
+
+    def _numeric_total_tolerance(self, left: float | int, right: float | int) -> float:
+        max_value = max(abs(float(left)), abs(float(right)))
+        return max(1000.0, min(5000.0, max_value * 0.002))
+
+    def _cluster_supported_numeric_targets(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        clusters: list[list[dict[str, Any]]] = []
+        for candidate in sorted(candidates, key=lambda item: float(coerce_numeric_value(item.get("value")) or 0)):
+            candidate_value = coerce_numeric_value(candidate.get("value"))
+            if candidate_value is None:
+                continue
+            matched_cluster: list[dict[str, Any]] | None = None
+            for cluster in clusters:
+                cluster_values = [coerce_numeric_value(item.get("value")) for item in cluster]
+                cluster_values = [value for value in cluster_values if value is not None]
+                if not cluster_values:
+                    continue
+                cluster_anchor = sorted(float(value) for value in cluster_values)[len(cluster_values) // 2]
+                if abs(float(candidate_value) - cluster_anchor) <= self._numeric_total_tolerance(candidate_value, cluster_anchor):
+                    matched_cluster = cluster
+                    break
+            if matched_cluster is None:
+                clusters.append([candidate])
+            else:
+                matched_cluster.append(candidate)
+
+        clustered_candidates: list[dict[str, Any]] = []
+        for cluster in clusters:
+            representative = max(
+                cluster,
+                key=lambda item: (
+                    int(item.get("support_count", 0)),
+                    int(item.get("producer_count", 0)),
+                    -abs(float(coerce_numeric_value(item.get("value")) or 0) - float(coerce_numeric_value(cluster[0].get("value")) or 0)),
+                ),
+            )
+            clustered_candidates.append(
+                {
+                    **representative,
+                    "support_count": sum(int(item.get("support_count", 0)) for item in cluster),
+                    "producer_count": max(int(item.get("producer_count", 0)) for item in cluster),
+                    "cluster_values": [coerce_numeric_value(item.get("value")) for item in cluster],
+                }
+            )
+
+        clustered_candidates.sort(
+            key=lambda item: (
+                -int(item.get("support_count", 0)),
+                -int(item.get("producer_count", 0)),
+                float(coerce_numeric_value(item.get("value")) or 0),
+            )
+        )
+        return clustered_candidates
 
     def _score_numeric_match(self, value: float | int | None, candidates: list[dict[str, Any]]) -> tuple[bool, float]:
         numeric_value = coerce_numeric_value(value)
@@ -1925,7 +2234,10 @@ class MedicalExtractionFusionEngine:
             return False, 0.0
         for candidate in candidates:
             candidate_value = coerce_numeric_value(candidate.get("value"))
-            if candidate_value is not None and abs(float(candidate_value) - float(numeric_value)) < 0.01:
+            if candidate_value is not None and abs(float(candidate_value) - float(numeric_value)) <= self._numeric_total_tolerance(
+                numeric_value,
+                candidate_value,
+            ):
                 return True, float(candidate.get("support_count", 0)) + (0.2 * float(candidate.get("producer_count", 0)))
         return False, 0.0
 
@@ -2089,6 +2401,8 @@ class MedicalExtractionFusionEngine:
         if preferred_grand_total is None and best_subset is not None:
             preferred_grand_total = coerce_numeric_value(best_subset.get("grand_total"))
         if preferred_grand_total is None:
+            preferred_grand_total = coerce_numeric_value(result.summary.total_amount)
+        if preferred_grand_total is None:
             best_supported = supported_targets.get("summary.total_amount", []) or supported_targets.get("financial_recap.grand_total", [])
             if best_supported:
                 preferred_grand_total = coerce_numeric_value(best_supported[0].get("value"))
@@ -2145,42 +2459,37 @@ class MedicalExtractionFusionEngine:
 
         return forced_fields
 
-    def _should_defer_coherent_financial_override(
-        self,
-        *,
-        result: AIMedicalScanResponse,
-        best_subset: dict[str, Any],
-        supported_targets: dict[str, list[dict[str, Any]]],
-    ) -> bool:
-        current_grand_total = coerce_numeric_value(result.financial_recap.grand_total)
-        candidate_grand_total = coerce_numeric_value(best_subset.get("grand_total"))
-        if current_grand_total is None or candidate_grand_total is None:
+    def _group_duplicates_medicine_amount(self, group: dict[str, Any], medicine_total: float | int | None) -> bool:
+        amount = coerce_numeric_value(group.get("amount"))
+        if amount is None or medicine_total is None:
             return False
-
-        relative_delta = abs(float(candidate_grand_total) - float(current_grand_total)) / max(abs(float(current_grand_total)), 1.0)
-        if relative_delta < RECONCILIATION_LARGE_OVERRIDE_RATIO_THRESHOLD:
+        if abs(float(amount) - float(medicine_total)) > self._numeric_total_tolerance(amount, medicine_total):
             return False
-
-        target_candidates = [
-            *supported_targets.get("summary.total_amount", []),
-            *supported_targets.get("financial_recap.grand_total", []),
-        ]
-        _, current_support_score = self._score_numeric_match(current_grand_total, target_candidates)
-        _, candidate_support_score = self._score_numeric_match(candidate_grand_total, target_candidates)
-        if current_support_score <= 0.0:
-            return False
-
-        canonical_source = cast(dict[str, Any], best_subset.get("canonical_medicine_source") or {})
-        canonical_source_support = float(canonical_source.get("support_count", 0)) + (0.2 * float(canonical_source.get("producer_count", 0)))
-        dropped_count = len(cast(list[int], best_subset.get("dropped_group_indices", [])))
-
-        return (
-            candidate_support_score <= current_support_score
-            and canonical_source_support <= RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD
-            and dropped_count >= RECONCILIATION_HEAVY_DROP_COUNT_THRESHOLD
+        representative_value_raw = group.get("representative_value")
+        representative_value = cast(dict[str, Any], representative_value_raw) if isinstance(representative_value_raw, dict) else {}
+        combined_text = normalize_whitespace(
+            f"{representative_value.get('category') or ''} {representative_value.get('description') or ''}"
+        ).casefold()
+        normalized_text = normalize_comparison_text(combined_text)
+        return any(
+            keyword in normalized_text
+            for keyword in (
+                "apotek",
+                "apotik",
+                "farmasi",
+                "instalasifarmasi",
+                "notapenjualan",
+                "obatobatan",
+                "pembelianobat",
+                "pharmacy",
+                "prescription",
+                "resep",
+                "salinanresep",
+                "strukobat",
+            )
         )
 
-    def _choose_best_ledger_subset(
+    def _enumerate_ledger_subset_candidates(
         self,
         selected_groups: list[dict[str, Any]],
         *,
@@ -2188,11 +2497,11 @@ class MedicalExtractionFusionEngine:
         supported_targets: dict[str, list[dict[str, Any]]],
         medicine_line_items_null_dominant: bool,
         preferred_grand_total: float | int | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         if not selected_groups and not medicine_candidates:
-            return None
+            return []
 
-        best_choice: dict[str, Any] | None = None
+        ranked_candidates: list[dict[str, Any]] = []
         non_medicine_indices = [index for index, group in enumerate(selected_groups) if group.get("bucket") != "medicine"]
         require_grand_total_match = bool(supported_targets.get("summary.total_amount") or supported_targets.get("financial_recap.grand_total"))
         candidate_sources = medicine_candidates or [
@@ -2208,10 +2517,15 @@ class MedicalExtractionFusionEngine:
 
         for medicine_candidate in candidate_sources:
             subset_medicine_total = coerce_numeric_value(medicine_candidate.get("amount"))
-            for subset_size in range(len(non_medicine_indices) + 1):
-                for subset_indices_tuple in combinations(non_medicine_indices, subset_size):
+            medicine_duplicate_indices = {
+                index
+                for index in non_medicine_indices
+                if self._group_duplicates_medicine_amount(selected_groups[index], subset_medicine_total)
+            }
+            eligible_non_medicine_indices = [index for index in non_medicine_indices if index not in medicine_duplicate_indices]
+            for subset_size in range(len(eligible_non_medicine_indices) + 1):
+                for subset_indices_tuple in combinations(eligible_non_medicine_indices, subset_size):
                     subset_indices = list(subset_indices_tuple)
-
                     subset_groups = [selected_groups[index] for index in subset_indices]
                     subset_other_total = self._sum_defined_numbers(
                         [cast(float | int | None, group.get("amount")) for group in subset_groups]
@@ -2220,7 +2534,6 @@ class MedicalExtractionFusionEngine:
                     if preferred_grand_total is not None:
                         if subset_grand_total is None or abs(float(subset_grand_total) - float(preferred_grand_total)) >= 0.01:
                             continue
-                    output_indices = list(subset_indices)
 
                     total_match, total_match_score = self._score_numeric_match(
                         subset_grand_total,
@@ -2238,51 +2551,245 @@ class MedicalExtractionFusionEngine:
                         supported_targets.get("financial_recap.total_other_charges", []),
                     )
 
-                    coherent = total_match or not require_grand_total_match
                     support_score = float(medicine_candidate.get("score", 0.0)) + sum(float(group.get("score", 0.0)) for group in subset_groups)
                     dropped_indices = [index for index in range(len(selected_groups)) if index not in subset_indices]
-                    canonical_source_support = float(medicine_candidate.get("support_count", 0)) + (0.2 * float(medicine_candidate.get("producer_count", 0)))
-                    weak_source_penalty = 0.4 if canonical_source_support < RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD else 0.0
+                    canonical_source_support = self._support_score(
+                        medicine_candidate.get("support_count", 0),
+                        medicine_candidate.get("producer_count", 0),
+                    )
                     canonical_source_type = str(medicine_candidate.get("source_type", ""))
+                    weak_source_penalty = 0.4 if canonical_source_support < RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD else 0.0
                     weak_packet_source_penalty = 0.0
                     if medicine_line_items_null_dominant and canonical_source_type == "other_charge":
                         if canonical_source_support < (RECONCILIATION_WEAK_SOURCE_SUPPORT_THRESHOLD + 0.6):
                             weak_packet_source_penalty = 0.6
+                    selected_group_support_score = sum(
+                        self._support_score(group.get("support_count", 0), group.get("producer_count", 0))
+                        for group in subset_groups
+                    )
+                    dropped_strong_group_support_score = sum(
+                        self._support_score(selected_groups[index].get("support_count", 0), selected_groups[index].get("producer_count", 0))
+                        for index in dropped_indices
+                        if selected_groups[index].get("bucket") != "medicine"
+                        and index not in medicine_duplicate_indices
+                        and self._support_score(selected_groups[index].get("support_count", 0), selected_groups[index].get("producer_count", 0)) >= 1.0
+                    )
+                    receipt_backed_packet = (
+                        selected_group_support_score >= 1.0
+                        and canonical_source_support >= 1.0
+                        and dropped_strong_group_support_score == 0
+                        and medicine_match
+                        and other_match
+                        and subset_grand_total is not None
+                    )
+                    coherent = total_match or not require_grand_total_match or receipt_backed_packet
+                    explicit_medicine_source_bonus = 0.75 if canonical_source_type in {"medicine_row", "visible_medicine_sum"} else 0.0
+                    evidence_strength = (
+                        total_match_score
+                        + other_match_score
+                        + medicine_match_score
+                        + selected_group_support_score
+                        + canonical_source_support
+                        + explicit_medicine_source_bonus
+                        - dropped_strong_group_support_score
+                        - weak_source_penalty
+                        - weak_packet_source_penalty
+                    )
                     dropped_count_penalty = 0.5 * len(dropped_indices)
-                    candidate_choice = {
-                        "coherent": coherent,
-                        "selected_group_indices": subset_indices,
-                        "output_indices": output_indices,
-                        "medicine_total": subset_medicine_total,
-                        "other_total": subset_other_total,
-                        "grand_total": subset_grand_total,
-                        "canonical_medicine_source": medicine_candidate,
-                        "dropped_group_indices": dropped_indices,
-                        "dropped_outlier_keys": [
-                            selected_groups[index]["key"]
-                            for index in dropped_indices
-                            if selected_groups[index].get("bucket") != "medicine"
-                        ],
-                        "dropped_medicine_charge_count": len(
-                            [index for index in dropped_indices if selected_groups[index].get("bucket") == "medicine"]
-                        ),
-                        "score_tuple": (
-                            1 if coherent else 0,
-                            1 if total_match else 0,
-                            total_match_score,
-                            1 if medicine_match else 0,
-                            medicine_match_score,
-                            1 if other_match else 0,
-                            other_match_score,
-                            canonical_source_support,
-                            support_score - weak_source_penalty - weak_packet_source_penalty,
-                            -dropped_count_penalty,
-                        ),
-                    }
-                    if best_choice is None or candidate_choice["score_tuple"] > best_choice["score_tuple"]:
-                        best_choice = candidate_choice
+                    ranked_candidates.append(
+                        {
+                            "coherent": coherent,
+                            "selected_group_indices": subset_indices,
+                            "output_indices": list(subset_indices),
+                            "medicine_total": subset_medicine_total,
+                            "other_total": subset_other_total,
+                            "grand_total": subset_grand_total,
+                            "canonical_medicine_source": medicine_candidate,
+                            "dropped_group_indices": dropped_indices,
+                            "dropped_outlier_keys": [
+                                selected_groups[index]["key"]
+                                for index in dropped_indices
+                                if selected_groups[index].get("bucket") != "medicine"
+                            ],
+                            "dropped_medicine_charge_count": len(
+                                [
+                                    index
+                                    for index in dropped_indices
+                                    if selected_groups[index].get("bucket") == "medicine" or index in medicine_duplicate_indices
+                                ]
+                            ),
+                            "evidence_summary": {
+                                "grand_total_match_score": total_match_score,
+                                "medicine_total_match_score": medicine_match_score,
+                                "other_total_match_score": other_match_score,
+                                "selected_group_support_score": round(selected_group_support_score, 4),
+                                "dropped_strong_group_support_score": round(dropped_strong_group_support_score, 4),
+                                "canonical_medicine_source_support": round(canonical_source_support, 4),
+                                "canonical_medicine_source_type": canonical_source_type,
+                                "uses_packet_level_medicine_proxy": canonical_source_type == "other_charge",
+                                "receipt_backed_packet": receipt_backed_packet,
+                                "evidence_strength": round(evidence_strength, 4),
+                            },
+                            "score_tuple": (
+                                1 if coherent else 0,
+                                -dropped_strong_group_support_score,
+                                total_match_score,
+                                1 if total_match else 0,
+                                evidence_strength,
+                                other_match_score,
+                                1 if canonical_source_type in {"medicine_row", "visible_medicine_sum"} else 0,
+                                support_score - weak_source_penalty - weak_packet_source_penalty,
+                                -dropped_count_penalty,
+                            ),
+                        }
+                    )
 
-        return best_choice
+        ranked_candidates.sort(key=lambda candidate: cast(tuple[Any, ...], candidate["score_tuple"]), reverse=True)
+        return ranked_candidates
+
+    def _select_plausible_ledger_candidates(
+        self,
+        ranked_candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        coherent_candidates = [candidate for candidate in ranked_candidates if candidate.get("coherent", False)]
+        if not coherent_candidates:
+            return []
+        best_candidate = coherent_candidates[0]
+        plausible: list[dict[str, Any]] = [best_candidate]
+        seen_totals = {
+            (
+                coerce_numeric_value(best_candidate.get("grand_total")),
+                coerce_numeric_value(best_candidate.get("medicine_total")),
+                coerce_numeric_value(best_candidate.get("other_total")),
+            )
+        }
+
+        for candidate in coherent_candidates[1:]:
+            if len(plausible) >= 20:
+                break
+            candidate_totals = (
+                coerce_numeric_value(candidate.get("grand_total")),
+                coerce_numeric_value(candidate.get("medicine_total")),
+                coerce_numeric_value(candidate.get("other_total")),
+            )
+            if candidate_totals in seen_totals:
+                continue
+            plausible.append(candidate)
+            seen_totals.add(candidate_totals)
+        return plausible
+
+    def _has_dominant_financial_candidate(self, plausible_candidates: list[dict[str, Any]]) -> bool:
+        if len(plausible_candidates) <= 1:
+            return True
+        best_candidate = plausible_candidates[0]
+        runner_up = plausible_candidates[1]
+        best_grand_total = coerce_numeric_value(best_candidate.get("grand_total"))
+        runner_grand_total = coerce_numeric_value(runner_up.get("grand_total"))
+        best_summary = cast(dict[str, Any], best_candidate.get("evidence_summary") or {})
+        runner_summary = cast(dict[str, Any], runner_up.get("evidence_summary") or {})
+        best_strength = float(best_summary.get("evidence_strength", 0.0))
+        runner_strength = float(runner_summary.get("evidence_strength", 0.0))
+        if best_grand_total is not None and runner_grand_total is not None:
+            material_difference_threshold = max(5000.0, 0.03 * min(float(best_grand_total), float(runner_grand_total)))
+            if abs(float(best_grand_total) - float(runner_grand_total)) > material_difference_threshold:
+                best_receipt_backed = bool(best_summary.get("receipt_backed_packet", False))
+                runner_receipt_backed = bool(runner_summary.get("receipt_backed_packet", False))
+                best_grand_match_score = float(best_summary.get("grand_total_match_score", 0.0))
+                runner_grand_match_score = float(runner_summary.get("grand_total_match_score", 0.0))
+                clearly_better_total_support = (best_grand_match_score - runner_grand_match_score) >= 1.0
+                if (
+                    not (best_receipt_backed or clearly_better_total_support)
+                    or (
+                        runner_receipt_backed
+                        and not clearly_better_total_support
+                        and (best_strength - runner_strength) < 3.0
+                    )
+                ):
+                    return False
+        return (
+            (best_strength - runner_strength) >= 1.25
+            and float(best_summary.get("grand_total_match_score", 0.0)) >= float(runner_summary.get("grand_total_match_score", 0.0))
+            and float(best_summary.get("other_total_match_score", 0.0)) >= float(runner_summary.get("other_total_match_score", 0.0))
+        )
+
+    async def _adjudicate_financial_packet(
+        self,
+        *,
+        images: list[Any],
+        candidates: list[dict[str, Any]],
+        state: FusionWorkingState,
+    ) -> tuple[int | None, str | None]:
+        state.financial_judge_attempt_count += 1
+        selected_index, reason = await self._judge_financial_packet(images, candidates)
+        if selected_index is None or not isinstance(selected_index, int):
+            return None, reason
+        if selected_index < 0 or selected_index >= len(candidates):
+            return None, reason
+        state.financial_judge_applied_count += 1
+        return selected_index, reason
+
+    def _choose_best_ledger_subset(
+        self,
+        selected_groups: list[dict[str, Any]],
+        *,
+        medicine_candidates: list[dict[str, Any]],
+        supported_targets: dict[str, list[dict[str, Any]]],
+        medicine_line_items_null_dominant: bool,
+        preferred_grand_total: float | int | None = None,
+    ) -> dict[str, Any] | None:
+        ranked_candidates = self._enumerate_ledger_subset_candidates(
+            selected_groups,
+            medicine_candidates=medicine_candidates,
+            supported_targets=supported_targets,
+            medicine_line_items_null_dominant=medicine_line_items_null_dominant,
+            preferred_grand_total=preferred_grand_total,
+        )
+        return ranked_candidates[0] if ranked_candidates else None
+
+    def _nullify_inconsistent_financial_recap(
+        self,
+        result: AIMedicalScanResponse,
+        *,
+        field_confidence: dict[str, Any],
+        corrected_fields: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        total_medicines = coerce_numeric_value(result.financial_recap.total_medicines)
+        total_other_charges = coerce_numeric_value(result.financial_recap.total_other_charges)
+        grand_total = coerce_numeric_value(result.financial_recap.grand_total)
+        if total_medicines is None or total_other_charges is None or grand_total is None:
+            return []
+        expected_grand_total = self._sum_defined_numbers([total_medicines, total_other_charges])
+        if expected_grand_total is None or abs(float(expected_grand_total) - float(grand_total)) <= self._numeric_total_tolerance(
+            expected_grand_total,
+            grand_total,
+        ):
+            return []
+
+        nullified: list[dict[str, Any]] = []
+        for field_path in (
+            "summary.total_amount",
+            "financial_recap.total_medicines",
+            "financial_recap.total_other_charges",
+            "financial_recap.grand_total",
+        ):
+            original_value = self._get_field_value(result, field_path)
+            if original_value is None:
+                continue
+            self._set_field_value(result, field_path, None)
+            meta = field_confidence.get(field_path)
+            if isinstance(meta, dict):
+                meta["selected_value"] = None
+                meta.setdefault("rule_hits", []).append("cleared because financial totals were internally inconsistent")
+                meta.setdefault("review_flags", []).append("financial_reconciliation_failed")
+            entry = {
+                "field_path": field_path,
+                "original_value": original_value,
+                "corrected_value": None,
+                "reason": "cleared because financial totals were internally inconsistent",
+            }
+            nullified.append(entry)
+            corrected_fields.append(entry)
+        return nullified
 
     def _apply_reconciled_numeric_field(
         self,
@@ -2764,7 +3271,7 @@ class MedicalExtractionFusionEngine:
         self,
         traces: list[SuccessfulProducerInferenceTrace],
         images: list[Any],
-        judge_invocations: list[dict[str, Any]],
+        state: FusionWorkingState,
         *,
         validation_hints: dict[str, Any],
         inventory_conflicts: list[str],
@@ -2866,29 +3373,35 @@ class MedicalExtractionFusionEngine:
         judge_used = False
         judge_reason: str | None = None
         if advisory_expansion_used and slot_conflicts and final_docs != base_docs[: len(final_docs)]:
-            selected_key, judge_reason = await self._judge_field(
-                "summary.detected_documents",
-                images,
-                [
-                    {
-                        "normalized_key": "validation_advisory",
-                        "raw_value": final_docs,
-                        "run_count": len(final_docs),
-                        "producers": set(range(max(total_producers, 1))),
-                    },
-                    {
-                        "normalized_key": "primary_order",
-                        "raw_value": base_docs[: len(final_docs)],
-                        "run_count": len(base_docs[: len(final_docs)]),
-                        "producers": {0},
-                    },
-                ],
+            judge_candidates = [
+                {
+                    "normalized_key": "validation_advisory",
+                    "raw_value": final_docs,
+                    "run_count": len(final_docs),
+                    "producer_count": max(total_producers, 1),
+                    "producers": set(range(max(total_producers, 1))),
+                },
+                {
+                    "normalized_key": "primary_order",
+                    "raw_value": base_docs[: len(final_docs)],
+                    "run_count": len(base_docs[: len(final_docs)]),
+                    "producer_count": 1,
+                    "producers": {0},
+                },
+            ]
+            selected_key, judge_reason = await self._judge_field_with_cache(
+                state,
+                field_path="summary.detected_documents",
+                cache_field_path="summary.detected_documents",
+                images=images,
+                candidates=judge_candidates,
             )
             if selected_key == "primary_order":
                 final_docs = base_docs[: len(final_docs)]
             judge_used = selected_key in {"validation_advisory", "primary_order"}
             if judge_used:
-                judge_invocations.append(
+                state.judge_applied_count += 1
+                state.judge_invocations.append(
                     {
                         "field_path": "summary.detected_documents",
                         "selected_candidate": final_docs,
@@ -2933,6 +3446,19 @@ class MedicalExtractionFusionEngine:
                     continue
                 if not other_charge_kinds_share_family(candidate_kind, existing_kind):
                     continue
+                if candidate_kind == existing_kind and candidate_kind in {
+                    "administration",
+                    "consultation",
+                    "laboratory",
+                    "room",
+                    "service",
+                }:
+                    return existing_key
+                if {normalize_other_charge_bucket(candidate_kind), normalize_other_charge_bucket(existing_kind)} <= {
+                    "consultation",
+                    "service",
+                }:
+                    return existing_key
                 if not candidate_descriptor or not existing_descriptor:
                     continue
                 if (
@@ -2963,4 +3489,8 @@ class MedicalExtractionFusionEngine:
             return False
 
         _, amount_text, _ = parse_other_charge_group_key(group_key)
-        return amount_text in exclude_amount_keys if amount_text is not None else False
+        if amount_text is None:
+            return False
+        amount = coerce_numeric_value(amount_text)
+        amount_key = normalize_candidate_key("other_charges.amount", amount)
+        return amount_key in exclude_amount_keys

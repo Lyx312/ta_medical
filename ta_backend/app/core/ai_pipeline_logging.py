@@ -11,7 +11,7 @@ from typing import Any, Iterator
 AI_PIPELINE_LOGGER_NAME = "app.ai_pipeline"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _OWNED_HANDLER_FLAG = "_ai_pipeline_owned_handler"
-_MAX_TERMINAL_ERROR_LEN = 255
+_MAX_TERMINAL_ERROR_LEN = 512
 _SUPPRESSED_EVENT_KEYS = {
     ("document_validation_processor", "document_validation_started"),
     ("document_validation_processor", "document_validation_completed"),
@@ -230,12 +230,20 @@ def format_ai_pipeline_terminal_line(event: str, fields: dict[str, Any]) -> str 
             f"ok={fields.get('successful_run_count', 0)}/{fields.get('total_run_count', 0)}",
         )
     if event == "field_judge_completed":
+        selected_candidate_valid = fields.get("selected_candidate_valid")
+        if selected_candidate_valid is True:
+            selected_status = "selected=yes"
+        elif selected_candidate_valid is False:
+            selected_status = "selected=invalid"
+        else:
+            selected_status = "selected=none"
         return _join_parts(
             prefix,
             "JUDGE",
             "done",
             f"field={fields.get('field_path')}" if fields.get("field_path") else None,
             f"candidates={fields.get('candidate_count')}" if fields.get("candidate_count") is not None else None,
+            selected_status,
         )
     if event == "field_judge_failed":
         return _join_parts(prefix, "JUDGE", "failed", f"field={fields.get('field_path')}" if fields.get("field_path") else None, f"err={error_message}" if error_message else None)
@@ -263,11 +271,15 @@ def format_ai_pipeline_terminal_line(event: str, fields: dict[str, Any]) -> str 
         )
     if event == "ensemble_fusion_completed":
         confidence = _format_confidence(fields.get("overall_confidence"))
+        judge_applied_count = fields.get("judge_applied_count", fields.get("judge_invocation_count", 0))
+        judge_attempt_count = fields.get("judge_attempt_count", judge_applied_count)
+        judge_cached_hit_count = fields.get("judge_cached_hit_count", 0)
         return _join_parts(
             prefix,
             "FUSE",
             "done",
-            f"judges={fields.get('judge_invocation_count', 0)}",
+            f"judges={judge_applied_count}/{judge_attempt_count}",
+            f"cache={judge_cached_hit_count}" if judge_cached_hit_count else None,
             f"nulls={fields.get('nullified_field_count', 0)}",
             f"conf={confidence}" if confidence else None,
             f"review={review_required}",

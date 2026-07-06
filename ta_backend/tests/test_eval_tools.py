@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from eval import generate_template, run_evaluation
 from eval.cli_utils import ensure_family_candidates, guess_mime_type, register_test_user
-from eval.evaluator import MedicalClaimEvaluator
+from eval.evaluator import EVALUATOR_SCHEMA_VERSION, PRIMARY_METRIC, MedicalClaimEvaluator
 from eval.ground_truth import GroundTruthError, load_ground_truth
 from eval.medicine_matcher import match_medicines
 from eval.result_store import (
@@ -24,6 +24,24 @@ from eval.result_store import (
     resolve_run_record_path,
     save_latest_snapshot,
 )
+
+
+def _minimal_eval_payload() -> dict[str, object]:
+    return {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
 
 
 def build_stub_eval_app(scan_status: int = 200) -> FastAPI:
@@ -254,19 +272,55 @@ def test_medical_claim_evaluator_scores_perfect_match() -> None:
 
     result = evaluator.evaluate(payload, payload)
 
-    assert result["overall_f1"] == 1.0
+    assert result["schema_version"] == EVALUATOR_SCHEMA_VERSION
+    assert result["primary_metric"] == PRIMARY_METRIC
+    assert result["strict_kie_micro"]["f1"] == 1.0
     assert result["per_section"]["summary"]["f1"] == 1.0
     assert result["per_section"]["patient_info"]["f1"] == 1.0
     assert result["per_section"]["medical_context"]["f1"] == 1.0
     assert result["per_section"]["medicines"]["f1"] == 1.0
     assert result["per_section"]["other_charges"]["f1"] == 1.0
     assert result["per_field"]["summary.service_date"]["f1"] == 1.0
-    assert result["soft_f1"] == 1.0
-    assert result["strict_f1"] == 1.0
-    assert result["pass_verify_only"] is True
+    assert result["field_exact_accuracy"]["accuracy"] == 1.0
+    assert result["diagnostics"]["usability"]["pass_verify_only"] is True
 
 
-def test_medical_claim_evaluator_strict_medicine_penalizes_partial_name_matches() -> None:
+def test_medical_claim_evaluator_clinical_text_matches_punctuation_equivalent_anamnesis() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {
+            "anamnesis": "Demam + Pusing + Pegal + Nyeri telan + Batuk",
+            "diagnoses": [],
+            "therapy_note": None,
+        },
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "medical_context": {
+            "anamnesis": "Demam + Pusing + Pegal (+) Nyeri telan (+) Batuk (+)",
+            "diagnoses": [],
+            "therapy_note": None,
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["medical_context.anamnesis"]["f1"] == 1.0
+
+
+def test_medical_claim_evaluator_strict_medicine_allows_obvious_ocr_near_match() -> None:
     evaluator = MedicalClaimEvaluator()
     predicted = {
         "summary": {
@@ -280,7 +334,7 @@ def test_medical_claim_evaluator_strict_medicine_penalizes_partial_name_matches(
         "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
         "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
         "medicines": [
-            {"name": "Paracetmol", "quantity": 10, "unit": "TABLET", "dosage_instruction": None, "unit_price": None, "total_price": 10000}
+            {"name": "Lapnon", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None}
         ],
         "other_charges": [],
         "financial_recap": {"total_medicines": 10000, "total_other_charges": 115000, "grand_total": 125000},
@@ -288,16 +342,47 @@ def test_medical_claim_evaluator_strict_medicine_penalizes_partial_name_matches(
     ground_truth = {
         **predicted,
         "medicines": [
-            {"name": "Paracetamol", "quantity": 10, "unit": "TABLET", "dosage_instruction": None, "unit_price": None, "total_price": 10000}
+            {"name": "Lapron", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None}
         ],
     }
 
     result = evaluator.evaluate(predicted, ground_truth)
 
-    assert result["per_section"]["medicines"]["soft_f1"] >= result["per_section"]["medicines"]["strict_f1"]
-    assert result["per_section"]["medicines"]["strict_f1"] < 1.0
-    assert result["per_field"]["medicines"]["avg_similarity"] > 0.0
-    assert result["pass_verify_only"] is False
+    assert result["entity_metrics"]["medicines"]["f1"] == 1.0
+    assert result["medicine_details"]["matches"][0]["similarity"] >= 0.78
+
+
+def test_medical_claim_evaluator_strict_medicine_rejects_unrelated_names_even_with_null_quantity() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi Klinik Sehat"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [
+            {"name": "Vitamin C", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None}
+        ],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "medicines": [
+            {"name": "Amoxicillin", "quantity": None, "unit": None, "dosage_instruction": None, "unit_price": None, "total_price": None}
+        ],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["entity_metrics"]["medicines"]["f1"] == 0.0
+    assert result["medicine_details"]["unmatched_predicted"][0]["name"] == "Vitamin C"
+    assert result["medicine_details"]["unmatched_ground_truth"][0]["name"] == "Amoxicillin"
 
 
 def test_medical_claim_evaluator_strict_other_charge_requires_amount_and_category() -> None:
@@ -325,9 +410,13 @@ def test_medical_claim_evaluator_strict_other_charge_requires_amount_and_categor
 
     result = evaluator.evaluate(predicted, ground_truth)
 
+    usability = result["diagnostics"]["usability"]
     assert result["per_section"]["other_charges"]["strict_f1"] == 0.0
-    assert result["per_section"]["other_charges"]["soft_f1"] <= 1.0
-    assert result["pass_verify_only"] is False
+    assert result["entity_metrics"]["other_charges"]["f1"] == 0.0
+    assert "other_charges KIE F1 below relaxed verify-only threshold" in usability["advisory_fail_reasons"]
+    assert usability["blocking_fail_reasons"] == []
+    assert usability["critical_fail_reasons"] == []
+    assert usability["pass_verify_only"] is True
 
 
 def test_medical_claim_evaluator_strict_detects_financial_mismatch_as_critical() -> None:
@@ -345,7 +434,7 @@ def test_medical_claim_evaluator_strict_detects_financial_mismatch_as_critical()
         "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
         "medicines": [],
         "other_charges": [],
-        "financial_recap": {"total_medicines": 10000, "total_other_charges": 115000, "grand_total": 130000},
+        "financial_recap": {"total_medicines": 10000, "total_other_charges": 115000, "grand_total": 160000},
     }
     ground_truth = {
         **payload,
@@ -354,9 +443,109 @@ def test_medical_claim_evaluator_strict_detects_financial_mismatch_as_critical()
 
     result = evaluator.evaluate(payload, ground_truth)
 
-    assert any("financial_recap.grand_total strict mismatch" == reason for reason in result["critical_fail_reasons"])
-    assert result["edit_burden_score"] >= evaluator.t.EDIT_COST_FINANCIAL_MISMATCH
-    assert result["pass_verify_only"] is False
+    usability = result["diagnostics"]["usability"]
+    assert any("financial_recap.grand_total outside verify-only tolerance" == reason for reason in usability["critical_fail_reasons"])
+    assert usability["blocking_fail_reasons"] == usability["critical_fail_reasons"]
+    assert usability["edit_burden_score"] >= evaluator.t.EDIT_COST_FINANCIAL_MISMATCH
+    assert usability["pass_verify_only"] is False
+    assert result["financial_exact_accuracy"]["incorrect_fields"] == ["financial_recap.grand_total"]
+
+
+def test_medical_claim_evaluator_verify_only_allows_small_financial_tolerance() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
+    predicted["financial_recap"] = {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 130000}
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert result["per_field"]["financial_recap.grand_total"]["strict_f1"] == 0.0
+    assert result["financial_exact_accuracy"]["incorrect_fields"] == ["financial_recap.grand_total"]
+    assert usability["blocking_fail_reasons"] == []
+    assert usability["critical_fail_reasons"] == []
+    assert usability["edit_burden_score"] == evaluator.t.EDIT_COST_PARTIAL_MATCH
+    assert usability["pass_verify_only"] is True
+
+
+def test_medical_claim_evaluator_verify_only_blocks_large_financial_difference() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
+    predicted["financial_recap"] = {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 151000}
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert "financial_recap.grand_total outside verify-only tolerance" in usability["blocking_fail_reasons"]
+    assert usability["critical_fail_reasons"] == usability["blocking_fail_reasons"]
+    assert usability["pass_verify_only"] is False
+
+
+def test_medical_claim_evaluator_verify_only_blocks_patient_name_mismatch() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "patient_info": {**predicted["patient_info"], "name": "Siti Aminah"},
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert result["per_field"]["patient_info.name"]["strict_f1"] == 0.0
+    assert "patient_info.name exact mismatch" in usability["blocking_fail_reasons"]
+    assert usability["critical_fail_reasons"] == usability["blocking_fail_reasons"]
+    assert usability["pass_verify_only"] is False
+
+
+def test_medical_claim_evaluator_verify_only_relaxes_high_similarity_facility_text() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "summary": {**predicted["summary"], "medical_facility_name": "RS Sehat Sentosa"},
+    }
+    predicted["summary"] = {**predicted["summary"], "medical_facility_name": "RS Sht Sentosa"}
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert result["per_field"]["summary.medical_facility_name"]["strict_f1"] == 0.0
+    assert result["relaxed_text"]["by_field"]["summary.medical_facility_name"]["average_anls"] >= 0.8
+    assert usability["critical_fail_reasons"] == []
+    assert usability["advisory_fail_reasons"] == []
+    assert usability["pass_verify_only"] is True
+
+
+def test_medical_claim_evaluator_verify_only_treats_date_mismatches_as_advisory() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "summary": {
+            **predicted["summary"],
+            "service_date": "2024-08-09",
+            "transaction_date": "2024-08-09",
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert result["per_field"]["summary.service_date"]["strict_f1"] == 0.0
+    assert result["per_field"]["summary.transaction_date"]["strict_f1"] == 0.0
+    assert "summary.service_date exact mismatch" in usability["advisory_fail_reasons"]
+    assert "summary.transaction_date exact mismatch" in usability["advisory_fail_reasons"]
+    assert usability["blocking_fail_reasons"] == []
+    assert usability["critical_fail_reasons"] == []
+    assert usability["pass_verify_only"] is True
 
 
 def test_medical_claim_evaluator_detected_documents_preserves_order_and_duplicates() -> None:
@@ -387,8 +576,62 @@ def test_medical_claim_evaluator_detected_documents_preserves_order_and_duplicat
     result = evaluator.evaluate(predicted, ground_truth)
 
     assert result["per_field"]["summary.detected_documents"]["f1"] == 0.6667
-    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 0.0
+    assert result["per_field"]["summary.detected_documents"]["strict_f1"] == 0.6667
+    assert result["per_field"]["summary.detected_documents"]["sequence_exact"] is False
     assert result["per_field"]["summary.detected_documents"]["matched_sequence"] == ["receipt", "receipt"]
+    assert result["diagnostics"]["usability"]["pass_verify_only"] is True
+
+
+def test_medical_claim_evaluator_edit_burden_counts_missing_list_item_once() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "medicines": [
+            {
+                "name": "Paracetamol",
+                "quantity": None,
+                "unit": None,
+                "dosage_instruction": None,
+                "unit_price": None,
+                "total_price": None,
+            }
+        ],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["entity_metrics"]["medicines"]["fn"] == 1
+    assert result["per_section"]["medicines"]["fn"] == 1.0
+    assert result["diagnostics"]["usability"]["edit_burden_score"] == evaluator.t.EDIT_COST_MISSING_ITEM
+
+
+def test_medical_claim_evaluator_verify_only_blocks_high_edit_burden_without_hard_failures() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = _minimal_eval_payload()
+    ground_truth = {
+        **predicted,
+        "medicines": [
+            {
+                "name": f"Medicine {index}",
+                "quantity": None,
+                "unit": None,
+                "dosage_instruction": None,
+                "unit_price": None,
+                "total_price": None,
+            }
+            for index in range(20)
+        ],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    usability = result["diagnostics"]["usability"]
+    assert usability["edit_burden_score"] > evaluator.t.VERIFY_ONLY_MAX_EDIT_BURDEN
+    assert "medicines KIE F1 below relaxed verify-only threshold" in usability["advisory_fail_reasons"]
+    assert usability["blocking_fail_reasons"] == []
+    assert usability["critical_fail_reasons"] == []
+    assert usability["pass_verify_only"] is False
 
 
 def test_medical_claim_evaluator_detected_documents_normalizes_prompt_and_internal_labels() -> None:
@@ -487,6 +730,36 @@ def test_medical_claim_evaluator_strict_facility_rejects_wrong_entity() -> None:
     assert result["per_field"]["summary.medical_facility_name"]["strict_f1"] == 0.0
 
 
+def test_medical_claim_evaluator_facility_matches_known_ubaya_alias() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "klinik ubaya",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 125000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 125000, "grand_total": 125000},
+    }
+    ground_truth = {
+        **predicted,
+        "summary": {
+            **predicted["summary"],
+            "medical_facility_name": "Klinik Pratama Universitas Surabaya",
+        },
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["per_field"]["summary.medical_facility_name"]["strict_f1"] == 1.0
+
+
 def test_medical_claim_evaluator_detected_documents_supports_doctor_lab_and_radiology_types() -> None:
     evaluator = MedicalClaimEvaluator()
     predicted = {
@@ -554,7 +827,7 @@ def test_medical_claim_evaluator_other_charge_normalizes_legacy_labels_to_prompt
 
     result = evaluator.evaluate(predicted, ground_truth)
 
-    assert result["per_section"]["other_charges"]["soft_f1"] == 1.0
+    assert result["per_section"]["other_charges"]["f1"] == 1.0
     assert result["per_section"]["other_charges"]["strict_f1"] == 1.0
 
 
@@ -585,6 +858,37 @@ def test_medical_claim_evaluator_other_charge_uses_description_fallback_only_whe
     assert result["per_section"]["other_charges"]["strict_f1"] == 1.0
 
 
+def test_medical_claim_evaluator_ignores_amount_null_duplicate_other_charge() -> None:
+    evaluator = MedicalClaimEvaluator()
+    predicted = {
+        "summary": {
+            "detected_documents": ["Kwitansi"],
+            "medical_facility_name": "RS Sehat Sentosa",
+            "service_date": "2024-08-10",
+            "transaction_date": None,
+            "currency": "IDR",
+            "total_amount": 70000,
+        },
+        "patient_info": {"name": "Budi Saputra", "date_of_birth": None, "age": None, "gender": None, "address": None},
+        "medical_context": {"anamnesis": None, "diagnoses": [], "therapy_note": None},
+        "medicines": [],
+        "other_charges": [
+            {"category": "ADMINISTRATION", "description": "Administrasi - Test Swab Antigen Covid-19", "amount": 70000},
+            {"category": "ADMINISTRATION", "description": "Administrasi", "amount": None},
+        ],
+        "financial_recap": {"total_medicines": 0, "total_other_charges": 70000, "grand_total": 70000},
+    }
+    ground_truth = {
+        **predicted,
+        "other_charges": [{"category": "SERVICE", "description": "Administrasi; Test Swab Antigen Covid-19", "amount": 70000}],
+    }
+
+    result = evaluator.evaluate(predicted, ground_truth)
+
+    assert result["entity_metrics"]["other_charges"]["f1"] == 1.0
+    assert result["other_charges_details"]["unmatched_predicted"] == []
+
+
 def test_medical_claim_evaluator_other_charge_strict_rejects_category_mismatch_with_similar_description() -> None:
     evaluator = MedicalClaimEvaluator()
     predicted = {
@@ -609,7 +913,7 @@ def test_medical_claim_evaluator_other_charge_strict_rejects_category_mismatch_w
 
     result = evaluator.evaluate(predicted, ground_truth)
 
-    assert result["per_section"]["other_charges"]["soft_f1"] >= 0.0
+    assert result["per_section"]["other_charges"]["f1"] == 0.0
     assert result["per_section"]["other_charges"]["strict_f1"] == 0.0
 
 
@@ -640,27 +944,120 @@ def test_build_aggregate_summary_includes_per_field_scores() -> None:
             {
                 "scan_source": "cache",
                 "score": {
-                    "overall_f1": 0.8,
-                    "per_section": {"summary": {"f1": 0.8}},
-                    "per_field": {"summary.service_date": {"f1": 1.0}},
+                    "strict_kie_micro": {"f1": 0.8, "precision": 0.8, "recall": 0.8, "tp": 4, "fp": 1, "fn": 1, "applicable": True},
+                    "strict_kie_section_macro_f1": 0.8,
+                    "per_section": {"summary": {"f1": 0.8, "precision": 0.8, "recall": 0.8, "tp": 4, "fp": 1, "fn": 1, "applicable": True}},
+                    "per_field": {"summary.service_date": {"f1": 1.0, "precision": 1.0, "recall": 1.0, "tp": 1, "fp": 0, "fn": 0, "applicable": True}},
+                    "field_exact_accuracy": {"correct": 1, "total": 1, "incorrect_fields": [], "accuracy": 1.0},
+                    "financial_exact_accuracy": {"correct": 0, "total": 0, "incorrect_fields": [], "accuracy": 0.0},
+                    "relaxed_text": {"average_anls": 1.0, "average_cer": 0.0, "count": 1},
+                    "diagnostics": {"usability": {"edit_burden_score": 0.0, "pass_verify_only": True}},
                 },
             },
             {
                 "scan_source": "fresh_scan",
                 "score": {
-                    "overall_f1": 0.6,
-                    "per_section": {"summary": {"f1": 0.6}},
-                    "per_field": {"summary.service_date": {"f1": 0.5}},
+                    "strict_kie_micro": {"f1": 0.6, "precision": 0.6, "recall": 0.6, "tp": 3, "fp": 2, "fn": 2, "applicable": True},
+                    "strict_kie_section_macro_f1": 0.6,
+                    "per_section": {"summary": {"f1": 0.6, "precision": 0.6, "recall": 0.6, "tp": 3, "fp": 2, "fn": 2, "applicable": True}},
+                    "per_field": {"summary.service_date": {"f1": 0.5, "precision": 0.5, "recall": 0.5, "tp": 1, "fp": 1, "fn": 1, "applicable": True}},
+                    "field_exact_accuracy": {"correct": 0, "total": 1, "incorrect_fields": ["summary.service_date"], "accuracy": 0.0},
+                    "financial_exact_accuracy": {"correct": 0, "total": 0, "incorrect_fields": [], "accuracy": 0.0},
+                    "relaxed_text": {"average_anls": 0.5, "average_cer": 0.5, "count": 1},
+                    "diagnostics": {"usability": {"edit_burden_score": 1.0, "pass_verify_only": False}},
                 },
             },
         ]
     )
 
-    assert summary["overall_macro_f1"] == 0.7
+    assert summary["schema_version"] == EVALUATOR_SCHEMA_VERSION
+    assert summary["strict_kie_micro"]["f1"] == 0.7
+    assert summary["strict_kie_macro_f1"] == 0.7
     assert summary["per_section_macro_f1"]["summary"] == 0.7
     assert summary["per_field_macro_f1"]["summary.service_date"] == 0.75
+    assert summary["field_exact_accuracy"]["accuracy"] == 0.5
+    assert summary["relaxed_text"]["average_anls"] == 0.75
     assert summary["claims_from_cache"] == 1
     assert summary["claims_from_fresh_scan"] == 1
+
+
+def test_build_aggregate_summary_reports_token_usage_from_run_records() -> None:
+    base_score = {
+        "strict_kie_micro": {"f1": 1.0, "precision": 1.0, "recall": 1.0, "tp": 1, "fp": 0, "fn": 0, "applicable": True},
+        "strict_kie_section_macro_f1": 1.0,
+        "per_section": {},
+        "per_field": {},
+        "field_exact_accuracy": {"correct": 0, "total": 0, "incorrect_fields": [], "accuracy": 0.0},
+        "financial_exact_accuracy": {"correct": 0, "total": 0, "incorrect_fields": [], "accuracy": 0.0},
+        "relaxed_text": {"average_anls": 0.0, "average_cer": 0.0, "count": 0},
+        "diagnostics": {"usability": {"edit_burden_score": 0.0, "pass_verify_only": True}},
+    }
+    summary = run_evaluation.build_aggregate_summary(
+        [
+            {
+                "scan_source": "fresh_scan",
+                "score": base_score,
+                "run_record": {
+                    "scan_log": {
+                        "ai_api_calls": [
+                            {
+                                "success": True,
+                                "prompt_tokens": 100,
+                                "completion_tokens": 20,
+                                "total_tokens": 120,
+                                "latency_ms": 900,
+                            },
+                            {
+                                "success": True,
+                                "prompt_tokens": 60,
+                                "completion_tokens": 10,
+                                "total_tokens": 70,
+                                "latency_ms": 600,
+                            },
+                        ]
+                    }
+                },
+            },
+            {
+                "scan_source": "cache",
+                "score": base_score,
+                "run_record": {
+                    "scan_log": {
+                        "ai_api_calls": [
+                            {
+                                "success": False,
+                                "prompt_tokens": 40,
+                                "completion_tokens": 5,
+                                "total_tokens": None,
+                                "latency_ms": 300,
+                            }
+                        ]
+                    }
+                },
+            },
+            {
+                "scan_source": "cache",
+                "score": base_score,
+                "run_record": {"scan_log": {"ai_api_calls": []}},
+            },
+        ]
+    )
+
+    token_usage = summary["token_usage"]
+    assert token_usage["claims_with_usage"] == 2
+    assert token_usage["api_call_count"] == 3
+    assert token_usage["successful_api_call_count"] == 2
+    assert token_usage["failed_api_call_count"] == 1
+    assert token_usage["total_input_tokens"] == 200
+    assert token_usage["total_output_tokens"] == 35
+    assert token_usage["total_tokens"] == 235
+    assert token_usage["average_input_tokens"] == 100.0
+    assert token_usage["average_output_tokens"] == 17.5
+    assert token_usage["average_total_tokens"] == 117.5
+    assert token_usage["average_input_tokens_per_call"] == 66.6667
+    assert token_usage["average_output_tokens_per_call"] == 11.6667
+    assert token_usage["average_total_tokens_per_call"] == 78.3333
+    assert token_usage["average_latency_ms_per_call"] == 600.0
 
 
 def test_discover_image_files_prefers_images_subfolder(tmp_path: Path) -> None:
@@ -708,7 +1105,7 @@ def test_run_single_evaluation_success_with_stubbed_app(tmp_path: Path, monkeypa
     result = asyncio.run(run_evaluation.run_single_evaluation(claim_dir, results_dir=results_dir))
 
     assert result["claim_id"] == "claim_001"
-    assert result["score"]["overall_f1"] == 1.0
+    assert result["score"]["strict_kie_micro"]["f1"] == 1.0
     assert result["scan_source"] == "fresh_scan"
     latest = load_latest_snapshot(results_dir, "claim_001")
     assert latest is not None
@@ -781,11 +1178,16 @@ def test_run_evaluation_main_writes_output_json(tmp_path: Path, monkeypatch: pyt
             "scan_source": "cache",
             "predicted": {},
             "score": {
-                "overall_f1": 0.9,
+                "strict_kie_micro": {"f1": 0.9, "precision": 0.9, "recall": 0.9, "tp": 9, "fp": 1, "fn": 1, "applicable": True},
+                "strict_kie_section_macro_f1": 0.9,
                 "per_section": {
-                    "summary": {"f1": 0.9, "precision": 0.9, "recall": 0.9, "tp": 1, "fp": 0, "fn": 0}
+                    "summary": {"f1": 0.9, "precision": 0.9, "recall": 0.9, "tp": 9, "fp": 1, "fn": 1, "applicable": True}
                 },
-                "per_field": {"summary.service_date": {"f1": 1.0}},
+                "per_field": {"summary.service_date": {"f1": 1.0, "precision": 1.0, "recall": 1.0, "tp": 1, "fp": 0, "fn": 0, "applicable": True}},
+                "field_exact_accuracy": {"correct": 1, "total": 1, "incorrect_fields": [], "accuracy": 1.0},
+                "financial_exact_accuracy": {"correct": 0, "total": 0, "incorrect_fields": [], "accuracy": 0.0},
+                "relaxed_text": {"average_anls": 0.0, "average_cer": 0.0, "count": 0},
+                "diagnostics": {"usability": {"edit_burden_score": 0.0, "pass_verify_only": True}},
             },
         }
 
@@ -796,7 +1198,9 @@ def test_run_evaluation_main_writes_output_json(tmp_path: Path, monkeypatch: pyt
     run_evaluation.main()
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["aggregate_summary"]["overall_macro_f1"] == 0.9
+    assert payload["evaluation_schema"] == EVALUATOR_SCHEMA_VERSION
+    assert payload["aggregate_summary"]["strict_kie_micro"]["f1"] == 0.9
+    assert payload["aggregate_summary"]["strict_kie_macro_f1"] == 0.9
     assert payload["aggregate_summary"]["per_field_macro_f1"]["summary.service_date"] == 1.0
     assert payload["aggregate_summary"]["claims_from_cache"] == 1
 

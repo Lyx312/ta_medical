@@ -15,7 +15,14 @@ from app.db.session import get_db_session
 from app.repositories.claim_repository import ClaimFileCreate, ClaimRepository
 from app.repositories.scan_log_repository import ScanLogRepository
 from app.schemas.auth import TokenData
-from app.schemas.claim import ClaimDetailResponse, ClaimMedicine, ClaimMedicineInput, ClaimResponse, parse_claim_date
+from app.schemas.claim import (
+    ClaimDetailResponse,
+    ClaimFileResponse,
+    ClaimMedicine,
+    ClaimMedicineInput,
+    ClaimResponse,
+    parse_claim_date,
+)
 from app.services.ai_service import DocumentImageInput, DocumentValidationProcessor
 from app.services.ai_service import build_patient_name_verification_error
 from app.services.ai_service import matches_any_patient_name_candidate
@@ -35,6 +42,10 @@ class BufferedUpload:
     content: bytes
     byte_size: int
     sha256_hash: str
+
+
+def build_data_url(mime_type: str, content: bytes) -> str:
+    return f"data:{mime_type};base64,{base64.b64encode(content).decode('utf-8')}"
 
 
 def build_claim_response(claim: Any) -> ClaimResponse:
@@ -92,6 +103,17 @@ def build_claim_detail_response(claim: Any) -> ClaimDetailResponse:
         status=claim.status,
         source_scan_log_id=claim.source_scan_log_id,
         created_at=claim.created_at,
+        files=[
+            ClaimFileResponse(
+                id=claim_file.id,
+                filename=claim_file.filename,
+                mime_type=claim_file.mime_type,
+                byte_size=claim_file.byte_size,
+                sha256_hash=claim_file.sha256_hash,
+                file_data_url=build_data_url(claim_file.mime_type, claim_file.content),
+            )
+            for claim_file in claim.files
+        ],
         source_scan_extraction_payload=(
             source_scan_log.extraction_payload if source_scan_log is not None else None
         ),

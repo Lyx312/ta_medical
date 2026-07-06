@@ -43,6 +43,6 @@ def get_settings() -> Settings:
         cohere_api_key=os.getenv("COHERE_API_KEY", ""),
         cerebras_api_key=os.getenv("CEREBRAS_API_KEY", ""),
         jwt_secret=os.getenv("JWT_SECRET", "fallback_dev_secret_change_this"),
-        access_token_expire_minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080")),
+        access_token_expire_minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080")), # 7 days
         database_url=os.getenv("DATABASE_URL", "sqlite:///./app.db"),
     )

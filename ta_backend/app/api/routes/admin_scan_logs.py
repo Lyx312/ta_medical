@@ -147,6 +147,13 @@ async def get_scan_log(
                 latency_ms=call.latency_ms,
                 usage_payload=call.usage_payload,
                 request_context_payload=call.request_context_payload,
+                prompt_file_path=call.prompt_file_path,
+                prompt_payload=call.prompt_payload,
+                raw_response_text=call.raw_response_text,
+                response_content_payload=call.response_content_payload,
+                parsed_response_payload=call.parsed_response_payload,
+                response_validation_error=call.response_validation_error,
+                result_context_payload=call.result_context_payload,
                 created_at=call.created_at,
             )
             for call in scan_log.ai_api_call_logs

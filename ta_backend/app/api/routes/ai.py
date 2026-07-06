@@ -4,7 +4,8 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.routes.auth import get_current_user_dependency
@@ -36,7 +37,12 @@ from app.services.ai_service import (
 )
 from app.services.scan_medicine_prioritization import prioritize_scan_medicines
 from app.services.image_preprocessing import preprocess_document_image
-from app.services.scan_progress import ScanProgressReporter, ScanStageProgress
+from app.services.scan_progress import (
+    ScanProgressReporter,
+    ScanStageProgress,
+    generate_scan_progress_sse,
+    scan_progress_event_hub,
+)
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 processor = MedicalDocumentProcessor(settings=get_settings())
@@ -250,7 +256,7 @@ def build_default_progress_for_scan_log(scan_log: ScanLog) -> dict[str, Any]:
         return build_scan_progress(
             stage="completed",
             title="Ready to review",
-            detail="Scan finished successfully.",
+            detail="Results are ready for you to review.",
             percent=100,
             status_value="succeeded",
         )
@@ -265,7 +271,7 @@ def build_default_progress_for_scan_log(scan_log: ScanLog) -> dict[str, Any]:
     return build_scan_progress(
         stage="queued",
         title="Preparing scan",
-        detail="Waiting for scan job to start.",
+        detail="Waiting to start server-side processing.",
         percent=0,
         status_value="pending",
     )
@@ -304,6 +310,31 @@ def build_scan_job_status_response(scan_log: ScanLog) -> AIScanJobStatusResponse
         result=build_user_scan_documents_response(scan_log) if scan_log.status == "succeeded" else None,
         error_message=extract_error_message_from_scan_log(scan_log) if progress.status == "failed" else None,
     )
+
+
+def is_scan_log_terminal(scan_log: ScanLog) -> bool:
+    return scan_log.status not in {"pending", "running"}
+
+
+def resolve_scan_job_event_name(scan_log: ScanLog) -> str:
+    if scan_log.status == "succeeded":
+        return "completed"
+    if scan_log.status == "cancelled":
+        return "cancelled"
+    if scan_log.status not in {"pending", "running"}:
+        return "failed"
+    return "progress"
+
+
+def publish_scan_job_status_event(scan_log: ScanLog) -> AIScanJobStatusResponse:
+    payload = build_scan_job_status_response(scan_log)
+    scan_progress_event_hub.publish(
+        scan_log.id,
+        event=cast(Any, resolve_scan_job_event_name(scan_log)),
+        payload=payload.model_dump(mode="json"),
+        terminal=is_scan_log_terminal(scan_log),
+    )
+    return payload
 
 
 async def execute_scan_documents_pipeline(
@@ -348,7 +379,7 @@ async def execute_scan_documents_pipeline(
     ) -> None:
         if progress_reporter is None:
             return
-        progress_reporter.set(
+        updated_scan_log = progress_reporter.set(
             ScanStageProgress(
                 stage=stage,
                 title=title,
@@ -362,6 +393,7 @@ async def execute_scan_documents_pipeline(
                 medicine_count=medicine_count,
             )
         )
+        publish_scan_job_status_event(updated_scan_log)
 
     async def handle_processor_progress(payload: dict[str, Any]) -> None:
         event = str(payload.get("event", "")).strip()
@@ -372,7 +404,7 @@ async def execute_scan_documents_pipeline(
             set_progress(
                 stage="extracting",
                 title="Extracting medical data",
-                detail=f"0 of {total_runs or 0} AI passes completed.",
+                detail=f"Running 0 of {total_runs or 0} AI extraction passes.",
                 percent=40,
                 total_runs=total_runs,
                 completed_runs=0,
@@ -386,7 +418,7 @@ async def execute_scan_documents_pipeline(
             set_progress(
                 stage="extracting",
                 title="Extracting medical data",
-                detail=f"{completed} of {total} AI passes completed.",
+                detail=f"Running {completed} of {total} AI extraction passes.",
                 percent=min(percent, 80),
                 total_runs=total_runs,
                 completed_runs=completed_runs,
@@ -397,7 +429,7 @@ async def execute_scan_documents_pipeline(
             set_progress(
                 stage="fusing",
                 title="Combining AI results",
-                detail="Selecting most consistent fields.",
+                detail="Comparing model outputs and selecting consistent fields.",
                 percent=80,
                 total_runs=total_runs,
                 completed_runs=completed_runs,
@@ -408,7 +440,7 @@ async def execute_scan_documents_pipeline(
             set_progress(
                 stage="fusing",
                 title="Combining AI results",
-                detail="Fusion complete. Preparing medicines review.",
+                detail="AI outputs combined. Preparing medicine review.",
                 percent=90,
                 total_runs=total_runs,
                 completed_runs=completed_runs,
@@ -425,8 +457,8 @@ async def execute_scan_documents_pipeline(
         )
         set_progress(
             stage="preprocessing",
-            title="Checking documents",
-            detail="Normalizing uploaded images.",
+            title="Preparing images",
+            detail="Optimizing uploaded images for AI processing.",
             percent=15,
             status_value="running",
             image_count=len(buffered_uploads),
@@ -467,8 +499,8 @@ async def execute_scan_documents_pipeline(
         )
         set_progress(
             stage="validating",
-            title="Checking documents",
-            detail="Validating document type and patient match.",
+            title="Validating documents",
+            detail="Checking document type, readability, and patient match.",
             percent=25,
             image_count=len(images),
         )
@@ -508,8 +540,8 @@ async def execute_scan_documents_pipeline(
         )
         set_progress(
             stage="validating",
-            title="Checking documents",
-            detail="Validation complete. Starting extraction.",
+            title="Validating documents",
+            detail="Validation complete. Starting AI extraction.",
             percent=40,
             image_count=len(images),
         )
@@ -531,6 +563,7 @@ async def execute_scan_documents_pipeline(
             )
             if progress_reporter is not None:
                 progress_reporter.replace_scan_log(scan_log)
+            publish_scan_job_status_event(scan_log)
             raise patient_name_error
 
         fallback_model_spec = processor.get_primary_enabled_model_spec()
@@ -596,8 +629,8 @@ async def execute_scan_documents_pipeline(
         extraction_meta_payload = extraction_result.extraction_meta_payload
         set_progress(
             stage="prioritizing_medicines",
-            title="Prioritizing medicines",
-            detail="Reviewing medicine ordering and ambiguity.",
+            title="Reviewing medicines",
+            detail="Resolving medicine order and ambiguity.",
             percent=90,
             medicine_count=len(extraction_result_payload.medicines),
         )
@@ -660,8 +693,8 @@ async def execute_scan_documents_pipeline(
             )
         set_progress(
             stage="prioritizing_medicines",
-            title="Ready to review",
-            detail="Finalizing extracted fields.",
+            title="Finalizing results",
+            detail="Applying final checks before review.",
             percent=97,
             medicine_count=len(extraction_result_payload.medicines),
         )
@@ -693,6 +726,7 @@ async def execute_scan_documents_pipeline(
             )
             if progress_reporter is not None:
                 progress_reporter.replace_scan_log(scan_log)
+            publish_scan_job_status_event(scan_log)
             raise patient_name_error
 
         scan_log = scan_log_repository.mark_succeeded(
@@ -707,6 +741,7 @@ async def execute_scan_documents_pipeline(
         )
         if progress_reporter is not None:
             progress_reporter.replace_scan_log(scan_log)
+        publish_scan_job_status_event(scan_log)
         ai_pipeline_log(
             event="scan_request_completed",
             component="ai_scan_route",
@@ -744,6 +779,7 @@ async def execute_scan_documents_pipeline(
             )
             if progress_reporter is not None:
                 progress_reporter.replace_scan_log(scan_log)
+            publish_scan_job_status_event(scan_log)
         ai_pipeline_log(
             event="scan_request_failed",
             component="ai_scan_route",
@@ -773,6 +809,7 @@ async def execute_scan_documents_pipeline(
             )
             if progress_reporter is not None:
                 progress_reporter.replace_scan_log(scan_log)
+            publish_scan_job_status_event(scan_log)
         ai_pipeline_log(
             event="scan_request_failed",
             component="ai_scan_route",
@@ -828,8 +865,8 @@ async def start_scan_documents_job(
     scan_log_repository = ScanLogRepository(db)
     initial_progress = build_scan_progress(
         stage="queued",
-        title="Upload complete",
-        detail="Preparing scan job.",
+        title="Preparing scan",
+        detail="Upload complete. Starting server-side processing.",
         percent=15,
         status_value="pending",
         image_count=len(buffered_uploads),
@@ -871,6 +908,42 @@ async def get_scan_documents_job_status(
     return build_scan_job_status_response(scan_log)
 
 
+@router.get("/scan-documents/jobs/{scan_log_id}/events")
+async def stream_scan_documents_job_events(
+    scan_log_id: int,
+    request: Request,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> StreamingResponse:
+    scan_log_repository = ScanLogRepository(db)
+    scan_log = scan_log_repository.get_by_id_and_user_id(scan_log_id, token_data.user_id)
+    if scan_log is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scan log not found.",
+        )
+
+    initial_scan_log = scan_log_repository.get_by_id_and_user_id(scan_log_id, token_data.user_id) or scan_log
+    initial_event_name = cast(Any, resolve_scan_job_event_name(initial_scan_log))
+    initial_payload = build_scan_job_status_response(initial_scan_log).model_dump(mode="json")
+
+    return StreamingResponse(
+        generate_scan_progress_sse(
+            scan_log_id=scan_log_id,
+            initial_event=initial_event_name,
+            initial_payload=initial_payload,
+            initial_terminal=is_scan_log_terminal(initial_scan_log),
+            is_disconnected=request.is_disconnected,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/scan-documents/jobs/{scan_log_id}/cancel", response_model=AIScanJobStatusResponse)
 async def cancel_scan_documents_job(
     scan_log_id: int,
@@ -894,13 +967,14 @@ async def cancel_scan_documents_job(
         )
     
     scan_log = scan_log_repository.mark_cancelled(scan_log)
+    payload = publish_scan_job_status_event(scan_log)
     ai_pipeline_log(
         event="scan_cancelled",
         component="ai_scan_route",
         scan_log_id=scan_log.id,
         user_id=token_data.user_id,
     )
-    return build_scan_job_status_response(scan_log)
+    return payload
 
 @router.post("/scan-documents", response_model=AIScanDocumentsResponse)
 async def scan_documents(
@@ -925,8 +999,8 @@ async def scan_documents(
         progress_payload=build_scan_progress(
             stage="queued",
             title="Preparing scan",
-            detail="Starting synchronous scan.",
-            percent=0,
+            detail="Starting server-side scan.",
+            percent=15,
             status_value="pending",
             image_count=len(buffered_uploads),
         ),

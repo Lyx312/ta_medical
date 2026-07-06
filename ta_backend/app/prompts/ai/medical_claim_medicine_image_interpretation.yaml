@@ -25,6 +25,16 @@ user_template: |
   {db_medicine_hints_json}
 
   Rules:
+  OUTPUT FORMAT:
+  - Return exactly one top-level key: judgements.
+  - judgements must be an array.
+  - Every judgement must include original_index and relevance fields.
+  - original_index must refer to an index from ambiguous_medicines_json.
+  - relevance must be one of relevant, uncertain, not_relevant.
+  - confidence fields must be numbers between 0 and 1.
+  - Use interpreted_name for the corrected or clarified medicine name. Do not output a name key.
+  - Do not include instructions, expected_types, expected_json, output_contract, output_schema, schema, or any explanatory keys.
+
   EVIDENCE HIERARCHY (apply in this order):
   1. Document image evidence is the primary authority. Interpreted names must be traceable to visible text in the uploaded images. Do not override clear image evidence with suggestions or DB hints.
   2. Ranked group suggestions are a secondary fallback for medicines that appear ambiguous in image evidence alone. Use suggestions only when image evidence is weak or absent for that medicine entry.
@@ -37,22 +47,12 @@ user_template: |
   Return only the JSON object.
 
 output_contract:
-  instructions:
-    - Return exactly one key: judgements.
-    - judgements must be an array.
-    - Every judgement must include original_index and relevance fields.
-    - original_index must refer to an index from ambiguous_medicines_json.
-    - relevance must be one of relevant, uncertain, not_relevant.
-    - confidence fields must be numbers between 0 and 1.
-  expected_types:
-    judgements: array<object>
-  expected_json:
-    judgements:
-      - original_index: number
-        interpreted_name: string | null
-        interpretation_confidence: number
-        interpretation_reason: string
-        relevance: relevant | uncertain | not_relevant
-        relevance_confidence: number
-        matched_diagnosis: boolean
-        matched_anamnesis: boolean
+  judgements:
+    - original_index: number
+      interpreted_name: string | null
+      interpretation_confidence: number
+      interpretation_reason: string
+      relevance: relevant | uncertain | not_relevant
+      relevance_confidence: number
+      matched_diagnosis: boolean
+      matched_anamnesis: boolean

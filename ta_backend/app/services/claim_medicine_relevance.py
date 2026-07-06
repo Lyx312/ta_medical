@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from fastapi import HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -237,12 +238,45 @@ class MedicineRelevanceLLMJudge(BaseDocumentAIProcessor):
                     "evidence_count": len(evidence_rows),
                 },
             },
+            prompt_file_path=self._prompt_file_path,
         )
-        payload = self._parse_ai_response_to_json(response.content)
         try:
-            return LLMMedicineJudgement.model_validate(payload)
+            payload = self._parse_ai_response_to_json(response.content)
+        except HTTPException as exc:
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                response_validation_error=self._describe_exception(exc),
+                result_context_payload={
+                    "medicine_name": medicine_name,
+                    "evidence_count": len(evidence_rows),
+                    "parse_succeeded": False,
+                },
+            )
+            raise
+        try:
+            result = LLMMedicineJudgement.model_validate(payload)
         except ValidationError as exc:
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                parsed_response_payload=payload,
+                response_validation_error=str(exc),
+                result_context_payload={
+                    "medicine_name": medicine_name,
+                    "evidence_count": len(evidence_rows),
+                    "schema_valid": False,
+                },
+            )
             raise RuntimeError("LLM medicine judgement returned invalid payload.") from exc
+        self._record_ai_call_outcome(
+            _tracking_payload,
+            parsed_response_payload=payload,
+            result_context_payload={
+                "medicine_name": medicine_name,
+                "relevance": result.relevance,
+                "confidence": result.confidence,
+            },
+        )
+        return result
 
 
 @dataclass(frozen=True)

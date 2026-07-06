@@ -38,8 +38,18 @@ def test_register_success(client: TestClient) -> None:
 
     assert response.status_code == 201
     payload = response.json()
+    assert payload["access_token"]
+    assert payload["token_type"] == "bearer"
     assert payload["user"]["email"] == "alice@example.com"
     assert payload["user"]["role"] == "user"
+
+    me = client.get(
+        "/api/auth/me",
+        headers={"Authorization": f"Bearer {payload['access_token']}"},
+    )
+
+    assert me.status_code == 200
+    assert me.json()["email"] == "alice@example.com"
 
 
 def test_register_duplicate_email(client: TestClient) -> None:

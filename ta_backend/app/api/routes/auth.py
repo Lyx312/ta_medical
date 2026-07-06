@@ -98,8 +98,13 @@ async def register_user(
             },
         )
 
+    access_token = create_access_token(
+        data={"sub": str(new_user.id), "email": new_user.email, "role": new_user.role}
+    )
+
     return RegisterResponse(
         message="Registration successful.",
+        access_token=access_token,
         user=UserPublic(
             id=new_user.id,
             full_name=new_user.full_name,

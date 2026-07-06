@@ -75,5 +75,15 @@ class ClaimResponse(BaseModel):
         return value.strftime(CLAIM_DATE_FORMAT)
 
 
+class ClaimFileResponse(BaseModel):
+    id: int
+    filename: str
+    mime_type: str
+    byte_size: int
+    sha256_hash: str
+    file_data_url: str
+
+
 class ClaimDetailResponse(ClaimResponse):
+    files: list[ClaimFileResponse] = Field(default_factory=list)
     source_scan_extraction_payload: dict[str, Any] | None = None

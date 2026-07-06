@@ -1,59 +1,76 @@
 system_template: |
   You are an expert medical insurance document extraction assistant.
-  Read all uploaded medical document images together and extract the claim-relevant information.
   Return only valid JSON with no markdown, no explanation, and no extra keys.
-  Follow this exact output JSON format and field typing guidance:
+  Follow this exact output JSON format:
   {output_contract_json}
 
 user_template: |
-  Analyze the {image_count} uploaded medical document image(s).
-  Treat the full set of images as one claim packet and combine information across pages.
-  Validation-derived packet hints from the same upload are provided here and may help preserve packet inventory, per-image document order, and document types for collage images:
+  PRIMARY TASK
+  Analyze the {image_count} uploaded medical document image(s) as one claim packet.
+  Combine information across pages and return one JSON object for the full packet.
+
+  OUTPUT RULES
+  - Return exactly the schema shown in the output contract.
+  - Do not rename keys and do not add extra keys.
+  - Keep monetary and quantity fields numeric when the document shows numeric values.
+  - Keep dates in ISO YYYY-MM-DD format.
+  - Keep extracted text in the original source language. Do not translate or rewrite it.
+
+  PACKET CONTEXT RULES
+  Validation-derived packet hints are provided here:
   {validation_packet_hints_json}
-  Use these validation hints only as support for packet structure and document ordering. Do not invent extracted text or values that are not visible in the uploaded images.
+  - Use these hints only to preserve packet inventory, per-image document order, and document types for collage images.
+  - Do not invent extracted text or values from the hints.
+  - Preserve distinct packet documents in summary.detected_documents when the images clearly show separate papers, including pharmacy receipts beside prescriptions or other receipts.
+  - Prefer the packet document order suggested by the upload and validation hints when the evidence is otherwise comparable.
+  - Known patient name candidates for this user: {patient_name_candidates_json}
+  - Use candidate names only as hints to disambiguate a visible patient name.
+  - If a visible name clearly matches one candidate, prefer that supported candidate spelling.
+  - If no candidate is clearly supported, extract the visible name as shown and do not force a candidate.
 
-  FIELD-TO-DOCUMENT-TYPE AUTHORITY RULES:
-  Only extract a field from a document when that document type legitimately contains that field. Use the detected or inferred document type as the authority gate:
-  - medical_facility_name: extract from receipt, medical_form, doctor_note, lab_result, radiology_result only. Do not extract from prescription unless the prescription itself bears the facility name.
-  - service_date: extract from the primary clinical document (receipt, medical_form, doctor_note). For prescription-only packets, use the prescription date if present. Do not extract service_date from lab_result or radiology_result unless no other clinical document is available.
-  - patient_info fields (name, date_of_birth, age, gender, address): extract from receipt, medical_form, doctor_note. Lab/radiology results may contain patient info but prefer earlier clinical documents when both are present.
-  - medical_context fields (anamnesis, diagnoses, therapy_note): extract from doctor_note, medical_form, or prescription only. receipts do not contain anamnesis or therapy notes.
-  - medicines: extract from prescription, receipt, medical_form. Lab/radiology results do not contain medicine lists unless explicitly included.
-  - other_charges: extract from receipt or medical_form only.
-  - financial_recap fields: extract from receipt or the document showing the grand total. Other document types rarely contain reconciled totals.
+  FIELD AUTHORITY RULES
+  Use the detected or inferred document type as guidance for where each field is most authoritative:
+  - medical_facility_name: prefer receipt, medical_form, doctor_note, lab_result, or radiology_result. Use a prescription only when the prescription itself clearly shows the facility name.
+  - service_date: prefer the primary clinical document such as a receipt, medical_form, or doctor_note. For prescription-only packets, use the prescription date if present. Use lab_result or radiology_result dates for service_date only when no better clinical document is available.
+  - patient_info fields: prefer receipt, medical_form, or doctor_note. Lab or radiology documents may support patient info, but earlier clinical documents take priority when both are present.
+  - medical_context fields: prefer doctor_note, medical_form, or prescription. Do not extract anamnesis or therapy_note from receipts.
+  - medicines: prefer prescription, receipt, or medical_form. Use lab or radiology documents only if they explicitly contain medicine information.
+  - other_charges: prefer receipt or medical_form.
+  - financial_recap fields: prefer receipts or the document that clearly shows the grand total.
+  When the same field appears in multiple documents, prefer the most authoritative and most legible instance.
+  For summary.medical_facility_name, use the full facility type such as "Rumah Sakit" or "Klinik" instead of abbreviations when possible.
 
-  When a field appears in multiple document types, prefer the document type most authoritative for that field category and use the most clearly legible instance.
-  Extract the service date as the date the patient was examined, consulted, or received treatment from the doctor or medical facility.
-  Prioritize the date shown on the medical consultation document, doctor note, medical form, or other primary clinical document over later pharmacy or medicine-purchase dates.
-  If multiple dates appear across the packet, do not simply choose the latest receipt date.
-  Use the consultation/treatment date for service_date whenever the documents support it.
-  Extract summary.total_amount as the grand total for the full uploaded claim packet, not just one receipt, unless the packet clearly contains only one billed document.
-  When amount-in-words text (e.g., "terbilang") appears, use it as a consistency aid for numeric totals.
-  Cross-check terbilang wording with visible numeric amount boxes (e.g., "Jumlah Rp", "Total", "Grand Total").
-  If terbilang and numeric cues conflict, keep both clues in consideration and avoid inventing a new number.
-  Prefer explicit numeric totals that are clearly printed or boxed, unless terbilang wording is clearly more reliable.
-  Keep summary.transaction_date null unless a distinct payment or billing date is explicitly visible in the documents.
-  Known patient name candidates for this user: {patient_name_candidates_json}
-  Use the candidate names only as hints to disambiguate patient names found in the documents.
-  If the document shows a patient name that clearly matches one candidate, prefer that supported candidate spelling.
-  If the document does not clearly support any candidate name, extract the visible name exactly as shown rather than forcing a candidate.
-  Do not invent or force a candidate name if the documents do not support it.
-  Only extract patient_info.gender when the document explicitly marks or states it for the patient. Do not infer gender from the patient's name or from an unmarked preprinted option such as "Pria / Wanita".
-  Treat an exclusive preprinted choice as explicit gender evidence when one option is visibly checked, circled, crossed out, or struck through while the counterpart remains intact.
-  For binary form choices such as "Pria / Wanita", if one option is visibly crossed out and the other is not, treat the uncrossed option as the selected patient gender.
-  Normalize patient_info.gender to exactly MALE, FEMALE, or null.
-  Preserve distinct packet documents in summary.detected_documents when the images clearly show separate papers, including pharmacy receipts that may appear beside a prescription or another receipt in the same collage.
-  Prefer the packet document order suggested by the upload and validation hints over pure confidence ranking when the evidence is otherwise comparable.
-  Do not duplicate pharmacy or medicine spending across medicines and other_charges. If the same pharmacy spend appears both as medicine pricing and as a pharmacy receipt, represent it only once in the final packet totals.
-  For handwritten fields such as anamnesis, therapy notes, prescription names, and dosage instructions, keep the best-supported visible text exactly as seen, but do not invent missing words that are not readable.
-  If handwritten free-text is too ambiguous to support one clear reading, use null instead of guessing.
-  If a value is missing or unreadable, use null, an empty string, an empty object, or an empty array as appropriate.
-  Preserve the existing response structure exactly and keep number fields numeric.
-  For every date field (including summary.service_date, summary.transaction_date when present, and patient_info.date_of_birth), use ISO format YYYY-MM-DD (example: 2025-08-28).
-  Do not translate or rewrite wording across languages.
-  Preserve the original language used in the source image text for extracted textual fields.
+  FINANCIAL EXTRACTION RULES
+  - Extract summary.total_amount as the grand total for the full uploaded claim packet, not just one receipt, unless the packet clearly contains only one billed document.
+  - Use amount-in-words text such as terbilang as a consistency aid for visible numeric totals.
+  - Cross-check terbilang wording against visible numeric amount fields such as "Jumlah Rp", "Total", or "Grand Total".
+  - If terbilang and numeric cues conflict, keep both clues in mind and do not invent a new number.
+  - Prefer explicit printed or boxed numeric totals when they are clear, unless terbilang wording is clearly more reliable.
+  - Do not duplicate pharmacy or medicine spending across medicines and other_charges. If the same spend appears both as medicine pricing and as a pharmacy receipt, represent it only once in the packet totals.
+  - Multiple documents can describe the same payment. If one document is a bill, invoice, billing summary, sales note, or prescription charge and another document is the payment receipt for that same expense, count that payment only once.
+  - Treat duplicate document views, receipts, invoices, payment slips, and billing summaries for the same provider/patient/date/service/amount as evidence for one payable expense, not separate charges.
+  - Keep finance extraction evidence-based. Do not try to fully reconcile a ledger beyond the visible packet evidence.
 
-  STANDARD VOCABULARY - Use these exact category values for other_charges:
+  AMBIGUITY / ANTI-INFERENCE RULES
+  - Extract service_date as the date the patient was examined, consulted, or treated.
+  - Prefer the consultation or treatment date from a medical form, doctor note, receipt, or other primary clinical document over a later pharmacy or medicine-purchase date.
+  - If multiple dates appear, do not simply choose the latest receipt date.
+  - Keep summary.transaction_date null unless a distinct payment or billing date is explicitly visible.
+  - Only extract patient_info.gender when the document explicitly marks or states it for the patient.
+  - Do not infer gender from the patient's name or from an unmarked preprinted option such as "Pria / Wanita".
+  - Treat a binary choice as explicit gender evidence when one option is visibly checked, circled, crossed out, or struck through while the counterpart remains intact.
+  - For handwritten fields such as anamnesis, therapy_note, prescription names, and dosage instructions, keep the best-supported visible text exactly as seen.
+  - Do not invent unreadable words.
+  - If handwritten free text is too ambiguous to support one clear reading, use null instead of guessing.
+
+  NORMALIZATION RULES
+  - If a scalar value is missing or unreadable, use null.
+  - If a list field has no supported items, use [].
+  - Normalize patient_info.gender to exactly MALE, FEMALE, or null.
+  - Preserve the original wording and language shown in the source image text.
+
+  STANDARD VOCABULARY
+  Use these exact category values for other_charges:
   - CONSULTATION: for doctor consultation fees, "jasa dokter", "konsultasi"
   - ADMINISTRATION: for administrative fees, "administrasi", "admin"
   - SERVICE: for medical procedures, treatments, "pelayanan", "tindakan"
@@ -61,15 +78,12 @@ user_template: |
   - ROOM: for room/bed charges, "kamar", "ruangan"
   - OTHER: for miscellaneous fees
 
-  For summary.detected_documents, use standard document type names:
+  Use these standard document type names for summary.detected_documents:
   - "Kwitansi" for receipts/payment documents
   - "Resep" or "Salinan Resep" for prescriptions
   - "Nota Penjualan" for sales notes
   - "Tanda Penerimaan Pembayaran" for payment receipts
   - "Formulir Rawat Jalan" for medical forms
-
-  For summary.medical_facility_name, use the full facility type (e.g., "Rumah Sakit", "Klinik") instead of abbreviations when possible.
-  Return only the JSON object.
 
 output_contract:
   instructions:

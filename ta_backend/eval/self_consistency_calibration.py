@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.services.ai_ensemble import (
+from app.services.ai_ensemble_helpers import (
     DEFAULT_SELF_CONSISTENCY_CALIBRATION_ARTIFACT_PATH,
     classify_other_charge_kind,
     coerce_numeric_value,

@@ -10,11 +10,7 @@ export async function loginUser(payload: LoginPayload): Promise<LoginResponse> {
 
 export async function registerUser(payload: RegisterPayload): Promise<RegisterResponse> {
   const response = await postJson<RegisterResponse>('/auth/register', payload);
-
-  if (response.access_token) {
-    await setAuthToken(response.access_token);
-  }
-
+  await setAuthToken(response.access_token);
   return response;
 }
 
@@ -25,4 +21,3 @@ export function getCurrentUser(): Promise<AuthUser> {
 export function logoutUser() {
   return clearAuthToken();
 }
-

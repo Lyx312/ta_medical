@@ -139,6 +139,33 @@ class _FakeBatchJudge:
 
 
 @pytest.mark.asyncio
+async def test_prioritization_sends_extracted_name_to_batch_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    scan_result = _build_scan_result()
+    extraction_meta = _build_extraction_meta(score_0=0.91, score_1=0.86)
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingBatchJudge:
+        async def judge_batch(self, **kwargs: Any):
+            captured_kwargs.update(kwargs)
+            return prioritization_service.BatchMedicineInterpretationResponse(judgements=[])
+
+    monkeypatch.setattr(prioritization_service, "_build_db_medicine_hints", _fake_db_hints)
+    monkeypatch.setattr(prioritization_service, "ScanMedicineImageInterpretationJudge", CapturingBatchJudge)
+
+    await prioritization_service.prioritize_scan_medicines(
+        cast(Session, object()),
+        scan_result,
+        extraction_meta,
+        images=_build_images(),
+        interpretation_mode="suggest_only",
+    )
+
+    ambiguous_medicines = captured_kwargs["ambiguous_medicines"]
+    assert ambiguous_medicines[0]["extracted_name"] == "Paracitamol"
+    assert "name" not in ambiguous_medicines[0]
+
+
+@pytest.mark.asyncio
 async def test_prioritization_keeps_image_dominant_order(monkeypatch: pytest.MonkeyPatch) -> None:
     scan_result = _build_scan_result()
     extraction_meta = _build_extraction_meta(score_0=0.95, score_1=0.70)

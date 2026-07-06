@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import re
-from typing import Any
+from typing import Any, Callable
 
 from app.services.standard_vocabulary import (
     normalize_facility_name,
@@ -7,14 +9,45 @@ from app.services.standard_vocabulary import (
     normalize_to_evaluation_other_charge_category,
 )
 from eval.config import DEFAULT_THRESHOLDS, EvalThresholds
-from eval.medicine_matcher import match_medicines
+from eval.medicine_matcher import match_medicines, normalize_medicine_name
+
+EVALUATOR_SCHEMA_VERSION = "medical_claim_extraction_eval_v2"
+PRIMARY_METRIC = "strict_kie_micro_f1"
 
 CASE_INSENSITIVE_FIELDS = frozenset({
     "patient_info.name",
     "patient_info.gender",
-    "summary.medical_facility_name",
     "summary.currency",
+    "medicines.unit",
 })
+
+SECTION_ORDER = (
+    "summary",
+    "patient_info",
+    "medical_context",
+    "medicines",
+    "other_charges",
+    "financial_recap",
+)
+
+CRITICAL_FIELD_PATHS = (
+    "summary.medical_facility_name",
+    "summary.service_date",
+    "summary.transaction_date",
+    "summary.currency",
+    "summary.total_amount",
+    "patient_info.name",
+    "financial_recap.total_medicines",
+    "financial_recap.total_other_charges",
+    "financial_recap.grand_total",
+)
+
+FINANCIAL_EXACT_FIELD_PATHS = (
+    "summary.total_amount",
+    "financial_recap.total_medicines",
+    "financial_recap.total_other_charges",
+    "financial_recap.grand_total",
+)
 
 
 def _normalize_text(text: str | None) -> list[str]:
@@ -23,6 +56,12 @@ def _normalize_text(text: str | None) -> list[str]:
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip().split()
+
+
+def _normalize_exact_text(value: Any) -> str | None:
+    if _is_empty(value):
+        return None
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
 
 
 def _token_f1(pred_tokens: list[str], gt_tokens: list[str]) -> float:
@@ -40,39 +79,69 @@ def _token_f1(pred_tokens: list[str], gt_tokens: list[str]) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def _compute_cer(pred: str | None, gt: str | None) -> float:
-    """Compute Character Error Rate (CER). Lower is better.
+def _token_overlap(pred_tokens: list[str], gt_tokens: list[str]) -> float:
+    if not pred_tokens or not gt_tokens:
+        return 0.0
+    return len(set(pred_tokens) & set(gt_tokens)) / min(len(set(pred_tokens)), len(set(gt_tokens)))
 
-    CER = (insertions + deletions + substitutions) / len(ground_truth_chars)
-    """
+
+def _levenshtein_distance(pred: str, gt: str) -> int:
+    m, n = len(pred), len(gt)
+    if m == 0:
+        return n
+    if n == 0:
+        return m
+
+    previous = list(range(n + 1))
+    current = [0] * (n + 1)
+    for i in range(1, m + 1):
+        current[0] = i
+        for j in range(1, n + 1):
+            if pred[i - 1] == gt[j - 1]:
+                current[j] = previous[j - 1]
+            else:
+                current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + 1)
+        previous, current = current, previous
+    return previous[n]
+
+
+def _normalized_similarity(pred: str | None, gt: str | None) -> float:
+    if not pred and not gt:
+        return 1.0
+    if not pred or not gt:
+        return 0.0
+    pred_text = str(pred).casefold().strip()
+    gt_text = str(gt).casefold().strip()
+    max_len = max(len(pred_text), len(gt_text), 1)
+    return max(0.0, 1.0 - (_levenshtein_distance(pred_text, gt_text) / max_len))
+
+
+def _compute_cer(pred: str | None, gt: str | None) -> float:
+    """Compute Character Error Rate (CER). Lower is better."""
     if not pred and not gt:
         return 0.0
     if not pred or not gt:
         return 1.0
+    pred_text = str(pred)
+    gt_text = str(gt)
+    if not gt_text:
+        return 1.0 if pred_text else 0.0
+    return round(_levenshtein_distance(pred_text, gt_text) / len(gt_text), 4)
 
-    pred = str(pred)
-    gt = str(gt)
 
-    m, n = len(pred), len(gt)
-    if m == 0:
-        return 1.0 if n > 0 else 0.0
-
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            if pred[i - 1] == gt[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
-            else:
-                dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + 1)
-
-    edits = dp[m][n]
-    return round(edits / n, 4)
+def _compute_anls(pred: str | None, gt: str | None, threshold: float = 0.5) -> float:
+    """Compute DocVQA-style ANLS using normalized Levenshtein distance."""
+    if not pred and not gt:
+        return 1.0
+    if not pred or not gt:
+        return 0.0
+    pred_text = str(pred)
+    gt_text = str(gt)
+    max_len = max(len(pred_text), len(gt_text), 1)
+    normalized_distance = _levenshtein_distance(pred_text.casefold(), gt_text.casefold()) / max_len
+    if normalized_distance >= threshold:
+        return 0.0
+    return round(1.0 - normalized_distance, 4)
 
 
 def _exact_match(pred: Any, gt: Any) -> bool:
@@ -80,9 +149,7 @@ def _exact_match(pred: Any, gt: Any) -> bool:
         return True
     if pred is None or gt is None:
         return False
-    pred_str = str(pred).strip()
-    gt_str = str(gt).strip()
-    return pred_str == gt_str
+    return str(pred).strip() == str(gt).strip()
 
 
 def _case_insensitive_match(pred: Any, gt: Any) -> bool:
@@ -90,7 +157,7 @@ def _case_insensitive_match(pred: Any, gt: Any) -> bool:
         return True
     if pred is None or gt is None:
         return False
-    return str(pred).strip().lower() == str(gt).strip().lower()
+    return str(pred).strip().casefold() == str(gt).strip().casefold()
 
 
 def _fuzzy_name_match(pred: str | None, gt: str | None) -> float:
@@ -105,12 +172,156 @@ def _fuzzy_name_match(pred: str | None, gt: str | None) -> float:
     return _token_f1(pred_tokens, gt_tokens)
 
 
+def _normalize_clinical_text(value: Any) -> str | None:
+    if _is_empty(value):
+        return None
+    text = str(value).casefold()
+    text = re.sub(r"\(\s*\+\s*\)", " ", text)
+    text = re.sub(r"\bpositif\b", " ", text)
+    text = re.sub(r"[+/;,|]+", " ", text)
+    text = re.sub(r"[^\w\s.-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip() or None
+
+
+def _clinical_text_match(pred: Any, gt: Any) -> bool:
+    if _normalize_exact_text(pred) == _normalize_exact_text(gt):
+        return True
+    pred_normalized = _normalize_clinical_text(pred)
+    gt_normalized = _normalize_clinical_text(gt)
+    if pred_normalized is None and gt_normalized is None:
+        return True
+    if pred_normalized is None or gt_normalized is None:
+        return False
+    if pred_normalized == gt_normalized:
+        return True
+    pred_tokens = pred_normalized.split()
+    gt_tokens = gt_normalized.split()
+    return _token_f1(pred_tokens, gt_tokens) >= 0.82 or _compute_anls(pred_normalized, gt_normalized, threshold=0.35) >= 0.78
+
+
+FACILITY_ALIAS_TOKENS = {
+    "ubaya": ("universitas", "surabaya"),
+}
+
+
+def _facility_tokens(value: Any) -> list[str]:
+    normalized = normalize_facility_name(value) if not _is_empty(value) else None
+    if not normalized:
+        return []
+    tokens = _normalize_text(normalized)
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.extend(FACILITY_ALIAS_TOKENS.get(token, (token,)))
+    return [token for token in expanded if token not in {"klinik", "clinic", "pratama", "utama"}]
+
+
+def _facility_match(pred_value: Any, gt_value: Any) -> bool:
+    pred_normalized = normalize_facility_name(pred_value) if not _is_empty(pred_value) else None
+    gt_normalized = normalize_facility_name(gt_value) if not _is_empty(gt_value) else None
+    if pred_normalized == gt_normalized:
+        return True
+    pred_tokens = _facility_tokens(pred_value)
+    gt_tokens = _facility_tokens(gt_value)
+    if not pred_tokens or not gt_tokens:
+        return False
+    return _token_overlap(pred_tokens, gt_tokens) >= 0.80 and _token_f1(pred_tokens, gt_tokens) >= 0.65
+
+
 def _list_exact_match(pred: Any, gt: Any) -> bool:
     pred_list = pred if isinstance(pred, list) else []
     gt_list = gt if isinstance(gt, list) else []
     if not pred_list and not gt_list:
         return True
     return sorted(str(item).strip() for item in pred_list) == sorted(str(item).strip() for item in gt_list)
+
+
+def _num_match(pred: Any, gt: Any, tolerance: float = 0.0) -> bool:
+    p = _to_number(pred)
+    g = _to_number(gt)
+    if p is None and g is None:
+        return True
+    if p is None or g is None:
+        return False
+    if tolerance == 0.0:
+        return abs(p - g) < 1e-9
+    return abs(p - g) <= tolerance
+
+
+def _to_number(value: Any) -> float | None:
+    if _is_empty(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _number_key(value: Any) -> str | None:
+    number = _to_number(value)
+    if number is None:
+        return None
+    if number.is_integer():
+        return str(int(number))
+    return str(number)
+
+
+def _is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _is_empty_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return _is_empty(item)
+    return all(_is_empty(value) for value in item.values())
+
+
+def _metric_dict(tp: float, fp: float, fn: float, **extra: Any) -> dict[str, Any]:
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    result: dict[str, Any] = {
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "tp": round(tp, 4),
+        "fp": round(fp, 4),
+        "fn": round(fn, 4),
+        "applicable": (tp + fp + fn) > 0,
+    }
+    result.update(extra)
+    return result
+
+
+def _with_strict_aliases(metrics: dict[str, Any]) -> dict[str, Any]:
+    result = dict(metrics)
+    result.update(
+        strict_precision=result.get("precision", 0.0),
+        strict_recall=result.get("recall", 0.0),
+        strict_f1=result.get("f1", 0.0),
+        strict_tp=result.get("tp", 0),
+        strict_fp=result.get("fp", 0),
+        strict_fn=result.get("fn", 0),
+    )
+    return result
+
+
+def _add_counts(target: dict[str, float], source: dict[str, Any]) -> None:
+    target["tp"] = target.get("tp", 0.0) + float(source.get("tp", 0.0))
+    target["fp"] = target.get("fp", 0.0) + float(source.get("fp", 0.0))
+    target["fn"] = target.get("fn", 0.0) + float(source.get("fn", 0.0))
+
+
+def _merge_metric_counts(metrics: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+    counts = {"tp": 0.0, "fp": 0.0, "fn": 0.0}
+    for metric in metrics:
+        _add_counts(counts, metric)
+    return _with_strict_aliases(_metric_dict(counts["tp"], counts["fp"], counts["fn"], **extra))
 
 
 def _build_lcs_index_pairs(pred: list[str], gt: list[str]) -> list[tuple[int, int]]:
@@ -141,7 +352,7 @@ def _build_lcs_index_pairs(pred: list[str], gt: list[str]) -> list[tuple[int, in
 
 
 def _normalize_detected_document_sequence(values: list[Any]) -> list[str]:
-    return [normalize_to_evaluation_document_type(str(value)) or "other" for value in values]
+    return [normalize_to_evaluation_document_type(str(value)) or "other" for value in values if not _is_empty(value)]
 
 
 def _build_unmatched_document_items(
@@ -152,7 +363,7 @@ def _build_unmatched_document_items(
     return [
         {
             "index": index,
-            "raw_value": raw_values[index],
+            "raw_value": raw_values[index] if index < len(raw_values) else None,
             "normalized_value": normalized_values[index],
         }
         for index in range(len(normalized_values))
@@ -160,76 +371,112 @@ def _build_unmatched_document_items(
     ]
 
 
-def _normalize_other_charge_category_for_eval(category: Any, description: Any) -> str | None:
+def _normalize_other_charge_category_for_eval(category: Any, description: Any = None) -> str | None:
     canonical = normalize_to_evaluation_other_charge_category(str(category) if category is not None else None)
     if canonical is not None:
         return canonical
     return normalize_to_evaluation_other_charge_category(str(description) if description is not None else None)
 
 
-def _num_match(pred: Any, gt: Any, tolerance: float = 0.0) -> bool:
-    p = float(pred) if pred is not None else None
-    g = float(gt) if gt is not None else None
-    if p is None and g is None:
-        return True
-    if p is None or g is None:
-        return False
-    if tolerance == 0.0:
-        return abs(p - g) < 1e-9
-    return abs(p - g) <= tolerance
+def _medicine_key(item: dict[str, Any]) -> str | None:
+    tokens = normalize_medicine_name(item.get("name"))
+    if not tokens:
+        return None
+    return " ".join(sorted(tokens))
 
 
-def _metric_dict(tp: int, fp: int, fn: int, **extra: Any) -> dict[str, Any]:
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    result: dict[str, Any] = {
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
-        "f1": round(f1, 4),
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-    }
-    result.update(extra)
-    return result
+def _medicine_name_similarity(pred: str | None, gt: str | None) -> float:
+    pred_tokens = normalize_medicine_name(pred)
+    gt_tokens = normalize_medicine_name(gt)
+    if not pred_tokens and not gt_tokens:
+        return 1.0
+    if not pred_tokens or not gt_tokens:
+        return 0.0
+    token_sim = len(pred_tokens & gt_tokens) / len(pred_tokens | gt_tokens)
+    char_sim = _normalized_similarity(" ".join(sorted(pred_tokens)), " ".join(sorted(gt_tokens)))
+    return max(token_sim, char_sim)
 
 
-def _round_metric_value(value: Any) -> Any:
-    if isinstance(value, float):
-        return round(value, 4)
-    return value
+def _match_medicines_conservative(
+    pred: list[dict[str, Any]],
+    gt: list[dict[str, Any]],
+) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
+    exact_matches, exact_unmatched_pred, exact_unmatched_gt = _match_by_key(pred, gt, _medicine_key)
+    matched: list[tuple[int, int, float]] = [(pred_index, gt_index, 1.0) for pred_index, gt_index in exact_matches]
+    matched_pred: set[int] = {pred_index for pred_index, _gt_index in exact_matches}
+    matched_gt: set[int] = {gt_index for _pred_index, gt_index in exact_matches}
+
+    candidates: list[tuple[float, int, int]] = []
+    for pred_index in exact_unmatched_pred:
+        pred_item = pred[pred_index]
+        for gt_index in exact_unmatched_gt:
+            gt_item = gt[gt_index]
+            name_sim = _medicine_name_similarity(pred_item.get("name"), gt_item.get("name"))
+            if name_sim < 0.78:
+                continue
+            candidates.append((name_sim, pred_index, gt_index))
+
+    candidates.sort(reverse=True)
+    for similarity, pred_index, gt_index in candidates:
+        if pred_index in matched_pred or gt_index in matched_gt:
+            continue
+        matched.append((pred_index, gt_index, round(similarity, 4)))
+        matched_pred.add(pred_index)
+        matched_gt.add(gt_index)
+
+    unmatched_pred = [index for index in range(len(pred)) if index not in matched_pred]
+    unmatched_gt = [index for index in range(len(gt)) if index not in matched_gt]
+    matched.sort(key=lambda item: item[0])
+    return matched, unmatched_pred, unmatched_gt
 
 
-def _round_metric_dict(metrics: dict[str, Any]) -> dict[str, Any]:
-    return {key: _round_metric_value(value) for key, value in metrics.items()}
+def _diagnosis_key(item: dict[str, Any]) -> str | None:
+    return _normalize_exact_text(item.get("description"))
 
 
-def _merge_section_tracks(soft: dict[str, Any], strict: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    result = {
-        "precision": soft.get("precision", 0.0),
-        "recall": soft.get("recall", 0.0),
-        "f1": soft.get("f1", 0.0),
-        "tp": soft.get("tp", 0),
-        "fp": soft.get("fp", 0),
-        "fn": soft.get("fn", 0),
-        "soft_precision": soft.get("precision", 0.0),
-        "soft_recall": soft.get("recall", 0.0),
-        "soft_f1": soft.get("f1", 0.0),
-        "soft_tp": soft.get("tp", 0),
-        "soft_fp": soft.get("fp", 0),
-        "soft_fn": soft.get("fn", 0),
-        "strict_precision": strict.get("precision", 0.0),
-        "strict_recall": strict.get("recall", 0.0),
-        "strict_f1": strict.get("f1", 0.0),
-        "strict_tp": strict.get("tp", 0),
-        "strict_fp": strict.get("fp", 0),
-        "strict_fn": strict.get("fn", 0),
-        "soft": _round_metric_dict(soft),
-        "strict": _round_metric_dict(strict),
-    }
-    result.update(extra)
-    return result
+def _other_charge_key(item: dict[str, Any]) -> str | None:
+    category = _normalize_other_charge_category_for_eval(item.get("category"), item.get("description"))
+    amount = _number_key(item.get("amount"))
+    if category is None or amount is None:
+        return None
+    return f"{category.casefold()}:{amount}"
+
+
+def _filter_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if isinstance(item, dict) and not _is_empty_item(item)]
+
+
+def _match_by_key(
+    pred: list[dict[str, Any]],
+    gt: list[dict[str, Any]],
+    key_fn: Callable[[dict[str, Any]], str | None],
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    gt_key_to_indices: dict[str, list[int]] = {}
+    for gt_index, gt_item in enumerate(gt):
+        key = key_fn(gt_item)
+        if key is not None:
+            gt_key_to_indices.setdefault(key, []).append(gt_index)
+
+    matched: list[tuple[int, int]] = []
+    matched_gt: set[int] = set()
+    unmatched_pred: list[int] = []
+    for pred_index, pred_item in enumerate(pred):
+        key = key_fn(pred_item)
+        if key is None:
+            unmatched_pred.append(pred_index)
+            continue
+        candidates = [index for index in gt_key_to_indices.get(key, []) if index not in matched_gt]
+        if candidates:
+            gt_index = candidates[0]
+            matched.append((pred_index, gt_index))
+            matched_gt.add(gt_index)
+        else:
+            unmatched_pred.append(pred_index)
+
+    matched_pred = {pred_index for pred_index, _ in matched}
+    unmatched_gt = [index for index in range(len(gt)) if index not in matched_gt]
+    unmatched_pred.extend(index for index in range(len(pred)) if index not in matched_pred and index not in unmatched_pred)
+    return matched, unmatched_pred, unmatched_gt
 
 
 class MedicalClaimEvaluator:
@@ -243,186 +490,124 @@ class MedicalClaimEvaluator:
     ) -> dict[str, Any]:
         section_results: dict[str, dict[str, Any]] = {}
         per_field: dict[str, dict[str, Any]] = {}
+        text_entries: list[dict[str, Any]] = []
+        entity_metrics: dict[str, dict[str, Any]] = {}
+        details: dict[str, dict[str, Any]] = {}
 
-        section_weights: dict[str, float] = {
-            "summary": 1.0,
-            "patient_info": 1.0,
-            "medical_context": 1.0,
-            "medicines": 2.0,
-            "other_charges": 1.0,
-            "financial_recap": 1.0,
-        }
+        for section_name, evaluator in (
+            ("summary", self._evaluate_summary),
+            ("patient_info", self._evaluate_patient_info),
+            ("medical_context", self._evaluate_medical_context),
+            ("medicines", self._evaluate_medicines),
+            ("other_charges", self._evaluate_other_charges),
+            ("financial_recap", self._evaluate_financial_recap),
+        ):
+            result = evaluator(
+                predicted.get(section_name, {} if section_name not in {"medicines", "other_charges"} else []),
+                ground_truth.get(section_name, {} if section_name not in {"medicines", "other_charges"} else []),
+            )
+            section_results[section_name] = result["section"]
+            per_field.update(result.get("per_field", {}))
+            text_entries.extend(result.get("text_entries", []))
+            entity_metrics.update(result.get("entity_metrics", {}))
+            if result.get("details"):
+                details[section_name] = result["details"]
 
-        summary_metrics = self._evaluate_summary(predicted.get("summary", {}), ground_truth.get("summary", {}))
-        section_results["summary"] = summary_metrics["section"]
-        per_field.update(summary_metrics["per_field"])
-
-        patient_metrics = self._evaluate_patient_info(
-            predicted.get("patient_info", {}),
-            ground_truth.get("patient_info", {}),
+        strict_kie_micro = self._combine_sections(section_results)
+        strict_kie_section_macro_f1 = self._macro_f1(section_results.values())
+        field_exact_accuracy = self._compute_exact_accuracy(per_field, CRITICAL_FIELD_PATHS)
+        financial_exact_accuracy = self._compute_exact_accuracy(per_field, FINANCIAL_EXACT_FIELD_PATHS)
+        relaxed_text = self._aggregate_text_entries(text_entries)
+        edit_burden_score = self._compute_edit_burden(per_field, entity_metrics, text_entries)
+        verify_only_reasons = self._collect_verify_only_fail_reasons(section_results, per_field, entity_metrics, text_entries)
+        blocking_fail_reasons = verify_only_reasons["blocking_fail_reasons"]
+        advisory_fail_reasons = verify_only_reasons["advisory_fail_reasons"]
+        pass_verify_only = self._compute_verify_only_gate(
+            edit_burden_score,
+            blocking_fail_reasons,
         )
-        section_results["patient_info"] = patient_metrics["section"]
-        per_field.update(patient_metrics["per_field"])
-
-        context_metrics = self._evaluate_medical_context(
-            predicted.get("medical_context", {}),
-            ground_truth.get("medical_context", {}),
-        )
-        section_results["medical_context"] = context_metrics["section"]
-        per_field.update(context_metrics["per_field"])
-
-        medicines_metrics = self._evaluate_medicines(
-            predicted.get("medicines", []),
-            ground_truth.get("medicines", []),
-        )
-        section_results["medicines"] = medicines_metrics["section"]
-        per_field.update(medicines_metrics["per_field"])
-
-        charges_metrics = self._evaluate_other_charges(
-            predicted.get("other_charges", []),
-            ground_truth.get("other_charges", []),
-        )
-        section_results["other_charges"] = charges_metrics["section"]
-        per_field.update(charges_metrics["per_field"])
-
-        financial_recap_metrics = self._evaluate_financial_recap(
-            predicted.get("financial_recap", {}),
-            ground_truth.get("financial_recap", {}),
-        )
-        section_results["financial_recap"] = financial_recap_metrics["section"]
-        per_field.update(financial_recap_metrics["per_field"])
-
-        soft_section_results = {section: metrics.get("soft", metrics) for section, metrics in section_results.items()}
-        strict_section_results = {section: metrics.get("strict", metrics) for section, metrics in section_results.items()}
-
-        soft_f1 = self._compute_overall_f1(soft_section_results, section_weights)
-        strict_f1 = self._compute_overall_f1(strict_section_results, section_weights)
-
-        total_soft_tp = sum(float(metrics.get("tp", 0)) for metrics in soft_section_results.values())
-        total_soft_fp = sum(float(metrics.get("fp", 0)) for metrics in soft_section_results.values())
-        total_soft_fn = sum(float(metrics.get("fn", 0)) for metrics in soft_section_results.values())
-        overall_precision = total_soft_tp / (total_soft_tp + total_soft_fp) if (total_soft_tp + total_soft_fp) > 0 else 0.0
-        overall_recall = total_soft_tp / (total_soft_tp + total_soft_fn) if (total_soft_tp + total_soft_fn) > 0 else 0.0
-
-        edit_burden_score = self._compute_edit_burden(section_results)
-        critical_fail_reasons = self._collect_critical_fail_reasons(section_results, per_field)
-        pass_verify_only = self._compute_verify_only_gate(section_results, edit_burden_score, critical_fail_reasons)
 
         return {
-            "overall_f1": round(soft_f1, 4),
-            "soft_f1": round(soft_f1, 4),
-            "strict_f1": round(strict_f1, 4),
-            "overall_precision": round(overall_precision, 4),
-            "overall_recall": round(overall_recall, 4),
-            "edit_burden_score": round(edit_burden_score, 4),
-            "pass_verify_only": pass_verify_only,
-            "critical_fail_reasons": critical_fail_reasons,
+            "schema_version": EVALUATOR_SCHEMA_VERSION,
+            "primary_metric": PRIMARY_METRIC,
+            "strict_kie_micro": strict_kie_micro,
+            "strict_kie_section_macro_f1": strict_kie_section_macro_f1,
             "per_section": section_results,
             "per_field": per_field,
-            "medicine_details": medicines_metrics["section"].get("details", {}),
-            "other_charges_details": charges_metrics["section"].get("details", {}),
+            "entity_metrics": entity_metrics,
+            "field_exact_accuracy": field_exact_accuracy,
+            "financial_exact_accuracy": financial_exact_accuracy,
+            "relaxed_text": relaxed_text,
+            "diagnostics": {
+                "usability": {
+                    "edit_burden_score": round(edit_burden_score, 4),
+                    "pass_verify_only": pass_verify_only,
+                    "blocking_fail_reasons": blocking_fail_reasons,
+                    "advisory_fail_reasons": advisory_fail_reasons,
+                    "critical_fail_reasons": blocking_fail_reasons,
+                }
+            },
+            "details": details,
+            "medicine_details": details.get("medicines", {}),
+            "other_charges_details": details.get("other_charges", {}),
         }
 
     def _evaluate_summary(self, pred: dict[str, Any], gt: dict[str, Any]) -> dict[str, Any]:
-        pred_detected = pred.get("detected_documents", [])
-        gt_detected = gt.get("detected_documents", [])
-        detected_metrics = self._evaluate_detected_documents(pred_detected, gt_detected)
+        pred_dict = pred if isinstance(pred, dict) else {}
+        gt_dict = gt if isinstance(gt, dict) else {}
+        field_metrics: dict[str, dict[str, Any]] = {}
+        text_entries: list[dict[str, Any]] = []
 
-        pred_facility = pred.get("medical_facility_name")
-        gt_facility = gt.get("medical_facility_name")
-        facility_match = self._evaluate_facility_name(pred_facility, gt_facility)
-
-        base_metrics = self._evaluate_scalar_fields(
-            "summary",
-            pred,
-            gt,
-            [
-                ("service_date", "service_date"),
-                ("transaction_date", "transaction_date"),
-                ("total_amount", "total_amount"),
-                ("currency", "currency"),
-            ],
+        detected = self._evaluate_detected_documents(
+            pred_dict.get("detected_documents", []),
+            gt_dict.get("detected_documents", []),
         )
+        field_metrics["summary.detected_documents"] = detected
 
-        tp = base_metrics["section"]["tp"] + facility_match["tp"] + detected_metrics["tp"]
-        fp = base_metrics["section"]["fp"] + facility_match["fp"] + detected_metrics["fp"]
-        fn = base_metrics["section"]["fn"] + facility_match["fn"] + detected_metrics["fn"]
+        for field_name, match_kind in (
+            ("medical_facility_name", "facility"),
+            ("service_date", "exact"),
+            ("transaction_date", "exact"),
+            ("currency", "case_insensitive"),
+            ("total_amount", "numeric"),
+        ):
+            field_path = f"summary.{field_name}"
+            metric = self._evaluate_scalar_value(
+                field_path,
+                pred_dict.get(field_name),
+                gt_dict.get(field_name),
+                match_kind,
+            )
+            field_metrics[field_path] = metric
+            if field_name == "medical_facility_name":
+                entry = self._text_entry(field_path, pred_dict.get(field_name), gt_dict.get(field_name))
+                if entry is not None:
+                    text_entries.append(entry)
 
-        per_field = {**base_metrics["per_field"]}
-        per_field["summary.detected_documents"] = detected_metrics
-        per_field["summary.medical_facility_name"] = facility_match
-
-        soft_section = _metric_dict(tp, fp, fn)
-
-        strict_base = self._evaluate_scalar_fields(
-            "summary",
-            pred,
-            gt,
-            [
-                ("service_date", "service_date"),
-                ("transaction_date", "transaction_date"),
-                ("total_amount", "total_amount"),
-                ("currency", "currency"),
-            ],
-        )
-        strict_detected = self._evaluate_detected_documents_strict(pred_detected, gt_detected)
-        strict_facility = self._evaluate_facility_name_strict(pred_facility, gt_facility)
-        strict_tp = strict_base["section"]["tp"] + strict_detected["tp"] + strict_facility["tp"]
-        strict_fp = strict_base["section"]["fp"] + strict_detected["fp"] + strict_facility["fp"]
-        strict_fn = strict_base["section"]["fn"] + strict_detected["fn"] + strict_facility["fn"]
-
-        per_field["summary.detected_documents"].update(
-            strict_f1=strict_detected["f1"],
-            strict_precision=strict_detected["precision"],
-            strict_recall=strict_detected["recall"],
-            strict_tp=strict_detected["tp"],
-            strict_fp=strict_detected["fp"],
-            strict_fn=strict_detected["fn"],
-        )
-        per_field["summary.medical_facility_name"].update(
-            strict_f1=strict_facility["f1"],
-            strict_precision=strict_facility["precision"],
-            strict_recall=strict_facility["recall"],
-            strict_tp=strict_facility["tp"],
-            strict_fp=strict_facility["fp"],
-            strict_fn=strict_facility["fn"],
-        )
-        for field_name in ("summary.service_date", "summary.transaction_date", "summary.total_amount", "summary.currency"):
-            strict_field = strict_base["per_field"].get(field_name, {})
-            if field_name in per_field:
-                per_field[field_name].update(
-                    strict_f1=strict_field.get("f1", 0.0),
-                    strict_precision=strict_field.get("precision", 0.0),
-                    strict_recall=strict_field.get("recall", 0.0),
-                    strict_tp=strict_field.get("tp", 0),
-                    strict_fp=strict_field.get("fp", 0),
-                    strict_fn=strict_field.get("fn", 0),
-                )
-
-        strict_section = _metric_dict(strict_tp, strict_fp, strict_fn)
         return {
-            "section": _merge_section_tracks(soft_section, strict_section),
-            "per_field": per_field,
+            "section": _merge_metric_counts(list(field_metrics.values())),
+            "per_field": field_metrics,
+            "text_entries": text_entries,
         }
 
     def _evaluate_detected_documents(self, pred: list, gt: list) -> dict[str, Any]:
-        pred_raw = pred if isinstance(pred, list) else []
-        gt_raw = gt if isinstance(gt, list) else []
+        pred_raw = [value for value in (pred if isinstance(pred, list) else []) if not _is_empty(value)]
+        gt_raw = [value for value in (gt if isinstance(gt, list) else []) if not _is_empty(value)]
         pred_types = _normalize_detected_document_sequence(pred_raw)
         gt_types = _normalize_detected_document_sequence(gt_raw)
 
         matched_pairs = _build_lcs_index_pairs(pred_types, gt_types)
         matched_pred_indices = {pred_index for pred_index, _ in matched_pairs}
         matched_gt_indices = {gt_index for _, gt_index in matched_pairs}
-        tp = len(matched_pairs)
-        fp = len(pred_types) - tp
-        fn = len(gt_types) - tp
-
-        details = {
-            "predicted_sequence": pred_types,
-            "ground_truth_sequence": gt_types,
-            "matched_sequence": [pred_types[pred_index] for pred_index, _ in matched_pairs],
-            "matches": [
+        metric = _metric_dict(
+            len(matched_pairs),
+            len(pred_types) - len(matched_pairs),
+            len(gt_types) - len(matched_pairs),
+            predicted_sequence=pred_types,
+            ground_truth_sequence=gt_types,
+            matched_sequence=[pred_types[pred_index] for pred_index, _ in matched_pairs],
+            sequence_exact=pred_types == gt_types,
+            matches=[
                 {
                     "predicted_index": pred_index,
                     "ground_truth_index": gt_index,
@@ -432,642 +617,671 @@ class MedicalClaimEvaluator:
                 }
                 for pred_index, gt_index in matched_pairs
             ],
-            "unmatched_predicted": _build_unmatched_document_items(pred_raw, pred_types, matched_pred_indices),
-            "unmatched_ground_truth": _build_unmatched_document_items(gt_raw, gt_types, matched_gt_indices),
-        }
-        return _metric_dict(tp, fp, fn, **details)
+            unmatched_predicted=_build_unmatched_document_items(pred_raw, pred_types, matched_pred_indices),
+            unmatched_ground_truth=_build_unmatched_document_items(gt_raw, gt_types, matched_gt_indices),
+        )
+        return _with_strict_aliases(metric)
 
     def _evaluate_detected_documents_strict(self, pred: list, gt: list) -> dict[str, Any]:
-        pred_raw = pred if isinstance(pred, list) else []
-        gt_raw = gt if isinstance(gt, list) else []
-        pred_types = _normalize_detected_document_sequence(pred_raw)
-        gt_types = _normalize_detected_document_sequence(gt_raw)
-        if pred_types == gt_types:
-            return _metric_dict(
-                len(gt_types),
-                0,
-                0,
-                predicted_sequence=pred_types,
-                ground_truth_sequence=gt_types,
-                exact_match=True,
-                unmatched_predicted=[],
-                unmatched_ground_truth=[],
-            )
-        return _metric_dict(
-            0,
-            len(pred_types),
-            len(gt_types),
-            predicted_sequence=pred_types,
-            ground_truth_sequence=gt_types,
-            exact_match=False,
-            unmatched_predicted=_build_unmatched_document_items(pred_raw, pred_types, set()),
-            unmatched_ground_truth=_build_unmatched_document_items(gt_raw, gt_types, set()),
-        )
-
-    def _evaluate_facility_name(self, pred: str | None, gt: str | None) -> dict[str, Any]:
-        pred_normalized = normalize_facility_name(pred) if pred else None
-        gt_normalized = normalize_facility_name(gt) if gt else None
-
-        if pred_normalized and gt_normalized:
-            if pred_normalized.lower() == gt_normalized.lower():
-                return _metric_dict(1, 0, 0)
-            cer = _compute_cer(pred_normalized, gt_normalized)
-            if cer < 0.2:
-                return _metric_dict(1, 0, 0, cer=cer)
-            return _metric_dict(0, 1, 1, cer=cer)
-        if pred_normalized and not gt_normalized:
-            return _metric_dict(0, 1, 0)
-        if not pred_normalized and gt_normalized:
-            return _metric_dict(0, 0, 1)
-        return _metric_dict(1, 0, 0)
-
-    def _evaluate_facility_name_strict(self, pred: str | None, gt: str | None) -> dict[str, Any]:
-        pred_normalized = normalize_facility_name(pred) if pred else None
-        gt_normalized = normalize_facility_name(gt) if gt else None
-        if pred_normalized and gt_normalized:
-            pred_tokens = set(_normalize_text(pred_normalized))
-            gt_tokens = set(_normalize_text(gt_normalized))
-            overlap = len(pred_tokens & gt_tokens)
-            denom = max(len(gt_tokens), 1)
-            token_ratio = overlap / denom
-            if token_ratio >= self.t.STRICT_FACILITY_TOKEN_THRESHOLD:
-                return _metric_dict(1, 0, 0, similarity=round(token_ratio, 4))
-            return _metric_dict(0, 1, 1, similarity=round(token_ratio, 4))
-        if pred_normalized and not gt_normalized:
-            return _metric_dict(0, 1, 0)
-        if not pred_normalized and gt_normalized:
-            return _metric_dict(0, 0, 1)
-        return _metric_dict(1, 0, 0)
+        return self._evaluate_detected_documents(pred, gt)
 
     def _evaluate_patient_info(self, pred: dict[str, Any], gt: dict[str, Any]) -> dict[str, Any]:
-        soft_metrics = self._evaluate_scalar_fields(
-            "patient_info",
-            pred,
-            gt,
-            [
-                ("name", "name"),
-                ("gender", "gender"),
-                ("date_of_birth", "date_of_birth"),
-                ("age", "age"),
-                ("address", "address"),
-            ],
-        )
-        for metrics in soft_metrics["per_field"].values():
-            metrics.update(
-                strict_f1=metrics.get("f1", 0.0),
-                strict_precision=metrics.get("precision", 0.0),
-                strict_recall=metrics.get("recall", 0.0),
-                strict_tp=metrics.get("tp", 0),
-                strict_fp=metrics.get("fp", 0),
-                strict_fn=metrics.get("fn", 0),
+        pred_dict = pred if isinstance(pred, dict) else {}
+        gt_dict = gt if isinstance(gt, dict) else {}
+        field_metrics: dict[str, dict[str, Any]] = {}
+        text_entries: list[dict[str, Any]] = []
+        for field_name, match_kind, is_text in (
+            ("name", "case_insensitive", True),
+            ("date_of_birth", "exact", False),
+            ("age", "numeric", False),
+            ("gender", "case_insensitive", False),
+            ("address", "text_exact", True),
+        ):
+            field_path = f"patient_info.{field_name}"
+            metric = self._evaluate_scalar_value(
+                field_path,
+                pred_dict.get(field_name),
+                gt_dict.get(field_name),
+                match_kind,
             )
+            field_metrics[field_path] = metric
+            if is_text:
+                entry = self._text_entry(field_path, pred_dict.get(field_name), gt_dict.get(field_name))
+                if entry is not None:
+                    text_entries.append(entry)
         return {
-            "section": _merge_section_tracks(soft_metrics["section"], soft_metrics["section"]),
-            "per_field": soft_metrics["per_field"],
-        }
-
-    def _evaluate_scalar_fields(
-        self,
-        section_name: str,
-        pred: dict[str, Any],
-        gt: dict[str, Any],
-        fields: list[tuple[str, str]],
-    ) -> dict[str, Any]:
-        tp = fp = fn = 0
-        per_field: dict[str, dict[str, Any]] = {}
-
-        for gt_key, pred_key in fields:
-            p_val = pred.get(pred_key)
-            g_val = gt.get(gt_key)
-            field_path = f"{section_name}.{pred_key}"
-            
-            if isinstance(g_val, (list, tuple)):
-                is_match = _list_exact_match(p_val, g_val)
-            elif isinstance(g_val, (int, float)):
-                is_match = _num_match(p_val, g_val)
-            elif field_path in CASE_INSENSITIVE_FIELDS:
-                is_match = _case_insensitive_match(p_val, g_val)
-            else:
-                is_match = _exact_match(p_val, g_val)
-
-            if is_match:
-                field_tp, field_fp, field_fn = 1, 0, 0
-            elif p_val is not None and g_val is None:
-                field_tp, field_fp, field_fn = 0, 1, 0
-            elif p_val is None and g_val is not None:
-                field_tp, field_fp, field_fn = 0, 0, 1
-            else:
-                field_tp, field_fp, field_fn = 0, 1, 1
-
-            tp += field_tp
-            fp += field_fp
-            fn += field_fn
-            per_field[f"{section_name}.{pred_key}"] = _metric_dict(
-                field_tp,
-                field_fp,
-                field_fn,
-                predicted=p_val,
-                ground_truth=g_val,
-            )
-
-        return {
-            "section": _metric_dict(tp, fp, fn),
-            "per_field": per_field,
+            "section": _merge_metric_counts(list(field_metrics.values())),
+            "per_field": field_metrics,
+            "text_entries": text_entries,
         }
 
     def _evaluate_medical_context(self, pred: dict[str, Any], gt: dict[str, Any]) -> dict[str, Any]:
-        anamnesis_pred = pred.get("anamnesis")
-        anamnesis_gt = gt.get("anamnesis")
-        anamnesis_f1 = _token_f1(_normalize_text(anamnesis_pred), _normalize_text(anamnesis_gt))
-        anamnesis_cer = _compute_cer(anamnesis_pred, anamnesis_gt)
-        anam_tp = 1 if anamnesis_f1 >= self.t.TEXT_TOKEN_F1_THRESHOLD else 0
-        anam_fp = 0 if anam_tp else (1 if anamnesis_pred else 0)
-        anam_fn = 0 if anam_tp else (1 if anamnesis_gt else 0)
+        pred_dict = pred if isinstance(pred, dict) else {}
+        gt_dict = gt if isinstance(gt, dict) else {}
+        field_metrics: dict[str, dict[str, Any]] = {}
+        text_entries: list[dict[str, Any]] = []
 
-        therapy_pred = pred.get("therapy_note")
-        therapy_gt = gt.get("therapy_note")
-        therapy_f1 = _token_f1(_normalize_text(therapy_pred), _normalize_text(therapy_gt))
-        therapy_cer = _compute_cer(therapy_pred, therapy_gt)
-        therapy_tp = 1 if therapy_f1 >= self.t.TEXT_TOKEN_F1_THRESHOLD else 0
-        therapy_fp = 0 if therapy_tp else (1 if therapy_pred else 0)
-        therapy_fn = 0 if therapy_tp else (1 if therapy_gt else 0)
-
-        diag_metrics = self._evaluate_diagnoses(pred.get("diagnoses", []), gt.get("diagnoses", []))
-        total_tp = diag_metrics["tp"] + anam_tp + therapy_tp
-        total_fp = diag_metrics["fp"] + anam_fp + therapy_fp
-        total_fn = diag_metrics["fn"] + anam_fn + therapy_fn
-
-        soft_section = _metric_dict(
-                total_tp,
-                total_fp,
-                total_fn,
-                anamnesis_f1=round(anamnesis_f1, 4),
-                anamnesis_cer=anamnesis_cer,
-                therapy_note_f1=round(therapy_f1, 4),
-                therapy_note_cer=therapy_cer,
-                diagnoses_f1=round(diag_metrics["f1"], 4),
+        for field_name in ("anamnesis", "therapy_note"):
+            field_path = f"medical_context.{field_name}"
+            metric = self._evaluate_scalar_value(
+                field_path,
+                pred_dict.get(field_name),
+                gt_dict.get(field_name),
+                "clinical_text",
             )
+            field_metrics[field_path] = metric
+            entry = self._text_entry(field_path, pred_dict.get(field_name), gt_dict.get(field_name))
+            if entry is not None:
+                text_entries.append(entry)
 
-        strict_text_threshold = max(self.t.TEXT_TOKEN_F1_THRESHOLD, 0.8)
-        strict_anam_tp = 1 if anamnesis_f1 >= strict_text_threshold else 0
-        strict_anam_fp = 0 if strict_anam_tp else (1 if anamnesis_pred else 0)
-        strict_anam_fn = 0 if strict_anam_tp else (1 if anamnesis_gt else 0)
-        strict_therapy_tp = 1 if therapy_f1 >= strict_text_threshold else 0
-        strict_therapy_fp = 0 if strict_therapy_tp else (1 if therapy_pred else 0)
-        strict_therapy_fn = 0 if strict_therapy_tp else (1 if therapy_gt else 0)
-        strict_diag = self._evaluate_diagnoses_strict(pred.get("diagnoses", []), gt.get("diagnoses", []))
-        strict_section = _metric_dict(
-            strict_diag["tp"] + strict_anam_tp + strict_therapy_tp,
-            strict_diag["fp"] + strict_anam_fp + strict_therapy_fp,
-            strict_diag["fn"] + strict_anam_fn + strict_therapy_fn,
+        diagnosis_result = self._evaluate_diagnoses(
+            pred_dict.get("diagnoses", []),
+            gt_dict.get("diagnoses", []),
         )
+        field_metrics.update(diagnosis_result["per_field"])
+        text_entries.extend(diagnosis_result.get("text_entries", []))
 
-        per_field = {
-                "medical_context.anamnesis": _metric_dict(
-                    anam_tp,
-                    anam_fp,
-                    anam_fn,
-                    similarity=round(anamnesis_f1, 4),
-                    cer=anamnesis_cer,
-                    predicted=anamnesis_pred,
-                    ground_truth=anamnesis_gt,
-                ),
-                "medical_context.therapy_note": _metric_dict(
-                    therapy_tp,
-                    therapy_fp,
-                    therapy_fn,
-                    similarity=round(therapy_f1, 4),
-                    cer=therapy_cer,
-                    predicted=therapy_pred,
-                    ground_truth=therapy_gt,
-                ),
-                "medical_context.diagnoses": diag_metrics,
-            }
-        per_field["medical_context.anamnesis"].update(strict_f1=_metric_dict(strict_anam_tp, strict_anam_fp, strict_anam_fn)["f1"], strict_precision=_metric_dict(strict_anam_tp, strict_anam_fp, strict_anam_fn)["precision"], strict_recall=_metric_dict(strict_anam_tp, strict_anam_fp, strict_anam_fn)["recall"], strict_tp=strict_anam_tp, strict_fp=strict_anam_fp, strict_fn=strict_anam_fn)
-        per_field["medical_context.therapy_note"].update(strict_f1=_metric_dict(strict_therapy_tp, strict_therapy_fp, strict_therapy_fn)["f1"], strict_precision=_metric_dict(strict_therapy_tp, strict_therapy_fp, strict_therapy_fn)["precision"], strict_recall=_metric_dict(strict_therapy_tp, strict_therapy_fp, strict_therapy_fn)["recall"], strict_tp=strict_therapy_tp, strict_fp=strict_therapy_fp, strict_fn=strict_therapy_fn)
-        per_field["medical_context.diagnoses"].update(
-            strict_f1=strict_diag["f1"],
-            strict_precision=strict_diag["precision"],
-            strict_recall=strict_diag["recall"],
-            strict_tp=strict_diag["tp"],
-            strict_fp=strict_diag["fp"],
-            strict_fn=strict_diag["fn"],
-            strict_matches=strict_diag.get("matches", []),
-            strict_avg_similarity=strict_diag.get("avg_similarity", 0.0),
-        )
         return {
-            "section": _merge_section_tracks(soft_section, strict_section, avg_similarity=diag_metrics.get("avg_similarity", 0.0)),
-            "per_field": per_field,
+            "section": _merge_metric_counts(list(field_metrics.values())),
+            "per_field": field_metrics,
+            "text_entries": text_entries,
+            "entity_metrics": {"diagnoses": diagnosis_result["entity_metric"]},
+            "details": {"diagnoses": diagnosis_result["details"]},
         }
 
     def _evaluate_diagnoses(self, pred: list[dict[str, Any]], gt: list[dict[str, Any]]) -> dict[str, Any]:
-        if not gt:
-            if not pred:
-                return _metric_dict(0, 0, 0, unmatched_predicted=[], unmatched_ground_truth=[], matches=[], avg_similarity=0.0)
-            return _metric_dict(0, len(pred), 0, unmatched_predicted=pred, unmatched_ground_truth=[], matches=[], avg_similarity=0.0)
-        if not pred:
-            return _metric_dict(0, 0, len(gt), unmatched_predicted=[], unmatched_ground_truth=gt, matches=[], avg_similarity=0.0)
-
-        tp = fp = 0
-        gt_matched = [False] * len(gt)
-        unmatched_predicted: list[dict[str, Any]] = []
-        matches: list[dict[str, Any]] = []
-
-        for pred_diag in pred:
-            pred_desc = pred_diag.get("description", "")
-            pred_doc = pred_diag.get("doctor_name")
-            best_idx = -1
-            best_score = 0.0
-
-            for index, gt_diag in enumerate(gt):
-                if gt_matched[index]:
-                    continue
-                desc_score = _token_f1(
-                    _normalize_text(pred_desc),
-                    _normalize_text(gt_diag.get("description", "")),
-                )
-                doc_score = _fuzzy_name_match(pred_doc, gt_diag.get("doctor_name"))
-                combined = (desc_score + doc_score) / 2.0
-                if combined > best_score:
-                    best_score = combined
-                    best_idx = index
-
-            if best_idx >= 0 and best_score >= self.t.DIAGNOSIS_SIM_THRESHOLD:
-                tp += 1
-                gt_matched[best_idx] = True
-                matches.append(
-                    {
-                        "predicted": pred_diag,
-                        "ground_truth": gt[best_idx],
-                        "similarity": round(best_score, 4),
-                    }
-                )
-            else:
-                fp += 1
-                unmatched_predicted.append(pred_diag)
-
-        fn = sum(1 for matched in gt_matched if not matched)
-        avg_similarity = sum(m["similarity"] for m in matches) / len(matches) if matches else 0.0
-        return _metric_dict(
-            tp,
-            fp,
-            fn,
-            unmatched_predicted=unmatched_predicted,
-            unmatched_ground_truth=[gt[index] for index, matched in enumerate(gt_matched) if not matched],
-            matches=matches,
-            avg_similarity=round(avg_similarity, 4),
+        pred_items = _filter_items(pred if isinstance(pred, list) else [])
+        gt_items = _filter_items(gt if isinstance(gt, list) else [])
+        matched, unmatched_pred, unmatched_gt = _match_by_key(pred_items, gt_items, _diagnosis_key)
+        entity_metric = self._build_entity_metric(
+            pred_items,
+            gt_items,
+            matched,
+            unmatched_pred,
+            unmatched_gt,
         )
+        field_metrics: list[dict[str, Any]] = [entity_metric]
+        field_counts: dict[str, dict[str, float]] = {}
+        text_entries: list[dict[str, Any]] = []
+        strict_matches: list[dict[str, Any]] = []
+
+        for pred_index, gt_index in matched:
+            pred_item = pred_items[pred_index]
+            gt_item = gt_items[gt_index]
+            strict_matches.append({"predicted": pred_item, "ground_truth": gt_item})
+            doctor_metric = self._evaluate_scalar_value(
+                "medical_context.diagnoses.doctor_name",
+                pred_item.get("doctor_name"),
+                gt_item.get("doctor_name"),
+                "text_exact",
+            )
+            _add_counts(field_counts.setdefault("medical_context.diagnoses.doctor_name", {}), doctor_metric)
+            field_metrics.append(doctor_metric)
+            for field_name in ("description", "doctor_name"):
+                entry = self._text_entry(
+                    f"medical_context.diagnoses.{field_name}",
+                    pred_item.get(field_name),
+                    gt_item.get(field_name),
+                )
+                if entry is not None:
+                    text_entries.append(entry)
+
+        per_field = {
+            "medical_context.diagnoses": _with_strict_aliases(
+                {
+                    **entity_metric,
+                    "matches": strict_matches,
+                    "strict_matches": strict_matches,
+                    "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+                    "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+                }
+            )
+        }
+        for field_path, counts in field_counts.items():
+            per_field[field_path] = _with_strict_aliases(_metric_dict(counts.get("tp", 0.0), counts.get("fp", 0.0), counts.get("fn", 0.0)))
+
+        return {
+            "entity_metric": entity_metric,
+            "per_field": per_field,
+            "text_entries": text_entries,
+            "details": {
+                "matches": strict_matches,
+                "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+                "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+            },
+        }
 
     def _evaluate_diagnoses_strict(self, pred: list[dict[str, Any]], gt: list[dict[str, Any]]) -> dict[str, Any]:
-        if not gt:
-            if not pred:
-                return _metric_dict(0, 0, 0, unmatched_predicted=[], unmatched_ground_truth=[], matches=[], avg_similarity=0.0)
-            return _metric_dict(0, len(pred), 0, unmatched_predicted=pred, unmatched_ground_truth=[], matches=[], avg_similarity=0.0)
-        if not pred:
-            return _metric_dict(0, 0, len(gt), unmatched_predicted=[], unmatched_ground_truth=gt, matches=[], avg_similarity=0.0)
-
-        tp = fp = 0
-        gt_matched = [False] * len(gt)
-        unmatched_predicted: list[dict[str, Any]] = []
-        matches: list[dict[str, Any]] = []
-
-        for pred_diag in pred:
-            pred_desc = pred_diag.get("description", "")
-            pred_doc = pred_diag.get("doctor_name")
-            best_idx = -1
-            best_score = 0.0
-            best_desc_score = 0.0
-            best_doc_score = 0.0
-
-            for index, gt_diag in enumerate(gt):
-                if gt_matched[index]:
-                    continue
-                desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_diag.get("description", "")))
-                doc_score = _fuzzy_name_match(pred_doc, gt_diag.get("doctor_name"))
-                combined = (desc_score + doc_score) / 2.0
-                if combined > best_score:
-                    best_score = combined
-                    best_desc_score = desc_score
-                    best_doc_score = doc_score
-                    best_idx = index
-
-            doctor_required = bool(gt[best_idx].get("doctor_name")) if best_idx >= 0 else False
-            strict_pass = (
-                best_idx >= 0
-                and best_desc_score >= self.t.STRICT_DIAGNOSIS_DESC_THRESHOLD
-                and (not doctor_required or best_doc_score >= self.t.STRICT_DIAGNOSIS_DOCTOR_THRESHOLD)
-            )
-            if strict_pass:
-                tp += 1
-                gt_matched[best_idx] = True
-                matches.append({
-                    "predicted": pred_diag,
-                    "ground_truth": gt[best_idx],
-                    "similarity": round(best_score, 4),
-                    "description_similarity": round(best_desc_score, 4),
-                    "doctor_similarity": round(best_doc_score, 4),
-                })
-            else:
-                fp += 1
-                unmatched_predicted.append(pred_diag)
-
-        fn = sum(1 for matched in gt_matched if not matched)
-        avg_similarity = sum(m["similarity"] for m in matches) / len(matches) if matches else 0.0
-        return _metric_dict(tp, fp, fn, unmatched_predicted=unmatched_predicted, unmatched_ground_truth=[gt[index] for index, matched in enumerate(gt_matched) if not matched], matches=matches, avg_similarity=round(avg_similarity, 4))
+        result = self._evaluate_diagnoses(pred, gt)
+        metric = result["entity_metric"]
+        details = result["details"]
+        return {
+            **metric,
+            "matches": details.get("matches", []),
+            "unmatched_predicted": details.get("unmatched_predicted", []),
+            "unmatched_ground_truth": details.get("unmatched_ground_truth", []),
+        }
 
     def _evaluate_medicines(self, pred: list[dict[str, Any]], gt: list[dict[str, Any]]) -> dict[str, Any]:
-        if not pred and not gt:
-            metric = _metric_dict(0, 0, 0, details={"total_predicted": 0, "total_ground_truth": 0, "matched_count": 0, "unmatched_predicted": [], "unmatched_ground_truth": [], "matches": []})
-            return {"section": metric, "per_field": {"medicines": metric}}
+        pred_items = _filter_items(pred if isinstance(pred, list) else [])
+        gt_items = _filter_items(gt if isinstance(gt, list) else [])
+        matched, unmatched_pred, unmatched_gt = _match_medicines_conservative(pred_items, gt_items)
+        entity_metric = self._build_entity_metric(
+            pred_items,
+            gt_items,
+            matched,
+            unmatched_pred,
+            unmatched_gt,
+        )
+        field_metrics: list[dict[str, Any]] = [entity_metric]
+        field_counts: dict[str, dict[str, float]] = {}
+        text_entries: list[dict[str, Any]] = []
+        strict_matches: list[dict[str, Any]] = []
 
-        matched, unmatched_pred, unmatched_gt = match_medicines(pred, gt, self.t)
+        for pred_index, gt_index, similarity in matched:
+            pred_item = pred_items[pred_index]
+            gt_item = gt_items[gt_index]
+            strict_matches.append({"predicted": pred_item, "ground_truth": gt_item, "similarity": similarity})
+            for field_name, match_kind, is_text in (
+                ("quantity", "numeric", False),
+                ("unit", "case_insensitive", False),
+                ("dosage_instruction", "text_exact", True),
+                ("unit_price", "numeric", False),
+                ("total_price", "numeric", False),
+            ):
+                field_path = f"medicines.{field_name}"
+                metric = self._evaluate_scalar_value(
+                    field_path,
+                    pred_item.get(field_name),
+                    gt_item.get(field_name),
+                    match_kind,
+                )
+                _add_counts(field_counts.setdefault(field_path, {}), metric)
+                field_metrics.append(metric)
+                if is_text:
+                    entry = self._text_entry(field_path, pred_item.get(field_name), gt_item.get(field_name))
+                    if entry is not None:
+                        text_entries.append(entry)
+            entry = self._text_entry("medicines.name", pred_item.get("name"), gt_item.get("name"))
+            if entry is not None:
+                text_entries.append(entry)
 
-        tp_weight = sum(sim for _, _, sim in matched)
-        fp_count = len(unmatched_pred)
-        fn_count = len(unmatched_gt)
+        for pred_index, gt_index, _similarity in match_medicines(pred_items, gt_items, self.t)[0]:
+            entry = self._text_entry("medicines.name.relaxed", pred_items[pred_index].get("name"), gt_items[gt_index].get("name"))
+            if entry is not None:
+                text_entries.append(entry)
 
+        per_field = {
+            "medicines": _with_strict_aliases(
+                {
+                    **entity_metric,
+                    "matches": strict_matches,
+                    "strict_matches": strict_matches,
+                    "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+                    "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+                }
+            )
+        }
+        for field_path, counts in field_counts.items():
+            per_field[field_path] = _with_strict_aliases(_metric_dict(counts.get("tp", 0.0), counts.get("fp", 0.0), counts.get("fn", 0.0)))
+
+        section_metric = _merge_metric_counts(field_metrics)
         details = {
-            "total_predicted": len(pred),
-            "total_ground_truth": len(gt),
-            "matched_count": len(matched),
-            "unmatched_predicted": [pred[index] for index in unmatched_pred],
-            "unmatched_ground_truth": [gt[index] for index in unmatched_gt],
             "matches": [
-                {"predicted": pred[pred_index], "ground_truth": gt[gt_index], "similarity": round(similarity, 4)}
+                {
+                    "predicted": pred_items[pred_index],
+                    "ground_truth": gt_items[gt_index],
+                    "similarity": similarity,
+                }
                 for pred_index, gt_index, similarity in matched
             ],
+            "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+            "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+            "matched_count": len(matched),
+            "total_predicted": len(pred_items),
+            "total_ground_truth": len(gt_items),
         }
-        avg_similarity = sum(sim for _, _, sim in matched) / len(matched) if matched else 0.0
-
-        precision = tp_weight / (tp_weight + fp_count) if (tp_weight + fp_count) > 0 else 0.0
-        recall = tp_weight / (tp_weight + fn_count) if (tp_weight + fn_count) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-        weighted_metric = {
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "f1": round(f1, 4),
-            "tp": round(tp_weight, 4),
-            "fp": fp_count,
-            "fn": fn_count,
-            "avg_similarity": round(avg_similarity, 4),
+        return {
+            "section": section_metric,
+            "per_field": per_field,
+            "text_entries": text_entries,
+            "entity_metrics": {"medicines": entity_metric},
             "details": details,
         }
 
-        strict_matches: list[dict[str, Any]] = []
-        strict_fp = 0
-        strict_fn = 0
-        strict_matched_pred: set[int] = set()
-        strict_matched_gt: set[int] = set()
-        for pred_index, gt_index, similarity in matched:
-            pred_item = pred[pred_index]
-            gt_item = gt[gt_index]
-            qty_prox = 1.0 if pred_item.get("quantity") is None and gt_item.get("quantity") is None else 0.0
-            if pred_item.get("quantity") is not None or gt_item.get("quantity") is not None:
-                gt_qty = gt_item.get("quantity")
-                pred_qty = pred_item.get("quantity")
-                if pred_qty is not None and gt_qty is not None and float(gt_qty) != 0:
-                    qty_prox = max(0.0, 1.0 - abs(float(pred_qty) - float(gt_qty)) / max(float(gt_qty), 1.0))
-            pred_unit = (pred_item.get("unit") or "").strip().lower()
-            gt_unit = (gt_item.get("unit") or "").strip().lower()
-            unit_ok = not pred_unit or not gt_unit or pred_unit == gt_unit
-            if similarity >= self.t.STRICT_MEDICINE_SIM_THRESHOLD and qty_prox >= self.t.STRICT_MEDICINE_QTY_THRESHOLD and unit_ok:
-                strict_matches.append({"predicted": pred_item, "ground_truth": gt_item, "similarity": round(similarity, 4), "quantity_similarity": round(qty_prox, 4), "unit_match": unit_ok})
-                strict_matched_pred.add(pred_index)
-                strict_matched_gt.add(gt_index)
-        strict_fp = len(pred) - len(strict_matched_pred)
-        strict_fn = len(gt) - len(strict_matched_gt)
-        strict_metric = _metric_dict(len(strict_matches), strict_fp, strict_fn)
-        medicine_metric = dict(weighted_metric)
-        medicine_metric.update(
-            strict_f1=strict_metric["f1"],
-            strict_precision=strict_metric["precision"],
-            strict_recall=strict_metric["recall"],
-            strict_tp=strict_metric["tp"],
-            strict_fp=strict_metric["fp"],
-            strict_fn=strict_metric["fn"],
-            strict_matches=strict_matches,
-        )
-        return {"section": _merge_section_tracks(weighted_metric, strict_metric, avg_similarity=round(avg_similarity, 4), details=details, strict_matches=strict_matches), "per_field": {"medicines": medicine_metric}}
-
     def _evaluate_other_charges(self, pred: list[dict[str, Any]], gt: list[dict[str, Any]]) -> dict[str, Any]:
-        if not gt:
-            if not pred:
-                metric = _metric_dict(0, 0, 0, details={"unmatched_predicted": [], "unmatched_ground_truth": []})
-                return {"section": metric, "per_field": {"other_charges": metric}}
-            metric = _metric_dict(0, len(pred), 0, details={"unmatched_predicted": pred, "unmatched_ground_truth": []})
-            return {"section": metric, "per_field": {"other_charges": metric}}
-        if not pred:
-            metric = _metric_dict(0, 0, len(gt), details={"unmatched_predicted": [], "unmatched_ground_truth": gt})
-            return {"section": metric, "per_field": {"other_charges": metric}}
-
-        tp = fp = 0
-        gt_matched = [False] * len(gt)
-        unmatched_predicted: list[dict[str, Any]] = []
-        matches: list[dict[str, Any]] = []
-
-        for pred_charge in pred:
-            pred_cat_raw = pred_charge.get("category") or ""
-            pred_desc = pred_charge.get("description") or ""
-            pred_cat_mapped = _normalize_other_charge_category_for_eval(pred_cat_raw, pred_desc)
-            best_idx = -1
-            best_score = 0.0
-
-            for index, gt_charge in enumerate(gt):
-                if gt_matched[index]:
-                    continue
-                gt_cat_raw = gt_charge.get("category") or ""
-                gt_desc = gt_charge.get("description") or ""
-                gt_cat_mapped = _normalize_other_charge_category_for_eval(gt_cat_raw, gt_desc)
-                cat_match = pred_cat_mapped and gt_cat_mapped and pred_cat_mapped.upper() == gt_cat_mapped.upper()
-                desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_desc))
-                combined = (1.0 if cat_match else 0.0) * 0.5 + desc_score * 0.5
-                if combined > best_score:
-                    best_score = combined
-                    best_idx = index
-
-            if best_idx >= 0 and best_score >= self.t.OTHER_CHARGE_SIM_THRESHOLD:
-                tp += 1
-                gt_matched[best_idx] = True
-                matches.append(
-                    {
-                        "predicted": pred_charge,
-                        "ground_truth": gt[best_idx],
-                        "similarity": round(best_score, 4),
-                        "predicted_category_canonical": pred_cat_mapped,
-                        "ground_truth_category_canonical": gt_cat_mapped,
-                    }
-                )
-            else:
-                fp += 1
-                unmatched_predicted.append(pred_charge)
-
-        fn = sum(1 for matched in gt_matched if not matched)
-        avg_similarity = sum(m["similarity"] for m in matches) / len(matches) if matches else 0.0
-        metric = _metric_dict(
-            tp,
-            fp,
-            fn,
-            details={
-                "matches": matches,
-                "avg_similarity": round(avg_similarity, 4),
-                "unmatched_predicted": unmatched_predicted,
-                "unmatched_ground_truth": [gt[index] for index, matched in enumerate(gt_matched) if not matched],
-            },
-            avg_similarity=round(avg_similarity, 4),
+        pred_items = _filter_items(pred if isinstance(pred, list) else [])
+        gt_items = _filter_items(gt if isinstance(gt, list) else [])
+        matched, unmatched_pred, unmatched_gt = _match_by_key(pred_items, gt_items, _other_charge_key)
+        unmatched_pred = self._prune_amount_null_duplicate_other_charges(pred_items, matched, unmatched_pred)
+        entity_metric = self._build_entity_metric(
+            pred_items,
+            gt_items,
+            matched,
+            unmatched_pred,
+            unmatched_gt,
         )
-        strict_tp = strict_fp = 0
-        strict_gt_matched = [False] * len(gt)
+        field_metrics: list[dict[str, Any]] = [entity_metric]
+        field_counts: dict[str, dict[str, float]] = {}
+        text_entries: list[dict[str, Any]] = []
         strict_matches: list[dict[str, Any]] = []
-        for pred_charge in pred:
-            pred_cat_raw = pred_charge.get("category") or ""
-            pred_desc = pred_charge.get("description") or ""
-            pred_amount = pred_charge.get("amount")
-            pred_cat_mapped = _normalize_other_charge_category_for_eval(pred_cat_raw, pred_desc)
-            best_idx = -1
-            best_score = 0.0
-            best_desc_score = 0.0
-            for index, gt_charge in enumerate(gt):
-                if strict_gt_matched[index]:
-                    continue
-                gt_cat_raw = gt_charge.get("category") or ""
-                gt_desc = gt_charge.get("description") or ""
-                gt_amount = gt_charge.get("amount")
-                gt_cat_mapped = _normalize_other_charge_category_for_eval(gt_cat_raw, gt_desc)
-                desc_score = _token_f1(_normalize_text(pred_desc), _normalize_text(gt_desc))
-                amount_match = _num_match(pred_amount, gt_amount)
-                cat_match = pred_cat_mapped and gt_cat_mapped and pred_cat_mapped.upper() == gt_cat_mapped.upper()
-                combined = (1.0 if cat_match else 0.0) * 0.5 + desc_score * 0.5
-                strict_pass = bool(cat_match and amount_match and desc_score >= self.t.STRICT_OTHER_CHARGE_DESC_THRESHOLD)
-                if strict_pass and combined > best_score:
-                    best_score = combined
-                    best_desc_score = desc_score
-                    best_idx = index
-            if best_idx >= 0:
-                strict_tp += 1
-                strict_gt_matched[best_idx] = True
-                strict_matches.append(
-                    {
-                        "predicted": pred_charge,
-                        "ground_truth": gt[best_idx],
-                        "similarity": round(best_score, 4),
-                        "description_similarity": round(best_desc_score, 4),
-                        "predicted_category_canonical": pred_cat_mapped,
-                        "ground_truth_category_canonical": _normalize_other_charge_category_for_eval(
-                            gt[best_idx].get("category"),
-                            gt[best_idx].get("description"),
-                        ),
-                    }
-                )
-            else:
-                strict_fp += 1
-        strict_fn = sum(1 for matched in strict_gt_matched if not matched)
-        strict_metric = _metric_dict(strict_tp, strict_fp, strict_fn)
-        other_metric = dict(metric)
-        other_metric.update(
-            strict_f1=strict_metric["f1"],
-            strict_precision=strict_metric["precision"],
-            strict_recall=strict_metric["recall"],
-            strict_tp=strict_metric["tp"],
-            strict_fp=strict_metric["fp"],
-            strict_fn=strict_metric["fn"],
-            strict_matches=strict_matches,
-        )
-        return {"section": _merge_section_tracks(metric, strict_metric, avg_similarity=round(avg_similarity, 4), details=metric.get("details", {}), strict_matches=strict_matches), "per_field": {"other_charges": other_metric}}
 
-    def _evaluate_financial_recap(self, pred: dict[str, Any], gt: dict[str, Any]) -> dict[str, Any]:
-        soft_metrics = self._evaluate_scalar_fields(
-            "financial_recap",
-            pred,
-            gt,
-            [
-                ("total_medicines", "total_medicines"),
-                ("total_other_charges", "total_other_charges"),
-                ("grand_total", "grand_total"),
-            ],
-        )
-        for metrics in soft_metrics["per_field"].values():
-            metrics.update(
-                strict_f1=metrics.get("f1", 0.0),
-                strict_precision=metrics.get("precision", 0.0),
-                strict_recall=metrics.get("recall", 0.0),
-                strict_tp=metrics.get("tp", 0),
-                strict_fp=metrics.get("fp", 0),
-                strict_fn=metrics.get("fn", 0),
+        for pred_index, gt_index in matched:
+            pred_item = pred_items[pred_index]
+            gt_item = gt_items[gt_index]
+            pred_category = _normalize_other_charge_category_for_eval(pred_item.get("category"), pred_item.get("description"))
+            gt_category = _normalize_other_charge_category_for_eval(gt_item.get("category"), gt_item.get("description"))
+            strict_matches.append(
+                {
+                    "predicted": pred_item,
+                    "ground_truth": gt_item,
+                    "predicted_category_canonical": pred_category,
+                    "ground_truth_category_canonical": gt_category,
+                }
             )
+            description_metric = self._evaluate_scalar_value(
+                "other_charges.description",
+                pred_item.get("description"),
+                gt_item.get("description"),
+                "text_exact",
+            )
+            _add_counts(field_counts.setdefault("other_charges.description", {}), description_metric)
+            field_metrics.append(description_metric)
+            entry = self._text_entry("other_charges.description", pred_item.get("description"), gt_item.get("description"))
+            if entry is not None:
+                text_entries.append(entry)
+
+        per_field = {
+            "other_charges": _with_strict_aliases(
+                {
+                    **entity_metric,
+                    "matches": strict_matches,
+                    "strict_matches": strict_matches,
+                    "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+                    "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+                }
+            )
+        }
+        for field_path, counts in field_counts.items():
+            per_field[field_path] = _with_strict_aliases(_metric_dict(counts.get("tp", 0.0), counts.get("fp", 0.0), counts.get("fn", 0.0)))
+
+        section_metric = _merge_metric_counts(field_metrics)
+        details = {
+            "matches": [
+                {
+                    "predicted": match["predicted"],
+                    "ground_truth": match["ground_truth"],
+                    "similarity": 1.0,
+                    "predicted_category_canonical": match.get("predicted_category_canonical"),
+                    "ground_truth_category_canonical": match.get("ground_truth_category_canonical"),
+                }
+                for match in strict_matches
+            ],
+            "unmatched_predicted": [pred_items[index] for index in unmatched_pred],
+            "unmatched_ground_truth": [gt_items[index] for index in unmatched_gt],
+        }
         return {
-            "section": _merge_section_tracks(soft_metrics["section"], soft_metrics["section"]),
-            "per_field": soft_metrics["per_field"],
+            "section": section_metric,
+            "per_field": per_field,
+            "text_entries": text_entries,
+            "entity_metrics": {"other_charges": entity_metric},
+            "details": details,
         }
 
-    def _compute_edit_burden(self, section_results: dict[str, dict[str, Any]]) -> float:
-        burden = 0.0
-        summary_strict = section_results.get("summary", {}).get("strict", {})
-        patient_strict = section_results.get("patient_info", {}).get("strict", {})
-        financial_strict = section_results.get("financial_recap", {}).get("strict", {})
-        medical_context_strict = section_results.get("medical_context", {}).get("strict", {})
-        medicines = section_results.get("medicines", {})
-        other_charges = section_results.get("other_charges", {})
+    def _evaluate_financial_recap(self, pred: dict[str, Any], gt: dict[str, Any]) -> dict[str, Any]:
+        pred_dict = pred if isinstance(pred, dict) else {}
+        gt_dict = gt if isinstance(gt, dict) else {}
+        field_metrics: dict[str, dict[str, Any]] = {}
+        for field_name in ("total_medicines", "total_other_charges", "grand_total"):
+            field_path = f"financial_recap.{field_name}"
+            field_metrics[field_path] = self._evaluate_scalar_value(
+                field_path,
+                pred_dict.get(field_name),
+                gt_dict.get(field_name),
+                "numeric",
+            )
+        return {
+            "section": _merge_metric_counts(list(field_metrics.values())),
+            "per_field": field_metrics,
+            "text_entries": [],
+        }
 
-        burden += float(summary_strict.get("fp", 0) + summary_strict.get("fn", 0)) * self.t.EDIT_COST_CRITICAL_FIELD
-        burden += float(patient_strict.get("fp", 0) + patient_strict.get("fn", 0)) * self.t.EDIT_COST_CRITICAL_FIELD
-        burden += float(financial_strict.get("fp", 0) + financial_strict.get("fn", 0)) * self.t.EDIT_COST_FINANCIAL_MISMATCH
-        burden += float(medical_context_strict.get("fp", 0) + medical_context_strict.get("fn", 0)) * self.t.EDIT_COST_PARTIAL_MATCH
-        burden += float(medicines.get("strict_fp", 0)) * self.t.EDIT_COST_EXTRA_ITEM
-        burden += float(medicines.get("strict_fn", 0)) * self.t.EDIT_COST_MISSING_ITEM
-        burden += max(0.0, float(medicines.get("soft_tp", 0)) - float(medicines.get("strict_tp", 0))) * self.t.EDIT_COST_PARTIAL_MATCH
-        burden += float(other_charges.get("strict_fp", 0)) * self.t.EDIT_COST_EXTRA_ITEM
-        burden += float(other_charges.get("strict_fn", 0)) * self.t.EDIT_COST_MISSING_ITEM
-        burden += max(0.0, float(other_charges.get("soft_tp", 0)) - float(other_charges.get("strict_tp", 0))) * self.t.EDIT_COST_CATEGORY_FIX
+    def _evaluate_scalar_value(self, field_path: str, pred_value: Any, gt_value: Any, match_kind: str) -> dict[str, Any]:
+        pred_empty = _is_empty(pred_value)
+        gt_empty = _is_empty(gt_value)
+        if pred_empty and gt_empty:
+            return _with_strict_aliases(
+                _metric_dict(
+                    0,
+                    0,
+                    0,
+                    predicted=pred_value,
+                    ground_truth=gt_value,
+                    exact_match=True,
+                    status="not_applicable",
+                )
+            )
+
+        if self._values_match(field_path, pred_value, gt_value, match_kind):
+            return _with_strict_aliases(
+                _metric_dict(
+                    1,
+                    0,
+                    0,
+                    predicted=pred_value,
+                    ground_truth=gt_value,
+                    exact_match=True,
+                    status="match",
+                )
+            )
+        if pred_empty:
+            tp, fp, fn, status_value = 0, 0, 1, "missing"
+        elif gt_empty:
+            tp, fp, fn, status_value = 0, 1, 0, "extra"
+        else:
+            tp, fp, fn, status_value = 0, 1, 1, "mismatch"
+        return _with_strict_aliases(
+            _metric_dict(
+                tp,
+                fp,
+                fn,
+                predicted=pred_value,
+                ground_truth=gt_value,
+                exact_match=False,
+                status=status_value,
+            )
+        )
+
+    def _values_match(self, field_path: str, pred_value: Any, gt_value: Any, match_kind: str) -> bool:
+        if match_kind == "numeric":
+            return _num_match(pred_value, gt_value)
+        if match_kind == "case_insensitive" or field_path in CASE_INSENSITIVE_FIELDS:
+            return _case_insensitive_match(pred_value, gt_value)
+        if match_kind == "facility":
+            return _facility_match(pred_value, gt_value)
+        if match_kind == "clinical_text":
+            return _clinical_text_match(pred_value, gt_value)
+        if match_kind == "text_exact":
+            return _normalize_exact_text(pred_value) == _normalize_exact_text(gt_value)
+        return _exact_match(pred_value, gt_value)
+
+    def _prune_amount_null_duplicate_other_charges(
+        self,
+        pred_items: list[dict[str, Any]],
+        matched: list[tuple[int, int]],
+        unmatched_pred: list[int],
+    ) -> list[int]:
+        matched_pred_items = [pred_items[pred_index] for pred_index, _gt_index in matched]
+        kept_unmatched: list[int] = []
+        for pred_index in unmatched_pred:
+            item = pred_items[pred_index]
+            if not self._is_amount_null_duplicate_other_charge(item, matched_pred_items):
+                kept_unmatched.append(pred_index)
+        return kept_unmatched
+
+    def _is_amount_null_duplicate_other_charge(
+        self,
+        item: dict[str, Any],
+        matched_items: list[dict[str, Any]],
+    ) -> bool:
+        if _to_number(item.get("amount")) is not None:
+            return False
+        category = _normalize_other_charge_category_for_eval(item.get("category"), item.get("description"))
+        description_tokens = _normalize_text(str(item.get("description") or item.get("category") or ""))
+        for matched_item in matched_items:
+            matched_category = _normalize_other_charge_category_for_eval(
+                matched_item.get("category"),
+                matched_item.get("description"),
+            )
+            if category != matched_category:
+                continue
+            matched_description_tokens = _normalize_text(
+                str(matched_item.get("description") or matched_item.get("category") or "")
+            )
+            if not description_tokens or _token_overlap(description_tokens, matched_description_tokens) > 0:
+                return True
+        return False
+
+    def _text_entry(self, field_path: str, pred_value: Any, gt_value: Any) -> dict[str, Any] | None:
+        if _is_empty(pred_value) and _is_empty(gt_value):
+            return None
+        pred_text = None if _is_empty(pred_value) else str(pred_value)
+        gt_text = None if _is_empty(gt_value) else str(gt_value)
+        return {
+            "field_path": field_path,
+            "predicted": pred_value,
+            "ground_truth": gt_value,
+            "anls": _compute_anls(pred_text, gt_text),
+            "token_f1": round(_token_f1(_normalize_text(pred_text), _normalize_text(gt_text)), 4),
+            "cer": _compute_cer(pred_text, gt_text),
+        }
+
+    def _build_entity_metric(
+        self,
+        pred_items: list[dict[str, Any]],
+        gt_items: list[dict[str, Any]],
+        matched: list[tuple[int, int]],
+        unmatched_pred: list[int],
+        unmatched_gt: list[int],
+    ) -> dict[str, Any]:
+        return _with_strict_aliases(
+            _metric_dict(
+                len(matched),
+                len(unmatched_pred),
+                len(unmatched_gt),
+                matched_count=len(matched),
+                total_predicted=len(pred_items),
+                total_ground_truth=len(gt_items),
+            )
+        )
+
+    def _combine_sections(self, section_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        return _merge_metric_counts([section_results[section] for section in SECTION_ORDER if section in section_results])
+
+    def _macro_f1(self, metrics: Any) -> float:
+        applicable = [float(metric.get("f1", 0.0)) for metric in metrics if metric.get("applicable")]
+        if not applicable:
+            return 0.0
+        return round(sum(applicable) / len(applicable), 4)
+
+    def _compute_exact_accuracy(self, per_field: dict[str, dict[str, Any]], field_paths: tuple[str, ...]) -> dict[str, Any]:
+        evaluated = 0
+        correct = 0
+        incorrect_fields: list[str] = []
+        for field_path in field_paths:
+            metric = per_field.get(field_path)
+            if not metric or not metric.get("applicable"):
+                continue
+            evaluated += 1
+            if metric.get("tp", 0) == 1 and metric.get("fp", 0) == 0 and metric.get("fn", 0) == 0:
+                correct += 1
+            else:
+                incorrect_fields.append(field_path)
+        accuracy = correct / evaluated if evaluated else 0.0
+        return {
+            "accuracy": round(accuracy, 4),
+            "correct": correct,
+            "total": evaluated,
+            "incorrect_fields": incorrect_fields,
+        }
+
+    def _aggregate_text_entries(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        if not entries:
+            return {
+                "average_anls": 0.0,
+                "average_token_f1": 0.0,
+                "average_cer": 0.0,
+                "count": 0,
+                "items": [],
+                "by_field": {},
+            }
+
+        by_field: dict[str, list[dict[str, Any]]] = {}
+        for entry in entries:
+            by_field.setdefault(str(entry["field_path"]), []).append(entry)
+
+        field_summary: dict[str, dict[str, Any]] = {}
+        for field_path, field_entries in by_field.items():
+            field_summary[field_path] = {
+                "average_anls": round(sum(float(item["anls"]) for item in field_entries) / len(field_entries), 4),
+                "average_token_f1": round(sum(float(item["token_f1"]) for item in field_entries) / len(field_entries), 4),
+                "average_cer": round(sum(float(item["cer"]) for item in field_entries) / len(field_entries), 4),
+                "count": len(field_entries),
+            }
+
+        return {
+            "average_anls": round(sum(float(item["anls"]) for item in entries) / len(entries), 4),
+            "average_token_f1": round(sum(float(item["token_f1"]) for item in entries) / len(entries), 4),
+            "average_cer": round(sum(float(item["cer"]) for item in entries) / len(entries), 4),
+            "count": len(entries),
+            "items": entries,
+            "by_field": field_summary,
+        }
+
+    def _compute_edit_burden(
+        self,
+        per_field: dict[str, dict[str, Any]],
+        entity_metrics: dict[str, dict[str, Any]],
+        text_entries: list[dict[str, Any]],
+    ) -> float:
+        burden = 0.0
+        text_by_field = self._index_text_entries(text_entries)
+        entity_field_paths = {"medicines", "other_charges", "medical_context.diagnoses"}
+
+        for field_path, metric in per_field.items():
+            if field_path in entity_field_paths or not metric.get("applicable"):
+                continue
+            if self._field_is_strict_match(metric):
+                continue
+
+            units = self._field_error_units(metric)
+            if field_path in FINANCIAL_EXACT_FIELD_PATHS:
+                if self._financial_field_within_verify_tolerance(metric):
+                    burden += self.t.EDIT_COST_PARTIAL_MATCH
+                else:
+                    burden += self.t.EDIT_COST_FINANCIAL_MISMATCH
+                continue
+
+            if field_path in CRITICAL_FIELD_PATHS:
+                if self._field_passes_relaxed_text_gate(field_path, text_by_field):
+                    burden += self.t.EDIT_COST_PARTIAL_MATCH
+                else:
+                    burden += self.t.EDIT_COST_CRITICAL_FIELD
+                continue
+
+            if self._field_passes_relaxed_text_gate(field_path, text_by_field):
+                burden += self.t.EDIT_COST_PARTIAL_MATCH
+            else:
+                burden += units * self.t.EDIT_COST_PARTIAL_MATCH
+
+        for entity_name in ("medicines", "other_charges"):
+            metric = entity_metrics.get(entity_name, {})
+            burden += float(metric.get("fp", 0)) * self.t.EDIT_COST_EXTRA_ITEM
+            burden += float(metric.get("fn", 0)) * self.t.EDIT_COST_MISSING_ITEM
+        diagnosis_metric = entity_metrics.get("diagnoses", {})
+        burden += float(diagnosis_metric.get("fp", 0) + diagnosis_metric.get("fn", 0)) * self.t.EDIT_COST_PARTIAL_MATCH
         return burden
 
-    def _collect_critical_fail_reasons(self, section_results: dict[str, dict[str, Any]], per_field: dict[str, dict[str, Any]]) -> list[str]:
-        reasons: list[str] = []
-        for field_path in (
+    def _collect_verify_only_fail_reasons(
+        self,
+        section_results: dict[str, dict[str, Any]],
+        per_field: dict[str, dict[str, Any]],
+        entity_metrics: dict[str, dict[str, Any]],
+        text_entries: list[dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        blocking_reasons: list[str] = []
+        advisory_reasons: list[str] = []
+        text_by_field = self._index_text_entries(text_entries)
+        advisory_exact_fields = {
             "summary.service_date",
             "summary.transaction_date",
-            "summary.total_amount",
             "summary.currency",
-            "summary.medical_facility_name",
-            "patient_info.name",
-            "financial_recap.total_medicines",
-            "financial_recap.total_other_charges",
-            "financial_recap.grand_total",
-        ):
-            field_metrics = per_field.get(field_path, {})
-            if field_metrics.get("strict_f1", field_metrics.get("f1", 0.0)) < 1.0:
-                reasons.append(f"{field_path} strict mismatch")
-        if section_results.get("medicines", {}).get("strict_f1", 0.0) < 0.95:
-            reasons.append("medicines strict_f1 below verify-only threshold")
-        if section_results.get("other_charges", {}).get("strict_f1", 0.0) < 0.95:
-            reasons.append("other_charges strict_f1 below verify-only threshold")
-        if section_results.get("medical_context", {}).get("strict_f1", 0.0) < 0.90:
-            reasons.append("medical_context strict_f1 below verify-only threshold")
-        return reasons
+        }
 
-    def _compute_verify_only_gate(self, section_results: dict[str, dict[str, Any]], edit_burden_score: float, critical_fail_reasons: list[str]) -> bool:
-        if critical_fail_reasons:
+        patient_name = per_field.get("patient_info.name", {})
+        if patient_name.get("applicable") and not self._field_is_strict_match(patient_name):
+            blocking_reasons.append("patient_info.name exact mismatch")
+
+        for field_path in advisory_exact_fields:
+            field_metrics = per_field.get(field_path, {})
+            if field_metrics.get("applicable") and not self._field_is_strict_match(field_metrics):
+                advisory_reasons.append(f"{field_path} exact mismatch")
+
+        facility = per_field.get("summary.medical_facility_name", {})
+        if (
+            facility.get("applicable")
+            and not self._field_is_strict_match(facility)
+            and not self._field_passes_relaxed_text_gate("summary.medical_facility_name", text_by_field)
+        ):
+            advisory_reasons.append("summary.medical_facility_name below relaxed text threshold")
+
+        for field_path in FINANCIAL_EXACT_FIELD_PATHS:
+            field_metrics = per_field.get(field_path, {})
+            if (
+                field_metrics.get("applicable")
+                and not self._field_is_strict_match(field_metrics)
+                and not self._financial_field_within_verify_tolerance(field_metrics)
+            ):
+                blocking_reasons.append(f"{field_path} outside verify-only tolerance")
+
+        for entity_name in ("medicines", "other_charges", "diagnoses"):
+            metric = entity_metrics.get(entity_name, {})
+            if metric.get("applicable") and metric.get("f1", 0.0) < self.t.VERIFY_ONLY_ENTITY_F1_THRESHOLD:
+                advisory_reasons.append(f"{entity_name} KIE F1 below relaxed verify-only threshold")
+        context = section_results.get("medical_context", {})
+        if context.get("applicable") and context.get("f1", 0.0) < self.t.VERIFY_ONLY_CONTEXT_F1_THRESHOLD:
+            advisory_reasons.append("medical_context KIE F1 below relaxed verify-only threshold")
+        return {
+            "blocking_fail_reasons": blocking_reasons,
+            "advisory_fail_reasons": advisory_reasons,
+        }
+
+    def _compute_verify_only_gate(
+        self,
+        edit_burden_score: float,
+        blocking_fail_reasons: list[str],
+    ) -> bool:
+        if blocking_fail_reasons:
             return False
         if edit_burden_score > self.t.VERIFY_ONLY_MAX_EDIT_BURDEN:
             return False
-        return (
-            section_results.get("medicines", {}).get("strict_f1", 0.0) >= 0.95
-            and section_results.get("other_charges", {}).get("strict_f1", 0.0) >= 0.95
-            and section_results.get("medical_context", {}).get("strict_f1", 0.0) >= 0.90
-            and section_results.get("summary", {}).get("strict_f1", 0.0) >= 1.0
-            and section_results.get("patient_info", {}).get("strict_f1", 0.0) >= 1.0
-            and section_results.get("financial_recap", {}).get("strict_f1", 0.0) >= 1.0
+        return True
+
+    def _field_is_strict_match(self, metric: dict[str, Any]) -> bool:
+        return float(metric.get("tp", 0.0)) > 0.0 and float(metric.get("fp", 0.0)) == 0.0 and float(metric.get("fn", 0.0)) == 0.0
+
+    def _field_error_units(self, metric: dict[str, Any]) -> float:
+        status = metric.get("status")
+        if status in {"missing", "extra", "mismatch"}:
+            return 1.0
+        return float(metric.get("fp", 0.0) + metric.get("fn", 0.0))
+
+    def _index_text_entries(self, text_entries: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        by_field: dict[str, list[dict[str, Any]]] = {}
+        for entry in text_entries:
+            by_field.setdefault(str(entry.get("field_path", "")), []).append(entry)
+        return by_field
+
+    def _field_passes_relaxed_text_gate(self, field_path: str, text_by_field: dict[str, list[dict[str, Any]]]) -> bool:
+        entries = text_by_field.get(field_path, [])
+        if not entries:
+            return False
+        return any(
+            float(entry.get("anls", 0.0)) >= self.t.VERIFY_ONLY_TEXT_ANLS_THRESHOLD
+            or float(entry.get("token_f1", 0.0)) >= self.t.VERIFY_ONLY_TEXT_TOKEN_F1_THRESHOLD
+            for entry in entries
         )
 
-    def _compute_overall_f1(
-        self,
-        section_results: dict[str, dict[str, Any]],
-        section_weights: dict[str, float],
-    ) -> float:
-        total_weight = 0.0
-        weighted_f1 = 0.0
-        for section, metrics in section_results.items():
-            weight = section_weights.get(section, 1.0)
-            weighted_f1 += weight * metrics["f1"]
-            total_weight += weight
-        return weighted_f1 / total_weight if total_weight > 0 else 0.0
+    def _financial_field_within_verify_tolerance(self, metric: dict[str, Any]) -> bool:
+        pred_number = _to_number(metric.get("predicted"))
+        gt_number = _to_number(metric.get("ground_truth"))
+        if pred_number is None or gt_number is None:
+            return False
+        return abs(pred_number - gt_number) <= self._financial_verify_tolerance(gt_number)
+
+    def _financial_verify_tolerance(self, gt_number: float) -> float:
+        relative_tolerance = abs(gt_number) * self.t.VERIFY_ONLY_FINANCIAL_REL_TOLERANCE
+        return min(
+            self.t.VERIFY_ONLY_FINANCIAL_MAX_TOLERANCE,
+            max(self.t.VERIFY_ONLY_FINANCIAL_ABS_TOLERANCE, relative_tolerance),
+        )

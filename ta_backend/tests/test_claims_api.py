@@ -177,6 +177,10 @@ def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
     created_payload = create_response.json()
     assert created_payload["nama_pasien"] == "Budi Santoso"
     assert created_payload["tanggal_pelayanan"] == "31-03-2026"
+    assert created_payload["file_count"] == 1
+    assert len(created_payload["files"]) == 1
+    assert created_payload["files"][0]["filename"] == "receipt.png"
+    assert created_payload["files"][0]["file_data_url"].startswith("data:image/png;base64,")
 
     list_response = client.get(
         "/api/claims",
@@ -188,7 +192,19 @@ def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
     assert len(claims) == 1
     assert claims[0]["nama_pasien"] == "Budi Santoso"
     assert claims[0]["tanggal_pelayanan"] == "31-03-2026"
+    assert claims[0]["file_count"] == 1
+    assert "files" not in claims[0]
     assert "source_scan_extraction_payload" not in claims[0]
+
+    detail_response = client.get(
+        f"/api/claims/{created_payload['id']}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert len(detail_payload["files"]) == 1
+    assert detail_payload["files"][0]["file_data_url"].startswith("data:image/png;base64,")
 
     restarted_app = create_app()
     with TestClient(restarted_app) as restarted_client:

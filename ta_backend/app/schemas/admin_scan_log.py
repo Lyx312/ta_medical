@@ -60,6 +60,13 @@ class AdminAIApiCallLogResponse(BaseModel):
     latency_ms: int | None
     usage_payload: dict[str, Any] | None
     request_context_payload: dict[str, Any] | None
+    prompt_file_path: str | None
+    prompt_payload: Any | None
+    raw_response_text: str | None
+    response_content_payload: Any | None
+    parsed_response_payload: Any | None
+    response_validation_error: str | None
+    result_context_payload: dict[str, Any] | None
     created_at: datetime
 
 

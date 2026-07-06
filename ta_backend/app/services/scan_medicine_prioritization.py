@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from fastapi import HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -27,6 +28,16 @@ AUTO_CORRECT_SIMILARITY_FLOOR = 0.62
 AUTO_CORRECT_RELEVANCE_CONFIDENCE_FLOOR = 0.55
 MEDICINE_IMAGE_INTERPRETATION_PROMPT_FILE_PATH = (
     ROOT_DIR / "app" / "prompts" / "ai" / "medical_claim_medicine_image_interpretation.yaml"
+)
+MEDICINE_RESPONSE_CONTRACT_ECHO_KEYS = frozenset(
+    {
+        "expected_json",
+        "expected_types",
+        "instructions",
+        "output_contract",
+        "output_schema",
+        "schema",
+    }
 )
 
 
@@ -63,6 +74,58 @@ class BatchMedicineInterpretationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     judgements: list[BatchMedicineInterpretationJudgement] = Field(default_factory=list)
+
+
+def _normalize_batch_medicine_interpretation_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = dict(payload)
+    if "judgements" not in normalized and "judgments" in normalized:
+        normalized["judgements"] = normalized.pop("judgments")
+    else:
+        normalized.pop("judgments", None)
+
+    if "judgements" not in normalized:
+        return normalized
+
+    for key in MEDICINE_RESPONSE_CONTRACT_ECHO_KEYS:
+        normalized.pop(key, None)
+
+    judgements = normalized.get("judgements")
+    if not isinstance(judgements, list):
+        return normalized
+
+    normalized_judgements: list[Any] = []
+    for judgement in judgements:
+        if not isinstance(judgement, dict):
+            normalized_judgements.append(judgement)
+            continue
+
+        normalized_judgement = dict(judgement)
+        if "interpreted_name" not in normalized_judgement and "name" in normalized_judgement:
+            normalized_judgement["interpreted_name"] = normalized_judgement["name"]
+        normalized_judgement.pop("name", None)
+        normalized_judgements.append(normalized_judgement)
+
+    normalized["judgements"] = normalized_judgements
+    return normalized
+
+
+def _summarize_batch_medicine_validation_error(exc: ValidationError) -> str:
+    paths: list[str] = []
+    for error in exc.errors(include_url=False, include_context=False, include_input=False):
+        location = error.get("loc", ())
+        if isinstance(location, tuple):
+            path = ".".join(str(part) for part in location)
+        else:
+            path = str(location)
+        if path and path not in paths:
+            paths.append(path)
+
+    if not paths:
+        return "schema validation failed"
+    return f"schema validation failed paths={','.join(paths[:6])}"
 
 
 class ScanMedicineImageInterpretationJudge(BaseDocumentAIProcessor):
@@ -134,9 +197,43 @@ class ScanMedicineImageInterpretationJudge(BaseDocumentAIProcessor):
                         "db_hint_count": len(db_medicine_hints),
                     },
                 },
+                prompt_file_path=self._prompt_file_path,
             )
-            payload = self._parse_ai_response_to_json(response.content)
-            result = BatchMedicineInterpretationResponse.model_validate(payload)
+            try:
+                payload = self._parse_ai_response_to_json(response.content)
+            except HTTPException as exc:
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    response_validation_error=self._describe_exception(exc),
+                    result_context_payload={
+                        "ambiguous_medicine_count": len(ambiguous_medicines),
+                        "parse_succeeded": False,
+                    },
+                )
+                raise
+            normalized_payload = _normalize_batch_medicine_interpretation_payload(payload)
+            try:
+                result = BatchMedicineInterpretationResponse.model_validate(normalized_payload)
+            except ValidationError as exc:
+                validation_summary = _summarize_batch_medicine_validation_error(exc)
+                self._record_ai_call_outcome(
+                    _tracking_payload,
+                    parsed_response_payload=normalized_payload,
+                    response_validation_error=validation_summary,
+                    result_context_payload={
+                        "ambiguous_medicine_count": len(ambiguous_medicines),
+                        "schema_valid": False,
+                    },
+                )
+                raise ValueError(validation_summary) from exc
+            self._record_ai_call_outcome(
+                _tracking_payload,
+                parsed_response_payload=normalized_payload,
+                result_context_payload={
+                    "ambiguous_medicine_count": len(ambiguous_medicines),
+                    "judgement_count": len(result.judgements),
+                },
+            )
             ai_pipeline_log(
                 event="medicine_prompt_completed",
                 component="scan_medicine_prioritization",
@@ -535,7 +632,7 @@ async def prioritize_scan_medicines(
             ambiguous_payload.append(
                 {
                     "original_index": index,
-                    "name": record.medicine.name,
+                    "extracted_name": record.medicine.name,
                     "normalized_name": normalized_name,
                     "quantity": record.medicine.quantity,
                     "unit": record.medicine.unit,

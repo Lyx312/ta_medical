@@ -25,12 +25,16 @@ user_template: |
   - classify the document type
   - decide whether it is a medical claim document
   - decide whether the document is readable enough for validation
+  - decide whether the medical provider identity is visible; keep the field name facility_identity_visible for schema compatibility
   - decide whether a stamp is visibly present
   - decide whether a doctor signature is visibly present
   - set decision to valid, invalid, or uncertain
   - include concise reasons explaining the decision
   Do not infer hidden, occluded, cropped, or ambiguous stamps/signatures.
-  A receipt may still be valid without a visible stamp or doctor signature if the receipt is otherwise readable and the medical facility identity is clearly visible.
+  Treat facility_identity_visible as true when the document clearly shows a medical provider identity such as a hospital, clinic, lab, pharmacy, medical practice, or treating doctor.
+  Treat a treating doctor identity as sufficient provider identity when it is supported by visible identifiers such as doctor name, specialty, SIP/license number, practice/contact details, official stamp, or letterhead.
+  Do not treat insurer, payer, or TPA branding alone (for example "mandiri inhealth") as medical provider identity.
+  A receipt may still be valid without a visible stamp or doctor signature if the receipt is otherwise readable and the medical provider identity is clearly visible.
 
   ANTI-INFERENCE RULES FOR STAMP AND SIGNATURE DETECTION:
   - A stamp must be clearly recognizable as an official ink stamp (not merely a faint logo, watermark, letterhead, or decorative border). If the mark is barely visible, smudged, or could be a logo or letterhead element, set stamp_detected to false.

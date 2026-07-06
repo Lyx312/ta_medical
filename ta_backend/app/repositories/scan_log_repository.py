@@ -56,6 +56,13 @@ class AIApiCallLogCreate:
     latency_ms: int | None = None
     usage_payload: dict[str, Any] | None = None
     request_context_payload: dict[str, Any] | None = None
+    prompt_file_path: str | None = None
+    prompt_payload: Any | None = None
+    raw_response_text: str | None = None
+    response_content_payload: Any | None = None
+    parsed_response_payload: Any | None = None
+    response_validation_error: str | None = None
+    result_context_payload: dict[str, Any] | None = None
 
 
 class ScanLogRepository:
@@ -151,7 +158,7 @@ class ScanLogRepository:
                 **scan_log.progress_payload,
                 "stage": "completed",
                 "title": "Ready to review",
-                "detail": "Scan finished successfully.",
+                "detail": "Results are ready for you to review.",
                 "percent": 100,
                 "status": "succeeded",
             }
@@ -252,8 +259,34 @@ class ScanLogRepository:
             latency_ms=payload.latency_ms,
             usage_payload=payload.usage_payload,
             request_context_payload=payload.request_context_payload,
+            prompt_file_path=payload.prompt_file_path,
+            prompt_payload=payload.prompt_payload,
+            raw_response_text=payload.raw_response_text,
+            response_content_payload=payload.response_content_payload,
+            parsed_response_payload=payload.parsed_response_payload,
+            response_validation_error=payload.response_validation_error,
+            result_context_payload=payload.result_context_payload,
         )
         self._db.add(record)
+        self._db.commit()
+        self._db.refresh(record)
+        return record
+
+    def update_ai_api_call_log(
+        self,
+        ai_api_call_log_id: int,
+        *,
+        parsed_response_payload: Any | None = None,
+        response_validation_error: str | None = None,
+        result_context_payload: dict[str, Any] | None = None,
+    ) -> AIApiCallLog | None:
+        record = self._db.get(AIApiCallLog, ai_api_call_log_id)
+        if record is None:
+            return None
+
+        record.parsed_response_payload = parsed_response_payload
+        record.response_validation_error = response_validation_error
+        record.result_context_payload = result_context_payload
         self._db.commit()
         self._db.refresh(record)
         return record

@@ -1,5 +1,14 @@
+import EventSource from 'react-native-sse';
+
+import { API_BASE_URL } from './config';
 import { getJson, postFormData, postFormDataWithProgress, postJson } from './client';
-import type { AIMedicalScanResult, AIScanJobStartResponse, AIScanJobStatusResponse } from './types';
+import { getAuthToken } from './storage';
+import type {
+  AIMedicalScanResult,
+  AIScanJobStartResponse,
+  AIScanJobStatusResponse,
+  ScanJobEventName,
+} from './types';
 
 export async function scanDocuments(imageUris: string[]): Promise<AIMedicalScanResult> {
   const formData = new FormData();
@@ -49,4 +58,23 @@ export function getScanDocumentsJob(scanLogId: number): Promise<AIScanJobStatusR
 
 export function cancelScanDocumentsJob(scanLogId: number): Promise<AIScanJobStatusResponse> {
   return postJson<AIScanJobStatusResponse>(`/ai/scan-documents/jobs/${scanLogId}/cancel`, {}, true);
+}
+
+export async function openScanDocumentsJobEventStream(
+  scanLogId: number,
+): Promise<EventSource<ScanJobEventName>> {
+  const token = await getAuthToken();
+  const eventSource = new EventSource<ScanJobEventName>(
+    `${API_BASE_URL}/ai/scan-documents/jobs/${scanLogId}/events`,
+    {
+      headers: token
+        ? {
+            Authorization: `Bearer ${token}`,
+          }
+        : undefined,
+      pollingInterval: 3000,
+      timeoutBeforeConnection: 0,
+    },
+  );
+  return eventSource;
 }

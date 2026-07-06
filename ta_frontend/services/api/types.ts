@@ -32,8 +32,9 @@ export type LoginResponse = {
 
 export type RegisterResponse = {
   message: string;
+  access_token: string;
+  token_type: string;
   user: AuthUser;
-  access_token?: string;
 };
 
 export type ApiError = {
@@ -162,6 +163,13 @@ export type AIScanJobStatusResponse = {
   error_message: string | null;
 };
 
+export type ScanJobEventName = 'progress' | 'completed' | 'failed' | 'cancelled' | 'heartbeat';
+
+export type ScanJobEvent = {
+  event: ScanJobEventName;
+  data: AIScanJobStatusResponse;
+};
+
 export type ClaimResponse = {
   id: number;
   user_id: number;
@@ -182,11 +190,7 @@ export type ClaimResponse = {
   created_at: string;
 };
 
-export type ClaimDetailResponse = ClaimResponse & {
-  source_scan_extraction_payload?: Record<string, unknown> | null;
-};
-
-export type AdminClaimFile = {
+export type ClaimFile = {
   id: number;
   filename: string;
   mime_type: string;
@@ -194,6 +198,13 @@ export type AdminClaimFile = {
   sha256_hash: string;
   file_data_url: string;
 };
+
+export type ClaimDetailResponse = ClaimResponse & {
+  files: ClaimFile[];
+  source_scan_extraction_payload?: Record<string, unknown> | null;
+};
+
+export type AdminClaimFile = ClaimFile;
 
 export type AdminClaimDetail = ClaimDetailResponse & {
   files: AdminClaimFile[];

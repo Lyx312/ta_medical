@@ -126,6 +126,13 @@ class AIApiCallLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     usage_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     request_context_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    prompt_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    prompt_payload: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    raw_response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_content_payload: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    parsed_response_payload: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    response_validation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_context_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

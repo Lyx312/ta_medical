@@ -24,11 +24,11 @@ const STAGE_ORDER: ScanProgressPayload['stage'][] = [
 
 const STAGE_LABELS: Record<ScanProgressPayload['stage'], string> = {
   queued: 'Uploading files',
-  preprocessing: 'Checking documents',
-  validating: 'Checking documents',
+  preprocessing: 'Preparing images',
+  validating: 'Validating documents',
   extracting: 'Extracting medical data',
   fusing: 'Combining AI results',
-  prioritizing_medicines: 'Prioritizing medicines',
+  prioritizing_medicines: 'Reviewing medicines',
   completed: 'Ready to review',
   failed: 'Scan failed',
 };

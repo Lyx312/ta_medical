@@ -51,7 +51,9 @@ htmlcov/
 .ruff_cache/
 
 # Notebooks
+notebooks/
 .ipynb_checkpoints/
+preprocessing_lab_outputs/
 
 # Logs
 *.log

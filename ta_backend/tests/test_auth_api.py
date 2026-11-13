@@ -1,12 +1,20 @@
+from io import BytesIO
 from pathlib import Path
 from typing import Generator
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.core.config import get_settings
 from app.db.session import clear_database_caches
 from app.main import create_app
+
+
+def build_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (8, 8), color="white").save(output, format="PNG")
+    return output.getvalue()
 
 
 @pytest.fixture()
@@ -198,6 +206,81 @@ def test_get_me_returns_persisted_user(client: TestClient) -> None:
     payload = response.json()
     assert payload["email"] == "grace@example.com"
     assert payload["role"] == "user"
+
+
+def test_user_profile_update_and_insurance_card_completes_profile(client: TestClient) -> None:
+    register = client.post(
+        "/api/auth/register",
+        json={
+            "full_name": "Profile User",
+            "email": "profile@example.com",
+            "password": "password123",
+            "confirm_password": "password123",
+        },
+    )
+    assert register.status_code == 201
+    token = register.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    update = client.put(
+        "/api/auth/me/profile",
+        headers=headers,
+        json={
+            "nip": "NIP-001",
+            "company_name": "Acme Corp",
+            "insurance_card_number": "CARD-001",
+            "phone_number": "031123456",
+            "mobile_number": "08123456789",
+            "bank_account_number": "1234567890",
+            "bank_account_holder_name": "Profile User",
+            "bank_name": "Bank Test",
+        },
+    )
+
+    assert update.status_code == 200
+    update_payload = update.json()
+    assert update_payload["nip"] == "NIP-001"
+    assert update_payload["company_name"] == "Acme Corp"
+    assert update_payload["profile_complete"] is False
+    assert "Foto kartu Asuransi" in update_payload["missing_profile_fields"]
+
+    upload = client.post(
+        "/api/auth/me/insurance-card",
+        headers=headers,
+        files={"file": ("insurance.png", build_png_bytes(), "image/png")},
+    )
+
+    assert upload.status_code == 200
+    upload_payload = upload.json()
+    assert upload_payload["insurance_card_filename"] == "insurance.png"
+    assert upload_payload["insurance_card_mime_type"] == "image/png"
+    assert upload_payload["insurance_card_data_url"].startswith("data:image/png;base64,")
+    assert upload_payload["profile_complete"] is True
+    assert upload_payload["missing_profile_fields"] == []
+
+
+def test_user_insurance_card_upload_rejects_non_image_bytes(client: TestClient) -> None:
+    register = client.post(
+        "/api/auth/register",
+        json={
+            "full_name": "Bad Image User",
+            "email": "bad-image@example.com",
+            "password": "password123",
+            "confirm_password": "password123",
+        },
+    )
+    assert register.status_code == 201
+    token = register.json()["access_token"]
+
+    response = client.post(
+        "/api/auth/me/insurance-card",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("bad.txt", b"not an image", "text/plain")},
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert {"field": "insurance_card", "message": "Uploaded insurance card must be a readable image."} in payload["errors"]
 
 
 def test_startup_seed_does_not_create_duplicate_admin_rows(client: TestClient) -> None:

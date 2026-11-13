@@ -2175,10 +2175,17 @@ def test_build_messages_includes_rendered_prompt_and_base64_images() -> None:
     rendered_system_prompt = str(messages[0].content)
 
     assert "Return only valid JSON" in rendered_system_prompt
+    assert "You specialize in Indonesian medical insurance claim packets" in rendered_system_prompt
     assert "Analyze the 1 uploaded medical document image(s) as one claim packet." in rendered_user_prompt
     assert "PRIMARY TASK" in rendered_user_prompt
+    assert "REAL DOCUMENT CONTEXT" in rendered_user_prompt
     assert "FINANCIAL EXTRACTION RULES" in rendered_user_prompt
     assert "AMBIGUITY / ANTI-INFERENCE RULES" in rendered_user_prompt
+    assert "Indonesian outpatient insurance claim evidence" in rendered_user_prompt
+    assert "Doctor handwriting often contains medicine names" in rendered_user_prompt
+    assert "Diagnosis and anamnesis may help disambiguate handwritten medicine names" in rendered_user_prompt
+    assert "do not invent medicines from diagnosis/anamnesis alone" in rendered_user_prompt
+    assert "Do not treat handwritten prescription text as irrelevant decoration." in rendered_user_prompt
     assert "Extract summary.total_amount as the grand total for the full uploaded claim packet" in rendered_user_prompt
     assert "Do not duplicate pharmacy or medicine spending across medicines and other_charges." in rendered_user_prompt
     assert "Do not infer gender from the patient's name" in rendered_user_prompt
@@ -2227,6 +2234,21 @@ def test_financial_packet_judge_prompt_emphasizes_terbilang_and_force_pick() -> 
     assert "Use terbilang or amount-in-words text as a consistency check" in prompt_bundle.user_template
     assert "Prioritize evidence in this order: visible numeric receipt amounts, terbilang consistency, then packet coherence across pages." in prompt_bundle.user_template
     assert 'Do not over-weight weak handwritten description text such as "untuk pembayaran"' in prompt_bundle.user_template
+
+
+def test_medicine_image_interpretation_prompt_includes_prescription_handwriting_context() -> None:
+    judge = ScanMedicineImageInterpretationJudge()
+    prompt_bundle = judge._load_prompt_bundle()
+
+    assert "DOCUMENT CONTEXT" in prompt_bundle.user_template
+    assert "handwritten doctor prescriptions" in prompt_bundle.user_template
+    assert "Ambiguous medicines should be judged against visible prescription or doctor handwriting first." in prompt_bundle.user_template
+    assert '"R/"' in prompt_bundle.user_template
+    assert '"dd"' in prompt_bundle.user_template
+    assert '"prn"' in prompt_bundle.user_template
+    assert "tablet/capsule/syrup/spray quantities" in prompt_bundle.user_template
+    assert "Use diagnosis_text and anamnesis_text as supporting clinical context for medicine interpretation." in prompt_bundle.user_template
+    assert "visible image evidence remains the primary authority" in prompt_bundle.user_template
 
 
 def test_build_messages_remain_image_url_after_langchain_normalization() -> None:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,9 @@ from app.api.routes.auth import get_current_user_dependency
 from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.repositories.claim_repository import ClaimFileCreate, ClaimRepository
+from app.repositories.family_member_repository import FamilyMemberRepository
 from app.repositories.scan_log_repository import ScanLogRepository
+from app.repositories.user_repository import UserRepository
 from app.schemas.auth import TokenData
 from app.schemas.claim import (
     ClaimDetailResponse,
@@ -28,6 +30,8 @@ from app.services.ai_service import build_patient_name_verification_error
 from app.services.ai_service import matches_any_patient_name_candidate
 from app.services.claim_medicine_relevance import evaluate_claim_medicines, persist_claim_medicine_knowledge
 from app.services.image_preprocessing import preprocess_document_image
+from app.services.inhealth_claim_form import InHealthClaimFormData, build_inhealth_claim_form_pdf
+from app.services.profile_completion import get_missing_family_profile_fields, get_missing_user_profile_fields
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 validation_processor = DocumentValidationProcessor(settings=get_settings())
@@ -44,8 +48,177 @@ class BufferedUpload:
     sha256_hash: str
 
 
+@dataclass(frozen=True)
+class ClaimPatientSnapshot:
+    selected_patient_type: str
+    selected_family_member_id: int | None
+    patient_relation: str
+    patient_card_number: str | None
+    patient_phone_number: str | None
+    patient_mobile_number: str | None
+    patient_email: str | None
+    user_full_name: str
+    user_nip: str | None
+    user_company_name: str | None
+    user_bank_account_number: str | None
+    user_bank_account_holder_name: str | None
+    user_bank_name: str | None
+    insurance_card_filename: str | None
+    insurance_card_mime_type: str | None
+    insurance_card_byte_size: int | None
+    insurance_card_sha256_hash: str | None
+    insurance_card_content: bytes | None
+
+
 def build_data_url(mime_type: str, content: bytes) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(content).decode('utf-8')}"
+
+
+def build_profile_required_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail={
+            "message": "Input validation failed.",
+            "errors": [{"field": "profile", "message": message}],
+        },
+    )
+
+
+def normalize_patient_relation(value: str | None) -> str | None:
+    normalized = (value or "").strip().lower()
+    relation_map = {
+        "self": "self",
+        "saya": "self",
+        "peserta": "self",
+        "husband": "husband",
+        "suami": "husband",
+        "wife": "wife",
+        "istri": "wife",
+        "child": "child",
+        "anak": "child",
+        "son": "child",
+        "daughter": "child",
+    }
+    return relation_map.get(normalized)
+
+
+def build_patient_card_file(snapshot: ClaimPatientSnapshot) -> ClaimFileCreate | None:
+    if not snapshot.insurance_card_content:
+        return None
+
+    filename = snapshot.insurance_card_filename or "insurance_card"
+    return ClaimFileCreate(
+        filename=f"patient_card_{filename}",
+        mime_type=snapshot.insurance_card_mime_type or "application/octet-stream",
+        byte_size=snapshot.insurance_card_byte_size or len(snapshot.insurance_card_content),
+        sha256_hash=snapshot.insurance_card_sha256_hash or hashlib.sha256(snapshot.insurance_card_content).hexdigest(),
+        content=snapshot.insurance_card_content,
+    )
+
+
+def resolve_claim_patient_snapshot(
+    db: Session,
+    *,
+    token_data: TokenData,
+    nama_pasien: str,
+    selected_patient_type: str | None,
+    selected_family_member_id: int | None,
+) -> ClaimPatientSnapshot:
+    user_repository = UserRepository(db)
+    user = user_repository.get_by_id(token_data.user_id)
+    if user is None:
+        raise build_profile_required_error("User profile was not found.")
+
+    family_member_repository = FamilyMemberRepository(db)
+    selected_type = (selected_patient_type or "").strip().lower()
+
+    if selected_type == "self":
+        if not matches_any_patient_name_candidate(nama_pasien, [user.full_name]):
+            raise build_profile_required_error("Selected patient does not match the user profile.")
+        missing_fields = get_missing_user_profile_fields(user)
+        if missing_fields:
+            raise build_profile_required_error(f"Complete user profile before submitting claim: {', '.join(missing_fields)}.")
+        return ClaimPatientSnapshot(
+            selected_patient_type="self",
+            selected_family_member_id=None,
+            patient_relation="self",
+            patient_card_number=user.insurance_card_number,
+            patient_phone_number=user.phone_number,
+            patient_mobile_number=user.mobile_number,
+            patient_email=user.email,
+            user_full_name=user.full_name,
+            user_nip=user.nip,
+            user_company_name=user.company_name,
+            user_bank_account_number=user.bank_account_number,
+            user_bank_account_holder_name=user.bank_account_holder_name,
+            user_bank_name=user.bank_name,
+            insurance_card_filename=user.insurance_card_filename,
+            insurance_card_mime_type=user.insurance_card_mime_type,
+            insurance_card_byte_size=user.insurance_card_byte_size,
+            insurance_card_sha256_hash=user.insurance_card_sha256_hash,
+            insurance_card_content=user.insurance_card_content,
+        )
+
+    if selected_type == "family":
+        if selected_family_member_id is None:
+            raise build_profile_required_error("Family member ID is required for family patient claims.")
+        family_member = family_member_repository.get_by_id_and_user_id(selected_family_member_id, token_data.user_id)
+        if family_member is None:
+            raise build_profile_required_error("Selected family member was not found.")
+        if not matches_any_patient_name_candidate(nama_pasien, [family_member.name]):
+            raise build_profile_required_error("Selected patient does not match the family member profile.")
+        patient_relation = normalize_patient_relation(family_member.relation)
+        if patient_relation not in {"husband", "wife", "child"}:
+            raise build_profile_required_error("Family member relation must be husband, wife, or child.")
+        missing_user_fields = get_missing_user_profile_fields(user)
+        missing_family_fields = get_missing_family_profile_fields(family_member)
+        if missing_user_fields or missing_family_fields:
+            missing_parts = []
+            if missing_user_fields:
+                missing_parts.append(f"user profile: {', '.join(missing_user_fields)}")
+            if missing_family_fields:
+                missing_parts.append(f"{family_member.name}: {', '.join(missing_family_fields)}")
+            raise build_profile_required_error(f"Complete profile before submitting claim: {'; '.join(missing_parts)}.")
+        return ClaimPatientSnapshot(
+            selected_patient_type="family",
+            selected_family_member_id=family_member.id,
+            patient_relation=patient_relation,
+            patient_card_number=family_member.insurance_card_number,
+            patient_phone_number=family_member.phone_number,
+            patient_mobile_number=family_member.mobile_number,
+            patient_email=family_member.email,
+            user_full_name=user.full_name,
+            user_nip=user.nip,
+            user_company_name=user.company_name,
+            user_bank_account_number=user.bank_account_number,
+            user_bank_account_holder_name=user.bank_account_holder_name,
+            user_bank_name=user.bank_name,
+            insurance_card_filename=family_member.insurance_card_filename,
+            insurance_card_mime_type=family_member.insurance_card_mime_type,
+            insurance_card_byte_size=family_member.insurance_card_byte_size,
+            insurance_card_sha256_hash=family_member.insurance_card_sha256_hash,
+            insurance_card_content=family_member.insurance_card_content,
+        )
+
+    family_members = family_member_repository.get_by_user_id(token_data.user_id)
+    candidates: list[tuple[str, int | None]] = []
+    if matches_any_patient_name_candidate(nama_pasien, [user.full_name]):
+        candidates.append(("self", None))
+    for family_member in family_members:
+        if matches_any_patient_name_candidate(nama_pasien, [family_member.name]):
+            candidates.append(("family", family_member.id))
+
+    if len(candidates) != 1:
+        raise build_profile_required_error("Selected patient identity is required for this claim.")
+
+    fallback_type, fallback_family_member_id = candidates[0]
+    return resolve_claim_patient_snapshot(
+        db,
+        token_data=token_data,
+        nama_pasien=nama_pasien,
+        selected_patient_type=fallback_type,
+        selected_family_member_id=fallback_family_member_id,
+    )
 
 
 def build_claim_response(claim: Any) -> ClaimResponse:
@@ -199,6 +372,89 @@ def build_selected_patient_name_error() -> HTTPException:
     )
 
 
+def build_claim_export_error(message: str, *, status_code: int = status.HTTP_422_UNPROCESSABLE_CONTENT) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "message": "Input validation failed.",
+            "errors": [{"field": "inhealth_form", "message": message}],
+        },
+    )
+
+
+def build_inhealth_form_data(db: Session, claim: Any, token_data: TokenData) -> InHealthClaimFormData:
+    if claim.patient_relation and claim.user_full_name_snapshot:
+        form_data = InHealthClaimFormData(
+            employee_name=claim.user_full_name_snapshot or "",
+            nip=claim.user_nip_snapshot or "",
+            company_name=claim.user_company_name_snapshot or "",
+            patient_name=claim.nama_pasien,
+            patient_relation=claim.patient_relation or "",
+            patient_card_number=claim.patient_card_number or "",
+            patient_phone_number=claim.patient_phone_number or "",
+            patient_mobile_number=claim.patient_mobile_number or "",
+            patient_email=claim.patient_email or "",
+            bank_account_number=claim.user_bank_account_number_snapshot or "",
+            bank_account_holder_name=claim.user_bank_account_holder_name_snapshot or "",
+            bank_name=claim.user_bank_name_snapshot or "",
+            claim_amount=claim.nominal_klaim,
+            receipt_date=claim.tanggal_pelayanan,
+            export_place="Surabaya",
+            export_date=datetime.now(timezone.utc).date(),
+            signature_name=claim.user_full_name_snapshot or "",
+        )
+    else:
+        snapshot = resolve_claim_patient_snapshot(
+            db,
+            token_data=token_data,
+            nama_pasien=claim.nama_pasien,
+            selected_patient_type=claim.selected_patient_type,
+            selected_family_member_id=claim.selected_family_member_id,
+        )
+        form_data = InHealthClaimFormData(
+            employee_name=snapshot.user_full_name,
+            nip=snapshot.user_nip or "",
+            company_name=snapshot.user_company_name or "",
+            patient_name=claim.nama_pasien,
+            patient_relation=snapshot.patient_relation,
+            patient_card_number=snapshot.patient_card_number or "",
+            patient_phone_number=snapshot.patient_phone_number or "",
+            patient_mobile_number=snapshot.patient_mobile_number or "",
+            patient_email=snapshot.patient_email or "",
+            bank_account_number=snapshot.user_bank_account_number or "",
+            bank_account_holder_name=snapshot.user_bank_account_holder_name or "",
+            bank_name=snapshot.user_bank_name or "",
+            claim_amount=claim.nominal_klaim,
+            receipt_date=claim.tanggal_pelayanan,
+            export_place="Surabaya",
+            export_date=datetime.now(timezone.utc).date(),
+            signature_name=snapshot.user_full_name,
+        )
+
+    missing_fields = [
+        label
+        for label, value in (
+            ("Nama karyawan", form_data.employee_name),
+            ("NIP", form_data.nip),
+            ("Nama perusahaan", form_data.company_name),
+            ("Nama pasien", form_data.patient_name),
+            ("Relasi pasien", form_data.patient_relation),
+            ("No. kartu", form_data.patient_card_number),
+            ("No. telepon", form_data.patient_phone_number),
+            ("HP", form_data.patient_mobile_number),
+            ("Email", form_data.patient_email),
+            ("No. rekening", form_data.bank_account_number),
+            ("Atas nama rekening", form_data.bank_account_holder_name),
+            ("Bank", form_data.bank_name),
+        )
+        if not str(value or "").strip()
+    ]
+    if missing_fields:
+        raise build_claim_export_error(f"Cannot export InHealth form. Missing: {', '.join(missing_fields)}.")
+
+    return form_data
+
+
 def build_invalid_medicines_payload_error() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -260,6 +516,8 @@ async def create_claim(
     kronologi: str = Form(...),
     medicines_payload: str | None = Form(default=None),
     source_scan_log_id: int | None = Form(default=None),
+    selected_patient_type: str | None = Form(default=None),
+    family_member_id: int | None = Form(default=None),
     files: list[UploadFile] = File(default=[]),
 ) -> ClaimDetailResponse:
     valid_types = ["rawat_jalan", "rawat_inap", "emergency", "maternity"]
@@ -278,6 +536,27 @@ async def create_claim(
         ) from exc
 
     medicines_input = parse_claim_medicines_payload(medicines_payload)
+    patient_snapshot: ClaimPatientSnapshot | None = None
+    if selected_patient_type is not None and selected_patient_type.strip():
+        patient_snapshot = resolve_claim_patient_snapshot(
+            db,
+            token_data=token_data,
+            nama_pasien=nama_pasien,
+            selected_patient_type=selected_patient_type,
+            selected_family_member_id=family_member_id,
+        )
+    else:
+        try:
+            patient_snapshot = resolve_claim_patient_snapshot(
+                db,
+                token_data=token_data,
+                nama_pasien=nama_pasien,
+                selected_patient_type=None,
+                selected_family_member_id=None,
+            )
+        except HTTPException:
+            patient_snapshot = None
+
     evaluated_medicines, requires_additional_review, review_note = await evaluate_claim_medicines(
         db,
         medicines_input,
@@ -337,10 +616,38 @@ async def create_claim(
             raise build_selected_patient_name_error()
 
     claim_repository = ClaimRepository(db)
+    claim_files = [
+        ClaimFileCreate(
+            filename=upload.filename,
+            mime_type=upload.mime_type,
+            byte_size=upload.byte_size,
+            sha256_hash=upload.sha256_hash,
+            content=upload.content,
+        )
+        for upload in buffered_uploads
+    ]
+    if patient_snapshot is not None:
+        patient_card_file = build_patient_card_file(patient_snapshot)
+        if patient_card_file is not None:
+            claim_files.append(patient_card_file)
+
     claim = claim_repository.create(
         user_id=token_data.user_id,
         user_email=token_data.email,
         nama_pasien=nama_pasien,
+        selected_patient_type=patient_snapshot.selected_patient_type if patient_snapshot else None,
+        selected_family_member_id=patient_snapshot.selected_family_member_id if patient_snapshot else None,
+        patient_relation=patient_snapshot.patient_relation if patient_snapshot else None,
+        patient_card_number=patient_snapshot.patient_card_number if patient_snapshot else None,
+        patient_phone_number=patient_snapshot.patient_phone_number if patient_snapshot else None,
+        patient_mobile_number=patient_snapshot.patient_mobile_number if patient_snapshot else None,
+        patient_email=patient_snapshot.patient_email if patient_snapshot else None,
+        user_full_name_snapshot=patient_snapshot.user_full_name if patient_snapshot else None,
+        user_nip_snapshot=patient_snapshot.user_nip if patient_snapshot else None,
+        user_company_name_snapshot=patient_snapshot.user_company_name if patient_snapshot else None,
+        user_bank_account_number_snapshot=patient_snapshot.user_bank_account_number if patient_snapshot else None,
+        user_bank_account_holder_name_snapshot=patient_snapshot.user_bank_account_holder_name if patient_snapshot else None,
+        user_bank_name_snapshot=patient_snapshot.user_bank_name if patient_snapshot else None,
         tanggal_pelayanan=parsed_tanggal_pelayanan,
         fasilitas_kesehatan=fasilitas_kesehatan,
         jenis_manfaat=jenis_manfaat,
@@ -354,16 +661,7 @@ async def create_claim(
         status="pending",
         created_at=datetime.now(timezone.utc),
         source_scan_log_id=source_scan_log_id,
-        files=[
-            ClaimFileCreate(
-                filename=upload.filename,
-                mime_type=upload.mime_type,
-                byte_size=upload.byte_size,
-                sha256_hash=upload.sha256_hash,
-                content=upload.content,
-            )
-            for upload in buffered_uploads
-        ],
+        files=claim_files,
     )
 
     if evaluated_medicines:
@@ -387,6 +685,43 @@ async def get_claims(
     claim_repository = ClaimRepository(db)
     claims = claim_repository.get_by_user_id(token_data.user_id)
     return [build_claim_response(claim) for claim in claims]
+
+
+@router.get("/{claim_id}/inhealth-form")
+async def download_inhealth_claim_form(
+    claim_id: int,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> Response:
+    claim_repository = ClaimRepository(db)
+    claim = claim_repository.get_by_id(claim_id)
+    if claim is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Claim not found.",
+        )
+    if claim.user_id != token_data.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to export this claim.",
+        )
+
+    form_data = build_inhealth_form_data(db, claim, token_data)
+    try:
+        pdf_bytes = build_inhealth_claim_form_pdf(form_data)
+    except FileNotFoundError as exc:
+        raise build_claim_export_error("InHealth claim form template is missing.", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from exc
+    except RuntimeError as exc:
+        raise build_claim_export_error(str(exc), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from exc
+    except ValueError as exc:
+        raise build_claim_export_error("InHealth claim form template is invalid.", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from exc
+
+    filename = f"inhealth-claim-{claim.id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{claim_id}", response_model=ClaimDetailResponse)

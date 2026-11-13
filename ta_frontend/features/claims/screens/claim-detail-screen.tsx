@@ -1,11 +1,12 @@
 import { useCallback, useMemo, useState } from 'react';
-import { BackHandler, Image, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Alert, BackHandler, Image, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { router, useLocalSearchParams, type Href } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 
 import { CenteredState } from '@/components/ui/centered-state';
+import { AppButton } from '@/components/ui/app-button';
 import { ImageViewer } from '@/components/ui/image-viewer';
 import { ScreenHeader } from '@/components/ui/screen-header';
 import { StatusBadge } from '@/components/ui/status-badge';
@@ -21,7 +22,7 @@ import {
   formatClaimTimestamp,
   getClaimStatusPresentation,
 } from '@/features/claims/utils/claim-display';
-import { getClaim } from '@/services/api/claims';
+import { downloadInhealthClaimForm, getClaim } from '@/services/api/claims';
 import type { ApiError, ClaimDetailResponse } from '@/services/api/types';
 
 function DetailRow({ label, value }: { label: string; value: string }) {
@@ -88,6 +89,7 @@ export function ClaimDetailScreen() {
   const [claim, setClaim] = useState<ClaimDetailResponse | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [isDownloadingForm, setIsDownloadingForm] = useState(false);
   const [viewerImageUri, setViewerImageUri] = useState<string | null>(null);
   const [viewerImageTitle, setViewerImageTitle] = useState('');
 
@@ -120,6 +122,27 @@ export function ClaimDetailScreen() {
       void loadClaim();
     }, [loadClaim]),
   );
+
+  const handleDownloadInhealthForm = useCallback(async () => {
+    if (!claim) {
+      return;
+    }
+
+    setIsDownloadingForm(true);
+    try {
+      const result = await downloadInhealthClaimForm(claim.id);
+      if (result.status === 'saved') {
+        Alert.alert('Saved', `${result.filename} was saved to your selected folder.`);
+      } else if (result.status === 'cancelled') {
+        Alert.alert('Save Cancelled', 'The InHealth form was not saved.');
+      }
+    } catch (err) {
+      const apiError = err as ApiError;
+      Alert.alert('Save Failed', apiError.message ?? 'Unable to save the InHealth form.');
+    } finally {
+      setIsDownloadingForm(false);
+    }
+  }, [claim]);
 
   useFocusEffect(
     useCallback(() => {
@@ -184,6 +207,12 @@ export function ClaimDetailScreen() {
           <ThemedText style={styles.heroMeta}>
             {formatClaimServiceDate(claim.tanggal_pelayanan)} | {formatBenefitTypeLabel(claim.jenis_manfaat)}
           </ThemedText>
+          <AppButton
+            label="Save InHealth Form"
+            tone="secondary"
+            loading={isDownloadingForm}
+            onPress={() => void handleDownloadInhealthForm()}
+          />
         </SurfaceCard>
 
         <SurfaceCard style={styles.sectionCard}>
@@ -250,7 +279,7 @@ export function ClaimDetailScreen() {
         </SurfaceCard>
       </ScrollView>
     );
-  }, [claim, colors, error, isLoading, loadClaim]);
+  }, [claim, colors, error, handleDownloadInhealthForm, isDownloadingForm, isLoading, loadClaim]);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>

@@ -1,10 +1,14 @@
 import json
+from datetime import date
+from io import BytesIO
 from pathlib import Path
 from typing import Generator
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from PIL import Image
+from pypdf import PdfReader
 from sqlalchemy import select
 
 from app.api.routes import ai as ai_route
@@ -15,10 +19,12 @@ from app.db.session import clear_database_caches, get_session_factory
 from app.main import create_app
 from app.models.claim import Claim
 from app.models.claim_medicine_knowledge import ClaimMedicineKnowledge
+from app.models.user import User
 from app.schemas.ai import AIMedicalScanResponse, DocumentValidationResponse
 from app.services.ai_service import DocumentImageInput
 from app.services import claim_medicine_relevance as medicine_relevance_service
 from app.services.image_preprocessing import ProcessedDocumentImage
+from app.services.inhealth_claim_form import _format_place_day_month, _format_year_suffix
 
 SCAN_RESULT = {
     "summary": {
@@ -49,6 +55,19 @@ SCAN_RESULT = {
         "grand_total": 125000,
     },
 }
+
+
+def test_inhealth_signature_date_formatting_splits_preprinted_year_prefix() -> None:
+    export_date = date(2026, 7, 7)
+
+    assert _format_place_day_month("Surabaya", export_date) == "Surabaya, 7 Juli"
+    assert _format_year_suffix(export_date) == "26"
+
+
+def build_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (8, 8), color="white").save(output, format="PNG")
+    return output.getvalue()
 
 
 @pytest.fixture()
@@ -85,6 +104,66 @@ def register_and_login(client: TestClient, email: str, *, full_name: str = "Clai
     )
     assert login.status_code == 200
     return login.json()["access_token"]
+
+
+def complete_user_profile(client: TestClient, token: str, *, full_name: str = "Claim User") -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    profile_response = client.put(
+        "/api/auth/me/profile",
+        headers=headers,
+        json={
+            "nip": "NIP-001",
+            "company_name": "Acme Corp",
+            "insurance_card_number": "CARD-SELF-001",
+            "phone_number": "031123456",
+            "mobile_number": "08123456789",
+            "bank_account_number": "1234567890",
+            "bank_account_holder_name": full_name,
+            "bank_name": "Bank Test",
+        },
+    )
+    assert profile_response.status_code == 200
+
+    card_response = client.post(
+        "/api/auth/me/insurance-card",
+        headers=headers,
+        files={"file": ("self-card.png", build_png_bytes(), "image/png")},
+    )
+    assert card_response.status_code == 200
+    assert card_response.json()["profile_complete"] is True
+
+
+def complete_family_member_profile(
+    client: TestClient,
+    token: str,
+    *,
+    name: str = "Family Patient",
+    relation: str = "child",
+) -> int:
+    headers = {"Authorization": f"Bearer {token}"}
+    create_response = client.post(
+        "/api/family-members",
+        headers=headers,
+        json={
+            "name": name,
+            "relation": relation,
+            "insurance_card_number": "CARD-FAMILY-001",
+            "phone_number": "031987654",
+            "mobile_number": "08987654321",
+            "email": "family@example.com",
+        },
+    )
+    assert create_response.status_code == 201
+    family_member_id = create_response.json()["id"]
+
+    card_response = client.post(
+        f"/api/family-members/{family_member_id}/insurance-card",
+        headers=headers,
+        files={"file": ("family-card.png", build_png_bytes(), "image/png")},
+    )
+    assert card_response.status_code == 200
+    assert card_response.json()["profile_complete"] is True
+    return int(family_member_id)
 
 
 def build_valid_validation_response(filename: str) -> DocumentValidationResponse:
@@ -217,6 +296,244 @@ def test_create_and_list_claims_include_nama_pasien_and_persist_after_restart(
     restarted_claims = restarted_response.json()
     assert len(restarted_claims) == 1
     assert restarted_claims[0]["nama_pasien"] == "Budi Santoso"
+
+
+def test_create_claim_with_self_patient_appends_card_and_exports_inhealth_pdf(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "inhealth-self@example.com")
+    complete_user_profile(client, token)
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        return build_valid_validation_response(images[0].filename)
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    create_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "selected_patient_type": "self",
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert create_response.status_code == 201
+    created_payload = create_response.json()
+    assert created_payload["file_count"] == 2
+    assert [file["filename"] for file in created_payload["files"]] == ["receipt.png", "patient_card_self-card.png"]
+
+    export_response = client.get(
+        f"/api/claims/{created_payload['id']}/inhealth-form",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert export_response.status_code == 200
+    assert export_response.headers["content-type"] == "application/pdf"
+    assert "inhealth-claim" in export_response.headers["content-disposition"]
+    assert b"ZapfDingbats" not in export_response.content
+    reader = PdfReader(BytesIO(export_response.content))
+    assert len(reader.pages) == 1
+    extracted_text = reader.pages[0].extract_text()
+    assert "Claim User" in extracted_text
+    assert "NIP-001" in extracted_text
+    assert "CARD-SELF-001" in extracted_text
+    assert "150.000" in extracted_text
+    assert "Surabaya" in extracted_text
+    assert _format_year_suffix(date.today()) in extracted_text
+
+
+def test_create_claim_with_family_patient_appends_card_and_exports_inhealth_pdf(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "inhealth-family@example.com")
+    complete_user_profile(client, token)
+    family_member_id = complete_family_member_profile(client, token)
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        return build_valid_validation_response(images[0].filename)
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    create_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Family Patient",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "175000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "selected_patient_type": "family",
+            "family_member_id": str(family_member_id),
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+
+    assert create_response.status_code == 201
+    created_payload = create_response.json()
+    assert created_payload["file_count"] == 2
+    assert [file["filename"] for file in created_payload["files"]] == ["receipt.png", "patient_card_family-card.png"]
+
+    export_response = client.get(
+        f"/api/claims/{created_payload['id']}/inhealth-form",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert export_response.status_code == 200
+    reader = PdfReader(BytesIO(export_response.content))
+    extracted_text = reader.pages[0].extract_text()
+    assert "Claim User" in extracted_text
+    assert "Family Patient" in extracted_text
+    assert "CARD-FAMILY-001" in extracted_text
+    assert "175.000" in extracted_text
+
+
+def test_inhealth_pdf_export_missing_template_returns_clear_error(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = register_and_login(client, "inhealth-template@example.com")
+    complete_user_profile(client, token)
+
+    def fake_preprocess_document_image(filename: str, content: bytes) -> ProcessedDocumentImage:
+        return ProcessedDocumentImage(
+            filename="receipt.jpg",
+            mime_type="image/jpeg",
+            content=b"processed-image",
+        )
+
+    async def fake_validation_process(images: list[DocumentImageInput], **_: object) -> DocumentValidationResponse:
+        return build_valid_validation_response(images[0].filename)
+
+    def fake_build_inhealth_claim_form_pdf(*_: object, **__: object) -> bytes:
+        raise FileNotFoundError("missing template")
+
+    monkeypatch.setattr(claims_route, "preprocess_document_image", fake_preprocess_document_image)
+    monkeypatch.setattr(claims_route.validation_processor, "process", fake_validation_process)
+
+    create_response = client.post(
+        "/api/claims",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "nama_pasien": "Claim User",
+            "tanggal_pelayanan": "31-03-2026",
+            "fasilitas_kesehatan": "RS Sehat Selalu",
+            "jenis_manfaat": "rawat_jalan",
+            "nominal_klaim": "150000",
+            "keterangan_penyakit": "Demam",
+            "kronologi": "Pemeriksaan rawat jalan",
+            "selected_patient_type": "self",
+        },
+        files=[("files", ("receipt.png", b"fake-image", "image/png"))],
+    )
+    assert create_response.status_code == 201
+
+    monkeypatch.setattr(claims_route, "build_inhealth_claim_form_pdf", fake_build_inhealth_claim_form_pdf)
+    export_response = client.get(
+        f"/api/claims/{create_response.json()['id']}/inhealth-form",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert export_response.status_code == 500
+    assert export_response.json()["message"] == "Input validation failed."
+    assert export_response.json()["errors"] == [
+        {"field": "inhealth_form", "message": "InHealth claim form template is missing."}
+    ]
+
+
+def test_inhealth_pdf_export_falls_back_to_unique_current_profile_for_old_claim(client: TestClient) -> None:
+    token = register_and_login(client, "inhealth-old@example.com")
+    complete_user_profile(client, token)
+
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        user = db.execute(select(User).where(User.email == "inhealth-old@example.com")).scalar_one()
+        claim_model = Claim(
+            user_id=user.id,
+            user_email=user.email,
+            nama_pasien="Claim User",
+            tanggal_pelayanan=claims_route.parse_claim_date("31-03-2026"),
+            fasilitas_kesehatan="RS Sehat Selalu",
+            jenis_manfaat="rawat_jalan",
+            nominal_klaim=150000,
+            keterangan_penyakit="Demam",
+            kronologi="Pemeriksaan rawat jalan",
+            status="pending",
+        )
+        db.add(claim_model)
+        db.commit()
+        claim_id = claim_model.id
+
+    response = client.get(
+        f"/api/claims/{claim_id}/inhealth-form",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    reader = PdfReader(BytesIO(response.content))
+    extracted_text = reader.pages[0].extract_text()
+    assert "Claim User" in extracted_text
+    assert "CARD-SELF-001" in extracted_text
+
+
+def test_inhealth_pdf_export_rejects_other_users_claim(client: TestClient) -> None:
+    owner_token = register_and_login(client, "inhealth-owner@example.com")
+    other_token = register_and_login(client, "inhealth-other@example.com", full_name="Other User")
+
+    session_factory = get_session_factory()
+    with session_factory() as db:
+        owner = db.execute(select(User).where(User.email == "inhealth-owner@example.com")).scalar_one()
+        claim_model = Claim(
+            user_id=owner.id,
+            user_email="inhealth-owner@example.com",
+            nama_pasien="Claim User",
+            tanggal_pelayanan=claims_route.parse_claim_date("31-03-2026"),
+            fasilitas_kesehatan="RS Sehat Selalu",
+            jenis_manfaat="rawat_jalan",
+            nominal_klaim=150000,
+            keterangan_penyakit="Demam",
+            kronologi="Pemeriksaan rawat jalan",
+            status="pending",
+        )
+        db.add(claim_model)
+        db.commit()
+        claim_id = claim_model.id
+
+    response = client.get(
+        f"/api/claims/{claim_id}/inhealth-form",
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+
+    assert owner_token
+    assert response.status_code == 403
 
 
 def test_create_claim_rejects_non_dmy_date_format(client: TestClient) -> None:

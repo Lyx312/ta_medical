@@ -63,6 +63,51 @@ class UserPublic(BaseModel):
     full_name: str
     email: str
     role: UserRole
+    nip: str | None = None
+    company_name: str | None = None
+    insurance_card_number: str | None = None
+    phone_number: str | None = None
+    mobile_number: str | None = None
+    bank_account_number: str | None = None
+    bank_account_holder_name: str | None = None
+    bank_name: str | None = None
+    insurance_card_filename: str | None = None
+    insurance_card_mime_type: str | None = None
+    insurance_card_byte_size: int | None = None
+    insurance_card_sha256_hash: str | None = None
+    insurance_card_data_url: str | None = None
+    profile_complete: bool = False
+    missing_profile_fields: list[str] = Field(default_factory=list)
+
+
+class UserProfileUpdate(BaseModel):
+    nip: str | None = Field(default=None, max_length=100)
+    company_name: str | None = Field(default=None, max_length=150)
+    insurance_card_number: str | None = Field(default=None, max_length=100)
+    phone_number: str | None = Field(default=None, max_length=50)
+    mobile_number: str | None = Field(default=None, max_length=50)
+    bank_account_number: str | None = Field(default=None, max_length=100)
+    bank_account_holder_name: str | None = Field(default=None, max_length=150)
+    bank_name: str | None = Field(default=None, max_length=100)
+
+    @field_validator(
+        "nip",
+        "company_name",
+        "insurance_card_number",
+        "phone_number",
+        "mobile_number",
+        "bank_account_number",
+        "bank_account_holder_name",
+        "bank_name",
+    )
+    @classmethod
+    def validate_optional_trimmed(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("Field cannot be empty.")
+        return normalized_value
 
 
 class RegisterResponse(BaseModel):

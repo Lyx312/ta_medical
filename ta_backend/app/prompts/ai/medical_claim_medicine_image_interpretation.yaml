@@ -24,6 +24,13 @@ user_template: |
   db_medicine_hints_json:
   {db_medicine_hints_json}
 
+  DOCUMENT CONTEXT:
+  - The images usually come from Indonesian medical claim packets and may include handwritten doctor prescriptions, copied prescriptions, outpatient forms, pharmacy receipts, and medicine sales notes.
+  - Ambiguous medicines should be judged against visible prescription or doctor handwriting first.
+  - Medicine-related handwriting often appears near cues such as "R/", "No.", "S", "dd", "pc", "prn", tablet/capsule/syrup/spray quantities, and dosage schedules.
+  - Treat handwritten doctor text near those cues as likely medicine or dosage evidence for the patient, but do not invent names that are not visually supported.
+  - Use diagnosis_text and anamnesis_text as supporting clinical context for medicine interpretation. A medicine that fits the diagnosis/anamnesis may be more plausible when handwriting is ambiguous, but visible image evidence remains the primary authority.
+
   Rules:
   OUTPUT FORMAT:
   - Return exactly one top-level key: judgements.

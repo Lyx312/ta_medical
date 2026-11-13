@@ -70,6 +70,8 @@ DEFAULT_AI_MODEL_CATALOG = [
 
 def initialize_database() -> None:
     Base.metadata.create_all(bind=get_engine())
+    ensure_user_profile_schema()
+    ensure_family_member_profile_schema()
     ensure_ai_model_schema()
     ensure_scan_log_schema()
     ensure_ai_api_call_log_schema()
@@ -104,6 +106,66 @@ def seed_default_ai_models() -> None:
     with session_factory() as db:
         repository = AIModelRepository(db)
         repository.upsert_seed_catalog(DEFAULT_AI_MODEL_CATALOG)
+
+
+def _binary_column_type() -> str:
+    return "BYTEA" if get_engine().dialect.name == "postgresql" else "BLOB"
+
+
+def ensure_user_profile_schema() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "users" not in tables:
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("users")}
+    desired_columns = {
+        "nip": "VARCHAR(100)",
+        "company_name": "VARCHAR(150)",
+        "insurance_card_number": "VARCHAR(100)",
+        "phone_number": "VARCHAR(50)",
+        "mobile_number": "VARCHAR(50)",
+        "bank_account_number": "VARCHAR(100)",
+        "bank_account_holder_name": "VARCHAR(150)",
+        "bank_name": "VARCHAR(100)",
+        "insurance_card_filename": "VARCHAR(255)",
+        "insurance_card_mime_type": "VARCHAR(100)",
+        "insurance_card_byte_size": "INTEGER",
+        "insurance_card_sha256_hash": "VARCHAR(64)",
+        "insurance_card_content": _binary_column_type(),
+    }
+
+    with engine.begin() as connection:
+        for column_name, column_type in desired_columns.items():
+            if column_name not in existing_columns:
+                connection.execute(text(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}"))
+
+
+def ensure_family_member_profile_schema() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "family_members" not in tables:
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("family_members")}
+    desired_columns = {
+        "insurance_card_number": "VARCHAR(100)",
+        "phone_number": "VARCHAR(50)",
+        "mobile_number": "VARCHAR(50)",
+        "email": "VARCHAR(255)",
+        "insurance_card_filename": "VARCHAR(255)",
+        "insurance_card_mime_type": "VARCHAR(100)",
+        "insurance_card_byte_size": "INTEGER",
+        "insurance_card_sha256_hash": "VARCHAR(64)",
+        "insurance_card_content": _binary_column_type(),
+    }
+
+    with engine.begin() as connection:
+        for column_name, column_type in desired_columns.items():
+            if column_name not in existing_columns:
+                connection.execute(text(f"ALTER TABLE family_members ADD COLUMN {column_name} {column_type}"))
 
 
 def ensure_ai_model_schema() -> None:
@@ -176,6 +238,24 @@ def ensure_claim_schema() -> None:
             connection.execute(text("ALTER TABLE claims ADD COLUMN requires_additional_review BOOLEAN NOT NULL DEFAULT FALSE"))
         if "review_note" not in column_names:
             connection.execute(text("ALTER TABLE claims ADD COLUMN review_note TEXT"))
+        claim_snapshot_columns = {
+            "selected_patient_type": "VARCHAR(20)",
+            "selected_family_member_id": "INTEGER",
+            "patient_relation": "VARCHAR(20)",
+            "patient_card_number": "VARCHAR(100)",
+            "patient_phone_number": "VARCHAR(50)",
+            "patient_mobile_number": "VARCHAR(50)",
+            "patient_email": "VARCHAR(255)",
+            "user_full_name_snapshot": "VARCHAR(150)",
+            "user_nip_snapshot": "VARCHAR(100)",
+            "user_company_name_snapshot": "VARCHAR(150)",
+            "user_bank_account_number_snapshot": "VARCHAR(100)",
+            "user_bank_account_holder_name_snapshot": "VARCHAR(150)",
+            "user_bank_name_snapshot": "VARCHAR(100)",
+        }
+        for snapshot_column_name, snapshot_column_type in claim_snapshot_columns.items():
+            if snapshot_column_name not in column_names:
+                connection.execute(text(f"ALTER TABLE claims ADD COLUMN {snapshot_column_name} {snapshot_column_type}"))
 
         if "requires_manual_review" in column_names:
             connection.execute(

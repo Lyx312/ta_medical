@@ -1,12 +1,20 @@
+from io import BytesIO
 from pathlib import Path
 from typing import Generator
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.core.config import get_settings
 from app.db.session import clear_database_caches
 from app.main import create_app
+
+
+def build_png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (8, 8), color="white").save(output, format="PNG")
+    return output.getvalue()
 
 
 @pytest.fixture()
@@ -84,6 +92,67 @@ def test_family_member_crud_flow(client: TestClient) -> None:
     final_list_response = client.get("/api/family-members", headers=headers)
     assert final_list_response.status_code == 200
     assert final_list_response.json() == []
+
+
+def test_family_member_profile_fields_and_insurance_card_upload(client: TestClient) -> None:
+    token = register_and_login(client, email="family-profile@example.com", full_name="Family Profile User")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create_response = client.post(
+        "/api/family-members",
+        headers=headers,
+        json={
+            "name": "Budi Santoso",
+            "relation": "Child",
+            "insurance_card_number": "CARD-FAMILY-001",
+            "phone_number": "031123456",
+            "mobile_number": "08123456789",
+            "email": "budi@example.com",
+        },
+    )
+
+    assert create_response.status_code == 201
+    created = create_response.json()
+    assert created["phone_number"] == "031123456"
+    assert created["insurance_card_number"] == "CARD-FAMILY-001"
+    assert created["mobile_number"] == "08123456789"
+    assert created["email"] == "budi@example.com"
+    assert created["profile_complete"] is False
+    assert "Foto Kartu member asuransi" in created["missing_profile_fields"]
+
+    upload_response = client.post(
+        f"/api/family-members/{created['id']}/insurance-card",
+        headers=headers,
+        files={"file": ("member-card.png", build_png_bytes(), "image/png")},
+    )
+
+    assert upload_response.status_code == 200
+    uploaded = upload_response.json()
+    assert uploaded["insurance_card_filename"] == "member-card.png"
+    assert uploaded["insurance_card_data_url"].startswith("data:image/png;base64,")
+    assert uploaded["profile_complete"] is True
+    assert uploaded["missing_profile_fields"] == []
+
+
+def test_family_member_insurance_card_upload_enforces_ownership(client: TestClient) -> None:
+    owner_token = register_and_login(client, email="card-owner@example.com", full_name="Card Owner")
+    other_token = register_and_login(client, email="card-other@example.com", full_name="Card Other")
+
+    create_response = client.post(
+        "/api/family-members",
+        headers={"Authorization": f"Bearer {owner_token}"},
+        json={"name": "Nina Owner", "relation": "Spouse"},
+    )
+    assert create_response.status_code == 201
+    family_member_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/family-members/{family_member_id}/insurance-card",
+        headers={"Authorization": f"Bearer {other_token}"},
+        files={"file": ("member-card.png", build_png_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 404
 
 
 def test_family_member_validation_rejects_empty_fields(client: TestClient) -> None:

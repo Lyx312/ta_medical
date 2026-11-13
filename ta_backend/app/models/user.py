@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from typing import Literal
 
-from sqlalchemy import CheckConstraint, DateTime, Integer, String
+from sqlalchemy import CheckConstraint, DateTime, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -21,6 +21,19 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[UserRole] = mapped_column(String(20), nullable=False, default="user")
+    nip: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    company_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    insurance_card_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    mobile_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    bank_account_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    bank_account_holder_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    bank_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    insurance_card_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    insurance_card_mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    insurance_card_byte_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    insurance_card_sha256_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    insurance_card_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

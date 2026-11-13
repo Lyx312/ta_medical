@@ -3,12 +3,38 @@ export type AuthUser = {
   full_name: string;
   email: string;
   role: 'user' | 'admin';
+  nip: string | null;
+  company_name: string | null;
+  insurance_card_number: string | null;
+  phone_number: string | null;
+  mobile_number: string | null;
+  bank_account_number: string | null;
+  bank_account_holder_name: string | null;
+  bank_name: string | null;
+  insurance_card_filename: string | null;
+  insurance_card_mime_type: string | null;
+  insurance_card_byte_size: number | null;
+  insurance_card_sha256_hash: string | null;
+  insurance_card_data_url: string | null;
+  profile_complete: boolean;
+  missing_profile_fields: string[];
 };
 
 export type FamilyMember = {
   id: number;
   name: string;
   relation: string;
+  insurance_card_number: string | null;
+  phone_number: string | null;
+  mobile_number: string | null;
+  email: string | null;
+  insurance_card_filename: string | null;
+  insurance_card_mime_type: string | null;
+  insurance_card_byte_size: number | null;
+  insurance_card_sha256_hash: string | null;
+  insurance_card_data_url: string | null;
+  profile_complete: boolean;
+  missing_profile_fields: string[];
 };
 
 export type AIModelConfiguration = {
@@ -239,6 +265,17 @@ export type RegisterPayload = {
   confirm_password: string;
 };
 
+export type UpdateUserProfilePayload = {
+  nip: string | null;
+  company_name: string | null;
+  insurance_card_number: string | null;
+  phone_number: string | null;
+  mobile_number: string | null;
+  bank_account_number: string | null;
+  bank_account_holder_name: string | null;
+  bank_name: string | null;
+};
+
 export type CreateClaimPayload = {
   nama_pasien: string;
   tanggal_pelayanan: string;
@@ -250,16 +287,26 @@ export type CreateClaimPayload = {
   medicines?: ClaimMedicineInput[];
   fileUris: string[];
   source_scan_log_id?: number;
+  selected_patient_type?: 'self' | 'family';
+  family_member_id?: number;
 };
 
 export type CreateFamilyMemberPayload = {
   name: string;
   relation: string;
+  insurance_card_number?: string | null;
+  phone_number?: string | null;
+  mobile_number?: string | null;
+  email?: string | null;
 };
 
 export type UpdateFamilyMemberPayload = {
   name: string;
   relation: string;
+  insurance_card_number?: string | null;
+  phone_number?: string | null;
+  mobile_number?: string | null;
+  email?: string | null;
 };
 
 export type UpdateAIModelPayload = {

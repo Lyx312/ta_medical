@@ -12,6 +12,7 @@ type AuthState = {
 };
 
 type AuthContextType = AuthState & {
+  refreshUser: () => Promise<AuthUser | null>;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (fullName: string, email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -45,6 +46,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     checkAuthState();
   }, [checkAuthState]);
 
+  const refreshUser = useCallback(async () => {
+    try {
+      const userData = await getCurrentUser();
+      setUser(userData);
+      return userData;
+    } catch {
+      await logoutUser();
+      setUser(null);
+      return null;
+    }
+  }, []);
+
   const signIn = async (email: string, password: string) => {
     const response = await loginUser({ email, password });
     setUser(response.user);
@@ -72,6 +85,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         user,
         isAuthenticated: user !== null,
         isLoading,
+        refreshUser,
         signIn,
         signUp,
         signOut,

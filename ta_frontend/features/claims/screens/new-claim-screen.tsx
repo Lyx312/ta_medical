@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   FlatList,
   Image,
@@ -66,6 +67,16 @@ type ClaimMedicineDraft = {
 };
 
 type ScanUiState = 'idle' | 'uploading' | 'processing' | 'succeeded' | 'failed';
+type CaptureGuideAction = 'view' | 'gallery' | 'camera';
+
+const DOCUMENT_CAPTURE_GUIDE_ITEMS = [
+  'Capture one document per photo, not a collage.',
+  'Keep the whole document inside the frame.',
+  'Use bright, even lighting and avoid glare or shadows.',
+  'Place the document flat and keep the camera parallel to it.',
+  'Make sure text is sharp before uploading.',
+  'Include every relevant receipt, prescription, diagnosis note, and bill detail.',
+];
 
 function normalizePatientName(name: string) {
   return name.trim().toLocaleLowerCase();
@@ -124,7 +135,8 @@ function toClaimMedicineInputList(medicines: ClaimMedicineDraft[]): ClaimMedicin
 export function NewClaimScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
+  const [profileGateUser, setProfileGateUser] = useState(user);
   const [imageUris, setImageUris] = useState<string[]>([]);
   const [familyMembers, setFamilyMembers] = useState<FamilyMember[]>([]);
   const [isLoadingFamilyMembers, setIsLoadingFamilyMembers] = useState(false);
@@ -149,6 +161,7 @@ export function NewClaimScreen() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitStatusText, setSubmitStatusText] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [captureGuideAction, setCaptureGuideAction] = useState<CaptureGuideAction | null>(null);
   const [viewerImageUri, setViewerImageUri] = useState<string | null>(null);
   const [viewerImageTitle, setViewerImageTitle] = useState('');
   const scanEventSourceRef = useRef<EventSource<ScanJobEventName> | null>(null);
@@ -178,13 +191,34 @@ export function NewClaimScreen() {
 
   useEffect(() => () => closeScanStream(), [closeScanStream]);
 
+  const activeUser = profileGateUser ?? user;
+
+  const incompleteFamilyMembers = useMemo(
+    () => familyMembers.filter((familyMember) => !familyMember.profile_complete),
+    [familyMembers],
+  );
+  const claimGateMissingItems = useMemo(() => {
+    const missingItems: string[] = [];
+
+    if (activeUser && !activeUser.profile_complete) {
+      missingItems.push(`Your profile: ${activeUser.missing_profile_fields.join(', ')}`);
+    }
+
+    for (const familyMember of incompleteFamilyMembers) {
+      missingItems.push(`${familyMember.name}: ${familyMember.missing_profile_fields.join(', ')}`);
+    }
+
+    return missingItems;
+  }, [activeUser, incompleteFamilyMembers]);
+  const claimProfileBlocked = claimGateMissingItems.length > 0;
+
   const patientOptions: PatientOption[] = useMemo(() => {
     const options: PatientOption[] = [];
 
-    if (user?.full_name) {
+    if (activeUser?.full_name) {
       options.push({
-        key: `self:${user.id}`,
-        name: user.full_name,
+        key: `self:${activeUser.id}`,
+        name: activeUser.full_name,
         relation: 'Saya',
       });
     }
@@ -198,7 +232,7 @@ export function NewClaimScreen() {
     }
 
     return options;
-  }, [familyMembers, user?.full_name, user?.id]);
+  }, [activeUser?.full_name, activeUser?.id, familyMembers]);
 
   const getSelectedPatientOption = () => patientOptions.find((option) => option.key === selectedPatientKey);
 
@@ -214,27 +248,32 @@ export function NewClaimScreen() {
     [patientOptions],
   );
 
-  const loadFamilyMembers = useCallback(async () => {
+  const loadClaimReadiness = useCallback(async () => {
     setIsLoadingFamilyMembers(true);
     setFamilyMemberError('');
 
     try {
-      setFamilyMembers(await getFamilyMembers());
+      const [refreshedUser, members] = await Promise.all([
+        refreshUser(),
+        getFamilyMembers(),
+      ]);
+      setProfileGateUser(refreshedUser);
+      setFamilyMembers(members);
     } catch (err) {
       const apiError = err as ApiError;
-      setFamilyMemberError(apiError.message ?? 'Unable to load family members.');
+      setFamilyMemberError(apiError.message ?? 'Unable to load claim profile data.');
     } finally {
       setIsLoadingFamilyMembers(false);
     }
-  }, []);
+  }, [refreshUser]);
 
   useFocusEffect(
     useCallback(() => {
-      void loadFamilyMembers();
-    }, [loadFamilyMembers]),
+      void loadClaimReadiness();
+    }, [loadClaimReadiness]),
   );
 
-  const pickImages = async () => {
+  const launchImagePicker = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
       allowsMultipleSelection: true,
       mediaTypes: ['images'],
@@ -250,7 +289,7 @@ export function NewClaimScreen() {
     }
   };
 
-  const takePhoto = async () => {
+  const launchCamera = async () => {
     const { status } = await ImagePicker.requestCameraPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('Permission Denied', 'Camera permission is required to take photos.');
@@ -268,6 +307,24 @@ export function NewClaimScreen() {
       setSourceScanLogId(undefined);
       resetScanFeedback();
       setErrors((prev) => ({ ...prev, images: '' }));
+    }
+  };
+
+  const openCaptureGuide = (action: CaptureGuideAction) => {
+    setCaptureGuideAction(action);
+  };
+
+  const continueFromCaptureGuide = async () => {
+    const action = captureGuideAction;
+    setCaptureGuideAction(null);
+
+    if (action === 'gallery') {
+      await launchImagePicker();
+      return;
+    }
+
+    if (action === 'camera') {
+      await launchCamera();
     }
   };
 
@@ -644,6 +701,7 @@ export function NewClaimScreen() {
 
     try {
       const medicinesInput = toClaimMedicineInputList(medicines);
+      const [selectedPatientType, selectedPatientId] = selectedPatient.key.split(':');
       const createdClaim = await createClaimWithProgress(
         {
           nama_pasien: selectedPatient.name,
@@ -656,6 +714,8 @@ export function NewClaimScreen() {
           medicines: medicinesInput,
           fileUris: imageUris,
           source_scan_log_id: sourceScanLogId,
+          selected_patient_type: selectedPatientType === 'family' ? 'family' : 'self',
+          family_member_id: selectedPatientType === 'family' ? Number(selectedPatientId) : undefined,
         },
         (progressPercent) => {
           if (progressPercent >= 100) {
@@ -690,26 +750,73 @@ export function NewClaimScreen() {
             <View style={viewStyles.content}>
               <ScreenHeader title="New Claim" subtitle="Submit a new insurance claim" />
 
+              {isLoadingFamilyMembers ? (
+                <SurfaceCard style={viewStyles.card}>
+                  <ActivityIndicator color={colors.primary} />
+                  <ThemedText style={textStyles.sectionDescription}>Checking profile completeness...</ThemedText>
+                </SurfaceCard>
+              ) : claimProfileBlocked ? (
+                <SurfaceCard style={viewStyles.card}>
+                  <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Complete your profile first</ThemedText>
+                  <ThemedText style={textStyles.sectionDescription}>
+                    Please complete your profile and family member data before submitting a new claim.
+                  </ThemedText>
+                  <View style={viewStyles.missingProfileList}>
+                    {claimGateMissingItems.map((item) => (
+                      <View key={item} style={viewStyles.missingProfileRow}>
+                        <Ionicons name="alert-circle-outline" size={18} color={colors.error} />
+                        <ThemedText style={[textStyles.missingProfileText, { color: colors.error }]}>{item}</ThemedText>
+                      </View>
+                    ))}
+                  </View>
+                  <FieldError message={familyMemberError} />
+                  <AppButton
+                    label="Go to Profile"
+                    tone="cta"
+                    onPress={() => router.push('/user/profile' as Href)}
+                  />
+                </SurfaceCard>
+              ) : (
+                <>
               <SurfaceCard style={viewStyles.card}>
                 <ThemedText style={[textStyles.sectionTitle, { color: colors.primary }]}>Document Upload</ThemedText>
                 <ThemedText style={textStyles.sectionDescription}>
                   Upload or take photos of your medical documents
                 </ThemedText>
-                <ThemedText style={textStyles.uploadHint}>
-                  For the best scan result, upload one clear photo per document instead of a collage.
-                </ThemedText>
+                <View style={[viewStyles.guidePanel, { backgroundColor: `${colors.primary}0D` }]}>
+                  <View style={viewStyles.guideHeaderRow}>
+                    <View style={viewStyles.guideTitleRow}>
+                      <Ionicons name="bulb-outline" size={18} color={colors.primary} />
+                      <ThemedText style={[textStyles.guideTitle, { color: colors.primary }]}>
+                        Document photo guide
+                      </ThemedText>
+                    </View>
+                    <Pressable style={viewStyles.guideAction} onPress={() => openCaptureGuide('view')}>
+                      <ThemedText style={[textStyles.guideActionText, { color: colors.secondary }]}>View guide</ThemedText>
+                      <Ionicons name="chevron-forward" size={16} color={colors.secondary} />
+                    </Pressable>
+                  </View>
+                  <View style={viewStyles.guideList}>
+                    {DOCUMENT_CAPTURE_GUIDE_ITEMS.slice(0, 4).map((item) => (
+                      <View key={item} style={viewStyles.guideRow}>
+                        <Ionicons name="checkmark-circle-outline" size={16} color={colors.primary} />
+                        <ThemedText style={textStyles.guideText}>{item}</ThemedText>
+                      </View>
+                    ))}
+                  </View>
+                </View>
 
                 <View style={viewStyles.imageActions}>
                   <Pressable
                     style={[viewStyles.imageButton, { borderColor: colors.divider }, scanBusy && viewStyles.disabledBlock]}
-                    onPress={pickImages}
+                    onPress={() => openCaptureGuide('gallery')}
                     disabled={scanBusy}>
                     <Ionicons name="image-outline" size={20} color={colors.primary} />
                     <ThemedText style={textStyles.imageButtonText}>Gallery</ThemedText>
                   </Pressable>
                   <Pressable
                     style={[viewStyles.imageButton, { borderColor: colors.divider }, scanBusy && viewStyles.disabledBlock]}
-                    onPress={takePhoto}
+                    onPress={() => openCaptureGuide('camera')}
                     disabled={scanBusy}>
                     <Ionicons name="camera-outline" size={20} color={colors.primary} />
                     <ThemedText style={textStyles.imageButtonText}>Camera</ThemedText>
@@ -933,6 +1040,8 @@ export function NewClaimScreen() {
                   <ThemedText style={textStyles.submitStatusText}>{submitStatusText}</ThemedText>
                 ) : null}
               </SurfaceCard>
+                </>
+              )}
             </View>
           </ScrollView>
         </View>
@@ -1027,6 +1136,40 @@ export function NewClaimScreen() {
         </View>
       </Modal>
 
+      <Modal
+        transparent
+        animationType="slide"
+        visible={captureGuideAction !== null}
+        onRequestClose={() => setCaptureGuideAction(null)}>
+        <View style={viewStyles.modalOverlay}>
+          <View style={[viewStyles.modalContent, viewStyles.guideModalContent, { backgroundColor: colors.cardBackground }]}>
+            <View style={viewStyles.modalHeader}>
+              <ThemedText style={textStyles.modalTitle}>Before scanning your documents</ThemedText>
+              <Pressable onPress={() => setCaptureGuideAction(null)}>
+                <ThemedText style={{ color: colors.secondary }}>Cancel</ThemedText>
+              </Pressable>
+            </View>
+            <View style={viewStyles.guideModalList}>
+              {DOCUMENT_CAPTURE_GUIDE_ITEMS.map((item) => (
+                <View key={item} style={viewStyles.guideModalRow}>
+                  <Ionicons name="checkmark-circle-outline" size={18} color={colors.primary} />
+                  <ThemedText style={textStyles.guideModalText}>{item}</ThemedText>
+                </View>
+              ))}
+            </View>
+            {captureGuideAction === 'view' ? (
+              <AppButton label="Close" tone="secondary" variant="outline" onPress={() => setCaptureGuideAction(null)} />
+            ) : (
+              <AppButton
+                label={captureGuideAction === 'camera' ? 'Continue to Camera' : 'Continue to Gallery'}
+                tone="cta"
+                onPress={() => void continueFromCaptureGuide()}
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
+
       <ImageViewer
         visible={viewerImageUri !== null}
         uri={viewerImageUri}
@@ -1082,6 +1225,49 @@ const viewStyles = StyleSheet.create({
     borderWidth: 1,
     gap: Spacing.sm,
   },
+  guideAction: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 2,
+    paddingVertical: 2,
+  },
+  guideHeaderRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.sm,
+    justifyContent: 'space-between',
+  },
+  guideList: {
+    gap: 7,
+  },
+  guideModalContent: {
+    maxHeight: '78%',
+  },
+  guideModalList: {
+    gap: Spacing.sm,
+    marginBottom: Spacing.lg,
+  },
+  guideModalRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: Spacing.sm,
+  },
+  guidePanel: {
+    borderRadius: Radii.md,
+    gap: Spacing.sm,
+    padding: Spacing.md,
+  },
+  guideRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: Spacing.xs,
+  },
+  guideTitleRow: {
+    alignItems: 'center',
+    flex: 1,
+    flexDirection: 'row',
+    gap: Spacing.xs,
+  },
   imageActions: {
     flexDirection: 'row',
     gap: 10,
@@ -1136,6 +1322,14 @@ const viewStyles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
   },
+  missingProfileList: {
+    gap: Spacing.sm,
+  },
+  missingProfileRow: {
+    alignItems: 'flex-start',
+    flexDirection: 'row',
+    gap: Spacing.sm,
+  },
   patientOptionTextContainer: {
     flex: 1,
     gap: 2,
@@ -1167,6 +1361,22 @@ const textStyles = StyleSheet.create({
   feedbackText: {
     ...Typography.helper,
   },
+  guideActionText: {
+    ...Typography.helper,
+    fontWeight: '600',
+  },
+  guideModalText: {
+    flex: 1,
+    fontSize: 14,
+  },
+  guideText: {
+    ...Typography.helper,
+    flex: 1,
+  },
+  guideTitle: {
+    ...Typography.bodyStrong,
+    fontSize: 14,
+  },
   imageButtonText: {
     fontSize: 14,
     fontWeight: '600',
@@ -1178,6 +1388,10 @@ const textStyles = StyleSheet.create({
   modalTitle: {
     fontSize: 18,
     fontWeight: '600',
+  },
+  missingProfileText: {
+    ...Typography.helper,
+    flex: 1,
   },
   optionalHint: {
     ...Typography.helper,
@@ -1200,10 +1414,6 @@ const textStyles = StyleSheet.create({
   },
   successTitle: {
     ...Typography.sectionTitle,
-  },
-  uploadHint: {
-    fontSize: 13,
-    opacity: Opacity.muted,
   },
 });
 

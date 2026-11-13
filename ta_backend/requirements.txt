@@ -54,6 +54,8 @@ urllib3==2.6.3
 uuid_utils==0.14.1
 python-multipart==0.0.20
 psycopg==3.2.12
+pypdf==5.6.0
+reportlab==4.4.5
 uvicorn==0.42.0
 xxhash==3.6.0
 zstandard==0.25.0

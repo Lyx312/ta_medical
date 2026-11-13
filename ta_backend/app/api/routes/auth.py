@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, status
 from jose import JWTError, jwt
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,9 +18,40 @@ from app.schemas.auth import (
     TokenData,
     UserRole,
     UserPublic,
+    UserProfileUpdate,
+)
+from app.services.profile_completion import (
+    build_data_url,
+    get_missing_user_profile_fields,
+    read_insurance_card_upload,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def build_user_public(user: Any) -> UserPublic:
+    missing_fields = get_missing_user_profile_fields(user)
+    return UserPublic(
+        id=user.id,
+        full_name=user.full_name,
+        email=user.email,
+        role=user.role,
+        nip=user.nip,
+        company_name=user.company_name,
+        insurance_card_number=user.insurance_card_number,
+        phone_number=user.phone_number,
+        mobile_number=user.mobile_number,
+        bank_account_number=user.bank_account_number,
+        bank_account_holder_name=user.bank_account_holder_name,
+        bank_name=user.bank_name,
+        insurance_card_filename=user.insurance_card_filename,
+        insurance_card_mime_type=user.insurance_card_mime_type,
+        insurance_card_byte_size=user.insurance_card_byte_size,
+        insurance_card_sha256_hash=user.insurance_card_sha256_hash,
+        insurance_card_data_url=build_data_url(user.insurance_card_mime_type, user.insurance_card_content),
+        profile_complete=len(missing_fields) == 0,
+        missing_profile_fields=missing_fields,
+    )
 
 
 def parse_user_role(value: object) -> UserRole:
@@ -105,12 +137,7 @@ async def register_user(
     return RegisterResponse(
         message="Registration successful.",
         access_token=access_token,
-        user=UserPublic(
-            id=new_user.id,
-            full_name=new_user.full_name,
-            email=new_user.email,
-            role=new_user.role,
-        ),
+        user=build_user_public(new_user),
     )
 
 
@@ -137,12 +164,7 @@ async def login_user(
     return LoginResponse(
         message="Login successful.",
         access_token=access_token,
-        user=UserPublic(
-            id=matched_user.id,
-            full_name=matched_user.full_name,
-            email=matched_user.email,
-            role=matched_user.role,
-        ),
+        user=build_user_public(matched_user),
     )
 
 
@@ -180,9 +202,58 @@ async def get_me(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found.",
         )
-    return UserPublic(
-        id=user.id,
-        full_name=user.full_name,
-        email=user.email,
-        role=user.role,
+    return build_user_public(user)
+
+
+@router.put("/me/profile", response_model=UserPublic)
+async def update_me_profile(
+    request: UserProfileUpdate,
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> UserPublic:
+    user_repository = UserRepository(db)
+    user = user_repository.get_by_id(token_data.user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    updated_user = user_repository.update_profile(
+        user,
+        nip=request.nip,
+        company_name=request.company_name,
+        insurance_card_number=request.insurance_card_number,
+        phone_number=request.phone_number,
+        mobile_number=request.mobile_number,
+        bank_account_number=request.bank_account_number,
+        bank_account_holder_name=request.bank_account_holder_name,
+        bank_name=request.bank_name,
     )
+    return build_user_public(updated_user)
+
+
+@router.post("/me/insurance-card", response_model=UserPublic)
+async def upload_me_insurance_card(
+    file: UploadFile = File(...),
+    token_data: TokenData = Depends(get_current_user_dependency),
+    db: Session = Depends(get_db_session),
+) -> UserPublic:
+    user_repository = UserRepository(db)
+    user = user_repository.get_by_id(token_data.user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    upload = await read_insurance_card_upload(file)
+    updated_user = user_repository.update_insurance_card(
+        user,
+        filename=upload.filename,
+        mime_type=upload.mime_type,
+        byte_size=upload.byte_size,
+        sha256_hash=upload.sha256_hash,
+        content=upload.content,
+    )
+    return build_user_public(updated_user)
